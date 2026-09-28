@@ -140,7 +140,7 @@ def test_an_announced_step_is_sent_back_once(ctx, monkeypatch, text):
     answer, _trace = a.ask("How many?")
     assert answer.startswith("There are 5.") and len(ran) == 2
     nudges = [m["content"] for m in a.llm.seen[-1] if m["role"] == "user" and "announcing a step" in m["content"]]
-    assert len(nudges) == 1
+    assert len(nudges) == 1 and a.usage["nudges"] == 1                  # counted (superset supagent stats)
 
 
 @pytest.mark.parametrize("text", [

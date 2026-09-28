@@ -841,11 +841,15 @@ class Agent:
                 nudge = None if nudged else unsupported_answer(answer, trace)
                 if nudge:                              # once: an answer from the tools, not from the summary
                     nudged = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (no tool / no query): %r", answer[-200:])
                     messages.append({"role": "user", "content": nudge})
                     continue
                 step = None if announced else announces_action(answer)
                 if step:                               # once: "Let me run the query." with no tool call
                     announced = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (announced step): %r", step)
                     messages.append({"role": "user", "content": ANNOUNCE_NUDGE.format(step=step)})
                     continue
                 missing = [c for c in charts if c.splitlines()[-1].strip() not in answer]

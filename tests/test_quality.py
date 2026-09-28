@@ -101,12 +101,14 @@ def test_where_the_time_of_the_answers_goes(live):
         Usage(message_id=mid, seconds=100.0, llm_calls=2, llm_seconds=90.0, prompt_tokens=10000, completion_tokens=200,
               cached_tokens=6000, tool_calls=1, tool_seconds=5.0, failed_calls=0),
         Usage(message_id=mid + 100000, seconds=40.0, llm_calls=2, llm_seconds=30.0, prompt_tokens=10000,
-              completion_tokens=100, cached_tokens=2000, tool_calls=3, tool_seconds=8.0, failed_calls=1)])
+              completion_tokens=100, cached_tokens=2000, tool_calls=3, tool_seconds=8.0, failed_calls=1,
+              nudges=1)])
     db.session.commit()
     out = usage_stats(days=7)
     assert (out["answers"], out["llm_calls_per_answer"], out["tool_calls_per_answer"]) == (2, 2.0, 2.0)
     assert out["llm_share"] == round(120 / 140, 3) and out["prompt_tokens_per_call"] == 5000
     assert out["prompt_cache_share"] == 0.4 and out["seconds_median"] in (40.0, 100.0)
+    assert out["sent_back_per_answer"] == 0.5 and out["failed_calls_per_answer"] == 0.5
     assert out["slowest"][0].startswith(f"#{mid} 100 s (LLM 90 s in 2 calls") and "Jobs per application" in out["slowest"][0]
 
 

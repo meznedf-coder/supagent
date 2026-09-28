@@ -153,6 +153,7 @@ def usage_stats(days: int = 7) -> dict[str, Any]:
            "llm_calls_per_answer": round(calls / len(rows), 2),
            "tool_calls_per_answer": round(sum(u.tool_calls or 0 for u in rows) / len(rows), 2),
            "failed_calls_per_answer": round(sum(u.failed_calls or 0 for u in rows) / len(rows), 2),
+           "sent_back_per_answer": round(sum(u.nudges or 0 for u in rows) / len(rows), 2),
            "llm_seconds_per_call": round(sum(u.llm_seconds or 0 for u in rows) / calls, 1),
            "prompt_tokens_per_call": round(prompt / calls),
            "completion_tokens_per_call": round(sum(u.completion_tokens or 0 for u in rows) / calls),

@@ -176,7 +176,7 @@ def _record_usage(message_id: int, user_id: int | None, seconds: float, llm: dic
             llm_seconds=round(float(llm.get("seconds") or 0), 1), prompt_tokens=int(llm.get("prompt_tokens") or 0),
             completion_tokens=int(llm.get("completion_tokens") or 0), cached_tokens=int(llm.get("cached_tokens") or 0),
             tool_calls=len(trace), tool_seconds=round(sum(float(t.get("seconds") or 0) for t in trace), 1),
-            failed_calls=sum(1 for t in trace if t.get("status") == "error")))
+            failed_calls=sum(1 for t in trace if t.get("status") == "error"), nudges=int(llm.get("nudges") or 0)))
         db.session.commit()
     except Exception:  # pylint: disable=broad-except   (table not created yet: superset supagent init)
         db.session.rollback()

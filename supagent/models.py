@@ -379,6 +379,7 @@ class Usage(db.Model):  # type: ignore[name-defined]
     tool_calls = sa.Column(sa.Integer)
     tool_seconds = sa.Column(sa.Float)
     failed_calls = sa.Column(sa.Integer)
+    nudges = sa.Column(sa.Integer)                # answers sent back to the LLM (no tool used, a step announced)
 
 
 TABLES = [Meta, Setting, Source, KObject, Relation, Run, Change, Conversation, Message, File, Example, Document,
