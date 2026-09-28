@@ -82,7 +82,8 @@ def test_the_throttle_limits_and_the_breaker_stops(monkeypatch):
 
 
 def test_metrics_are_learned_with_few_requests(world, monkeypatch):
-    """New metric: count, one statistics query, one series sample, the history once."""
+    """New metric: its series counted with others, one statistics query, its labels, the history
+    once (with the time left)."""
     import time as _time
 
     from superset.extensions import db
@@ -99,6 +100,8 @@ def test_metrics_are_learned_with_few_requests(world, monkeypatch):
     class Client:
         def query(self, expr, t, timeout=None):
             calls.append(("query", expr[:40]))
+            if expr.startswith("count by (__name__)"):
+                return [S({"__name__": "node_temp"}, 3)]
             if expr.startswith("count("):
                 return [S(v=3)]
             return [S({"stat": "min"}, 1), S({"stat": "max"}, 9), S({"stat": "avg"}, 5)]
@@ -220,3 +223,120 @@ def test_a_metric_whose_data_stopped_costs_two_lookups(world, monkeypatch):
     lookups.clear()
     stats = lm.profile_metric(Conn(), "node_temp", None, "gauge", 24, {})
     assert len(lookups) > 8 and stats["data_to_ms"] <= prev + 3_600_000   # first time: bisected (and history)
+
+
+def test_thousands_of_metrics_cost_about_one_request_each(world, monkeypatch):
+    """3,000 new metrics: their live series counted 50 at a time, the labels of the small ones
+    sampled together, one statistics query each; the depth of the history after, with the time
+    left, and it never marks the run incomplete."""
+    import time as _time
+
+    from superset.extensions import db
+
+    from supagent.knowledge import learn_metrics as lm
+    from supagent.models import KObject, Run
+
+    names = [f"app_metric_{i:04d}" for i in range(3000)]
+    calls = {"counts": 0, "stats": 0, "labels": 0, "history": 0, "other": 0}
+
+    class S:
+        def __init__(self, labels=None, v=5.0):
+            self.labels, self.points = labels or {}, [[0, v]]
+
+    class Client:
+        def query(self, expr, t, timeout=None):
+            if expr.startswith("count by (__name__)"):
+                calls["counts"] += 1
+                wanted = expr.split('=~"')[1].split('"')[0].split("|")
+                return [S({"__name__": n}, 4) for n in wanted]
+            calls["stats" if "stat" in expr else "other"] += 1
+            return [S({"stat": "min"}, 1), S({"stat": "max"}, 9), S({"stat": "avg"}, 5)]
+
+        def series(self, sels, a, b, limit=None):
+            if limit == 1:
+                calls["other"] += 1
+                return [{"__name__": "x"}]
+            calls["labels"] += 1
+            return [{"__name__": sel.split('"')[1], "instance": f"i{k}"} for sel in sels for k in range(4)]
+
+        def label_values(self, name, match, a, b, limit=None):
+            calls["history"] += 1                  # every metric has data 60 days back
+            return match[0].split('=~"')[1].split('"')[0].split("|")
+
+        def metadata(self):
+            return {}
+
+    class Conn:
+        client = Client()
+
+        def list_tables(self):
+            return names
+
+        def now_ms(self):
+            return 1_790_000_000_000
+
+        def close(self):
+            pass
+
+    db.session.query(KObject).filter(KObject.source_id == world["s_prom"].id,
+                                     KObject.name.like("app_metric_%")).delete(synchronize_session=False)
+    db.session.commit()
+    monkeypatch.setattr("supagent.tools._promagg_connection", lambda database: Conn())
+    monkeypatch.setattr(lm.Throttle, "wait", lambda self: None)
+    monkeypatch.setattr(lm.settings, "get", lambda key, _get=lm.settings.get: [] if key in (
+        "learn.metrics", "learn.metrics_exclude") else _get(key))
+    run = Run(kind="learn", reason="test")
+    db.session.add(run)
+    db.session.commit()
+    out = lm.learn_metrics(run, world["s_prom"], world["metrics"], deadline=_time.time() + 600)
+    assert out["profiled"] == 3000 and out["complete"] is True
+    assert calls["counts"] == 60 and calls["stats"] == 3000 and calls["labels"] == 60 and calls["other"] == 0
+    assert calls["history"] == 60 and out["history"] == 3000 and out["history_pending"] == 0
+    obj = db.session.query(KObject).filter_by(source_id=world["s_prom"].id, kind="metric", name="app_metric_0042").one()
+    assert obj.stats["series"] == 4 and obj.stats["min"] == 1.0 and obj.stats["data_from"]
+    label = db.session.query(KObject).filter_by(kind="label", parent="app_metric_0042", name="instance").one()
+    assert label.stats["values"] == ["i0", "i1", "i2", "i3"]
+    # no time left for the history: still complete (the lookups wait for the next run)
+    db.session.query(KObject).filter(KObject.source_id == world["s_prom"].id,
+                                     KObject.name.like("app_metric_%")).delete(synchronize_session=False)
+    db.session.commit()
+    clock = {"t": 0.0}
+    monkeypatch.setattr(lm.time, "time", lambda: clock["t"])
+    real_profile = lm.profile_metric
+
+    def profile(*a, **k):
+        clock["t"] += 0.1                      # 3,000 profiles: 300 "seconds"
+        return real_profile(*a, **k)
+
+    real_history = lm.batch_history
+
+    def history(*a, **k):
+        clock["t"] += 1.0                      # the time is up after one batch of history lookups
+        return real_history(*a, **k)
+
+    monkeypatch.setattr(lm, "profile_metric", profile)
+    monkeypatch.setattr(lm, "batch_history", history)
+    out = lm.learn_metrics(run, world["s_prom"], world["metrics"], deadline=300.5)
+    assert out["profiled"] == 3000 and out["complete"] is True                # every due metric profiled
+    assert out["history"] == 50 and out["history_pending"] == 2950           # the rest: next runs
+
+
+def test_the_history_of_many_metrics_comes_from_a_few_index_lookups():
+    from supagent.knowledge import learn_metrics as lm
+
+    end = 1_790_000_000_000
+    starts = {"old": end - 50 * lm.DAY_MS, "month": end - 25 * lm.DAY_MS, "new": end - 2 * lm.DAY_MS}
+    asked = []
+
+    class Client:
+        def label_values(self, name, match, a, b, limit=None):
+            asked.append((a, b))
+            return [n for n, t in starts.items() if t < b]           # series in the window
+
+    class Conn:
+        client = Client()
+
+    got = lm.batch_history(Conn(), list(starts), end)
+    day = lm.DAY_MS
+    assert got == {"old": end - 60 * day, "month": end - 30 * day, "new": end - 3 * day}
+    assert len(asked) == 7                                           # the last window adds nothing

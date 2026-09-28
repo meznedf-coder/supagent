@@ -207,13 +207,25 @@
       var tb = $("relations").querySelector("tbody");
       tb.innerHTML = "";
       (data.relations || []).forEach(function (r) {
-        tb.appendChild(el("tr", { class: "link", onclick: function () { detail(r.a.id); } }, [
+        var actions = el("td", {});
+        if (data.is_admin && r.origin !== "curated") {
+          actions.appendChild(el("button", { type: "button", class: "linkish", text: r.rejected ? "Restore" : "Wrong",
+            title: r.rejected ? "Measure and use it again" : "Never measure it again, never give it to the agent",
+            onclick: function (ev) {
+              ev.stopPropagation();
+              S.dict("POST", "relations/" + r.id, { rejected: !r.rejected }).then(relations);
+            } }));
+        }
+        var origin = r.origin === "curated" ? "catalog" : "measured";
+        tb.appendChild(el("tr", { class: "link" + (r.rejected ? " muted" : ""), onclick: function () { detail(r.a.id); } }, [
           el("td", { class: "nm", text: r.text }),
-          el("td", { text: r.origin === "curated" ? "catalog" : "measured" }),
-          el("td", { class: "num", text: r.confidence !== null && r.confidence !== undefined ? Math.round(r.confidence * 100) + "%" : "" })
+          el("td", { html: S.esc(origin) + (r.rejected ? ' <span class="badge bad">wrong' +
+                                                         (r.rejected_by ? ", " + S.esc(r.rejected_by) : "") + "</span>" : "") }),
+          el("td", { class: "num", text: r.confidence !== null && r.confidence !== undefined ? Math.round(r.confidence * 100) + "%" : "" }),
+          actions
         ]));
       });
-      if (!(data.relations || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "3", class: "muted", text: "No relation found yet." })]));
+      if (!(data.relations || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "4", class: "muted", text: "No relation found yet." })]));
     });
   }
 

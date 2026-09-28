@@ -53,9 +53,12 @@
   </section>
   <section id="tab-relations" class="tab" hidden>
     <p class="muted">How metrics and index fields relate: written in the catalog, or measured on the data (the values two
-      columns have in common). The agent uses them to join indices and to match metric labels with index fields.</p>
+      columns have in common, measured again every day). The agent uses them to join indices and to match metric labels
+      with index fields. A measured relation that is wrong: an admin marks it <strong>Wrong</strong>, it is never
+      measured again nor given to the agent. To state the right one, add a catalog entry of classification
+      <em>relationships</em> (Settings → Chat settings → Catalog): it always wins.</p>
     <div class="table-wrap"><table class="grid" id="relations">
-      <thead><tr><th>Relation</th><th>Origin</th><th class="num">Confidence</th></tr></thead><tbody></tbody>
+      <thead><tr><th>Relation</th><th>Origin</th><th class="num">Confidence</th><th></th></tr></thead><tbody></tbody>
     </table></div>
   </section>
   <section id="tab-changes" class="tab" hidden>
@@ -93,4 +96,4 @@
   </div>
 </div>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('supagent_static.static', filename='dictionary.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}
+{% block scripts %}<script src="{{ supagent_static('dictionary.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

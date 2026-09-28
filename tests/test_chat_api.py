@@ -283,3 +283,21 @@ def test_pages_follow_supersets_theme(app, monkeypatch):
         page = c.get("/supagent/").get_data(as_text=True)
     assert 'data-superset-dark="no"' in page and "theme.js" in page
     assert page.index("theme.js") < page.index("supagent.css")          # before the styles: no flash
+
+
+def test_page_files_carry_their_content_hash(app):
+    """Superset lets browsers keep static files for a year: after an upgrade, only a new URL makes
+    them load the new CSS and JavaScript (a stale stylesheet gave half-dark pages)."""
+    import re
+
+    from supagent import _file_hash
+
+    with app.test_client() as c:
+        login(c, "admin")
+        for page in ("/supagent/", "/supagent/dictionary/", "/supagent/admin/"):
+            html = c.get(page).get_data(as_text=True)
+            urls = re.findall(r'(?:src|href)="(/supagent-static/[^"]+)"', html)
+            assert urls, page
+            for url in urls:
+                name = url.split("/supagent-static/")[1].split("?")[0]
+                assert url.endswith(f"?v={_file_hash(name)}"), url

@@ -1,6 +1,7 @@
 """Relations measured on the data: which metric labels and index fields hold the same values
 (label node = field NODE: 200 of 200 values in common), and which fields of different indices
-do (join keys). Every relation keeps its evidence; the ones the data no longer supports go."""
+do (join keys). Every relation keeps its evidence; the ones the data no longer supports go. One an
+admin marked wrong is kept as such and never measured again (nor shown to the agent)."""
 
 from __future__ import annotations
 
@@ -48,7 +49,9 @@ def learn_relations() -> dict[str, int]:
             for y in range(x + 1, len(members)):
                 common[(members[x], members[y])] += 1
     kept: set[int] = set()
-    made = 0
+    rejected = {(r.a_id, r.b_id) for r in db.session.query(Relation).filter(
+        Relation.relation == "same_values", Relation.rejected_at.isnot(None))}
+    made = skipped = 0
     for (i, j), n in common.items():
         a, va = candidates[i]
         b, vb = candidates[j]
@@ -63,6 +66,9 @@ def learn_relations() -> dict[str, int]:
             continue
         if a.id > b.id:                           # relate() keeps the smaller id first: same for the evidence
             a, b, va, vb = b, a, vb, va
+        if (a.id, b.id) in rejected:              # an admin said it is wrong: never again
+            skipped += 1
+            continue
         sample = sorted(va & vb)[:6]
         rel = relate(a, b, "same_values", {"a_values": len(va), "b_values": len(vb), "common": n,
                                            "coverage": round(coverage, 3), "examples": sample}, coverage)
@@ -71,18 +77,19 @@ def learn_relations() -> dict[str, int]:
         made += 1
     removed = 0
     for rel in db.session.query(Relation).filter_by(relation="same_values", origin="learned"):
-        if rel.id not in kept:
+        if rel.id not in kept and rel.rejected_at is None:
             db.session.delete(rel)
             removed += 1
     db.session.commit()
-    return {"same_values": made, "removed": removed}
+    return {"same_values": made, "removed": removed, "rejected": skipped}
 
 
 def relations_of(obj_ids: list[int]) -> list[tuple[Relation, Any, Any]]:
     """Relations touching these objects, with both ends."""
     if not obj_ids:
         return []
-    rels = db.session.query(Relation).filter((Relation.a_id.in_(obj_ids)) | (Relation.b_id.in_(obj_ids))).all()
+    rels = (db.session.query(Relation).filter((Relation.a_id.in_(obj_ids)) | (Relation.b_id.in_(obj_ids)))
+            .filter(Relation.rejected_at.is_(None)).all())
     ids = {r.a_id for r in rels} | {r.b_id for r in rels}
     objs = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(ids))} if ids else {}
     return [(r, objs.get(r.a_id), objs.get(r.b_id)) for r in rels]

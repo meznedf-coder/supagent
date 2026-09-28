@@ -509,7 +509,7 @@ class KnowledgeView(_RecipesMixin, BaseView):
     class_permission_name = "AIAgentDictionary"
     method_permission_name = {"index": "read", "summary": "read", "objects": "read", "obj": "read",
                               "changes": "read", "relations": "read", "edit": "write", "recipes": "read",
-                              "set_recipe": "write", "timings": "read", "search": "read"}
+                              "set_recipe": "write", "timings": "read", "search": "read", "set_relation": "write"}
 
     @expose("/api/search", methods=("GET",))
     @has_access_api
@@ -562,7 +562,8 @@ class KnowledgeView(_RecipesMixin, BaseView):
         if ids:
             obj_ids = db.session.query(KObject.id).filter(KObject.source_id.in_(ids))
             rels = (db.session.query(func.count(Relation.id))
-                    .filter(Relation.a_id.in_(obj_ids), Relation.relation != "family_part").scalar())
+                    .filter(Relation.a_id.in_(obj_ids), Relation.relation != "family_part",
+                            Relation.rejected_at.is_(None)).scalar())
         runs = db.session.query(Run).order_by(Run.id.desc()).limit(5).all()
         return _json({"sources": out, "relations": rels, "is_admin": _is_admin(),
                       "runs": [{"id": r.id, "reason": r.reason, "status": r.status, "started_at": r.started_at,
@@ -622,7 +623,8 @@ class KnowledgeView(_RecipesMixin, BaseView):
         row = _obj_row(o, sources)
         row.update(stats=o.stats or {}, synonyms=o.synonyms or [], backend_help=o.backend_help,
                    first_seen=o.first_seen, last_seen=o.last_seen, gone_at=o.gone_at)
-        rels = (db.session.query(Relation).filter((Relation.a_id == o.id) | (Relation.b_id == o.id)).all())
+        rels = (db.session.query(Relation).filter((Relation.a_id == o.id) | (Relation.b_id == o.id))
+                .filter(Relation.rejected_at.is_(None)).all())
         ends = {r.a_id for r in rels} | {r.b_id for r in rels}
         objs = {x.id: x for x in db.session.query(KObject).filter(KObject.id.in_(ends))} if ends else {}
         row["relations"] = []
@@ -695,12 +697,14 @@ class KnowledgeView(_RecipesMixin, BaseView):
         from supagent.knowledge.describe import _relation_text
         from supagent.models import KObject, Relation
 
-        sources = self._sources()
+        sources, admin = self._sources(), _is_admin()
         ids = db.session.query(KObject.id).filter(KObject.source_id.in_(list(sources) or [-1]),
                                                   KObject.gone_at.is_(None))
-        rels = (db.session.query(Relation).filter(Relation.a_id.in_(ids), Relation.b_id.in_(ids),
-                                                  Relation.relation != "family_part")
-                .order_by(Relation.origin, Relation.confidence.desc()).limit(1000).all())
+        q = db.session.query(Relation).filter(Relation.a_id.in_(ids), Relation.b_id.in_(ids),
+                                              Relation.relation != "family_part")
+        if not admin:
+            q = q.filter(Relation.rejected_at.is_(None))
+        rels = q.order_by(Relation.origin, Relation.confidence.desc()).limit(1000).all()
         ends = {r.a_id for r in rels} | {r.b_id for r in rels}
         objs = {x.id: x for x in db.session.query(KObject).filter(KObject.id.in_(ends))} if ends else {}
         out = []
@@ -708,10 +712,35 @@ class KnowledgeView(_RecipesMixin, BaseView):
             a, b = objs.get(r.a_id), objs.get(r.b_id)
             if a is None or b is None:
                 continue
-            out.append({"relation": r.relation, "origin": r.origin, "confidence": r.confidence,
+            out.append({"id": r.id, "relation": r.relation, "origin": r.origin, "confidence": r.confidence,
                         "evidence": r.evidence or {}, "text": _relation_text(r, a, b),
+                        "rejected": r.rejected_at is not None, "rejected_by": r.rejected_by,
                         "a": _obj_row(a, sources), "b": _obj_row(b, sources)})
-        return _json({"relations": out})
+        return _json({"relations": out, "is_admin": admin})
+
+    @expose("/api/relations/<int:rid>", methods=("POST",))
+    @has_access_api
+    def set_relation(self, rid: int) -> Response:
+        """An admin marks a measured relation wrong (never measured again, never shown to the
+        agent) or restores it. A relation from the catalog changes with its catalog entry."""
+        import datetime as _dt
+
+        from superset import db
+
+        from supagent.models import Relation
+
+        if not _is_admin():
+            return _json({"error": "only admins may change the relations"}, 403)
+        r = db.session.get(Relation, rid)
+        if r is None:
+            abort(404)
+        if r.origin == "curated":
+            return _json({"error": "this relation comes from the catalog: change or delete its catalog entry"}, 400)
+        wrong = bool(_body().get("rejected"))
+        r.rejected_at = _dt.datetime.utcnow() if wrong else None
+        r.rejected_by = (g.user.username if wrong else None)
+        db.session.commit()
+        return _json({"id": rid, "rejected": wrong})
 
 
 def _obj_row(o: Any, sources: dict[int, Any]) -> dict:

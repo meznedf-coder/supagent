@@ -93,6 +93,8 @@ class Relation(db.Model):  # type: ignore[name-defined]
     evidence = sa.Column(sa.JSON)              # {"a_values": n, "b_values": m, "common": k, "coverage": ...}
     confidence = sa.Column(sa.Float)
     origin = sa.Column(SafeString(16))          # learned | curated
+    rejected_at = sa.Column(sa.DateTime)        # an admin marked it wrong: kept so that it is never measured again
+    rejected_by = sa.Column(SafeString(255))
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
 
 

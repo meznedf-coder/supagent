@@ -95,7 +95,7 @@ pre { background: var(--code-bg); border: 1px solid var(--line-2); border-radius
 .badge.llm { background: var(--llm-soft); color: var(--llm); }
 .badge.curated { background: var(--accent-soft); color: var(--accent); }
 .badge.backend { background: var(--line-2); color: var(--ink-2); }
-.badge.gone { background: #fbe9e7; color: var(--bad); }
+.badge.gone { background: transparent; box-shadow: inset 0 0 0 1px var(--bad); color: var(--bad); }
 .badge.ok { color: var(--ok); }
 .badge.warn { color: var(--warn); }
 details.query summary { cursor: pointer; }

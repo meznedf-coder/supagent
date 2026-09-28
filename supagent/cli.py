@@ -154,8 +154,10 @@ def learn(databases: tuple[str, ...], no_llm: bool, minutes: int | None, plan: b
                 continue
             what = "metrics" if r["backend"] == "promagg" else "indices / families"
             over = "  (more than the time limit: the next runs continue)" if r["minutes"] > r["limit_minutes"] else ""
+            later = (f"; then the depth of the history, about {r['history_requests']} lookups with the time left"
+                     if r.get("history_requests") else "")
             click.echo(f"{r['database']}: {r['objects']} {what}, {r['new']} new, {r['due']} to profile today, "
-                       f"about {r['requests']} requests = {r['minutes']} min at the rate limit{over}")
+                       f"about {r['requests']} requests = {r['minutes']} min at the rate limit{over}{later}")
         return
     out = run_learning(reason="cli", databases=list(databases) or None, llm=not no_llm, max_minutes=minutes)
     click.echo(json.dumps(out, indent=2, default=str))

@@ -18,11 +18,13 @@ workers and beat. With an existing FLASK_APP_MUTATOR: `FLASK_APP_MUTATOR = supag
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import logging
 import os
 from typing import Any, Callable
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +33,24 @@ _STATIC = "supagent_static"
 
 MENU_ITEMS = {"chat": "AI agent chat", "dictionary": "AI agent dictionary", "admin": "AI agent settings"}
 SETTINGS_CATEGORY = "Manage"            # Superset's Settings menu, section Manage
+
+
+@functools.lru_cache(maxsize=None)
+def _file_hash(filename: str) -> str:
+    try:
+        with open(os.path.join(HERE, "static", "supagent", filename), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()[:10]
+    except OSError:
+        return __version__
+
+
+def static_url(filename: str) -> str:
+    """URL of a page file with its content hash: Superset lets browsers keep static files for a
+    year (SEND_FILE_MAX_AGE_DEFAULT), so after an upgrade they must see a new URL, or they keep
+    the former CSS and JavaScript (half-dark pages, former fixes missing)."""
+    from flask import url_for
+
+    return url_for(f"{_STATIC}.static", filename=filename, v=_file_hash(filename))
 
 
 def init_app(app: Any) -> None:
@@ -48,6 +68,7 @@ def init_app(app: Any) -> None:
     if _STATIC not in app.blueprints:
         app.register_blueprint(Blueprint(_STATIC, __name__, static_folder=os.path.join(HERE, "static", "supagent"),
                                          static_url_path="/supagent-static"))
+    app.jinja_env.globals["supagent_static"] = static_url
     # `superset init` gives every new view to Gamma unless it is admin-only: the agent's views
     # are admin-only there, and `superset supagent init` gives the chat and the dictionary to
     # the role "AI Agent" (the settings stay with the admins)

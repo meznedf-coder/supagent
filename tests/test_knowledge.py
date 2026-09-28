@@ -112,7 +112,40 @@ def test_measured_relations_with_evidence(world):
     label = db.session.query(KObject).filter_by(kind="label", name="node").one()
     label.stats = {"values": ["a", "b", "c"]}
     db.session.commit()
-    assert learn_relations() == {"same_values": 0, "removed": 1}
+    assert learn_relations() == {"same_values": 0, "removed": 1, "rejected": 0}
+
+
+def test_a_wrong_relation_is_rejected_for_good(world, app):
+    """An admin marks a measured relation wrong: the daily measuring keeps it rejected, the
+    agent never sees it; Restore brings it back."""
+    from flask import g
+    from superset.extensions import db
+
+    from conftest import login
+    from supagent.knowledge.describe import _relations as described
+    from supagent.knowledge.relations import learn_relations, relations_of
+    from supagent.models import KObject, Relation
+
+    learn_relations()
+    rel = db.session.query(Relation).filter_by(relation="same_values").one()
+    rid, node = rel.id, db.session.query(KObject).filter_by(kind="field", name="NODE").one()
+
+    def post(user, body):
+        for key in ("_login_user", "user"):
+            g.pop(key, None)
+        with app.test_client() as c:
+            login(c, user)
+            return c.post(f"/supagent/dictionary/api/relations/{rid}", json=body)
+
+    assert post("alice", {"rejected": True}).status_code == 403
+    assert post("admin", {"rejected": True}).get_json() == {"id": rid, "rejected": True}
+    out = learn_relations()
+    assert out["rejected"] == 1 and out["same_values"] == 0
+    rel = db.session.get(Relation, rid)
+    assert rel is not None and rel.rejected_at is not None and rel.rejected_by == "admin"
+    assert relations_of([node.id]) == [] and not described([node.id], {world["s_jobs"].id, world["s_prom"].id})
+    assert post("admin", {"rejected": False}).get_json() == {"id": rid, "rejected": False}
+    assert learn_relations()["same_values"] == 1 and relations_of([node.id])
 
 
 def test_catalog_wins_and_relates(world):

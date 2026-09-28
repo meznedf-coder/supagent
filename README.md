@@ -73,7 +73,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.2.3-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.2.4-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -157,9 +157,20 @@ billions of documents:
 * **Rolling profiles**: the statistics (series count, data range, typical values, label and
   field values, fill rates) are refreshed for each metric or index every
   `learn.profile_every_days` days (default 7), about a seventh of them each day, plus the new
-  ones. About 3 requests per metric: a series count, one combined statistics query, a sample
-  of `learn.series_sample` series for the labels. Metrics above `learn.stats_max_series`
-  series get no value statistics; the start of a metric's data is looked up once a month.
+  ones. **It is never a full scan every day**: a metric is profiled once, then again on its own
+  day of the cycle. A profile costs about one request of its own (0.2.4): the series counts of
+  50 metrics come from one query, the labels of metrics with a few series from one shared
+  series request, and each metric has one combined statistics query. Metrics above
+  `learn.stats_max_series` series get no value statistics. The start of the data (the depth of
+  the history) is looked up with the time left, about 8 label-index requests per 50 metrics,
+  then once a month.
+* **Thousands of metrics**: the first profiles take a few runs. A run that reaches
+  `learn.max_minutes` is marked **partial** on the settings page ("stopped at the time limit:
+  the next run continues"); the next run starts with the metrics not profiled yet. To go
+  faster the first time, run it once at night with more time
+  (`superset supagent learn --database "<name>" --minutes 240`), leave out what nobody asks
+  about (`learn.metrics_exclude`: `go_*`, `process_*`, `promhttp_*`...) and, if the Mimir team
+  agrees, raise `learn.max_requests_per_minute`.
 * **Dated and rolled-over indices** (`logs-2026.09.27`, `traces-000123`) are learned as one
   family: the newest member is profiled, the family keeps the pattern.
 * **Field statistics** are batched (`learn.fields_per_request` per request) on a sample of
@@ -170,10 +181,13 @@ billions of documents:
   for the day. A run stops after `learn.max_minutes` (default 30); the next one continues.
 
 Then it measures the **relations** (a metric label and an index field hold the same values; the
-evidence is kept), applies the **catalog** (what people wrote always wins), asks the LLM for
-descriptions of up to `learn.llm_per_run` objects that have none (marked *AI-written*), lets
-the agent write the **catalog entries it is certain of** (below), and updates the knowledge
-search.
+evidence is kept; a relation an admin marked **Wrong** in *Data dictionary → Relations* is
+never measured again nor given to the agent, and a catalog entry of classification
+*relationships* states the right one), applies the **catalog** (what people wrote always wins),
+asks the LLM for descriptions of up to `learn.llm_per_run` objects that have none (default 60
+per run, 10 per LLM call, in the run's time plus ten minutes; exporters' HELP texts and catalog
+texts count as descriptions; marked *AI-written*; raise it to describe more per run), lets the
+agent write the **catalog entries it is certain of** (below), and updates the knowledge search.
 
 `superset supagent learn --plan` tells what today's run would do, without reading any data:
 objects due, requests, minutes at the rate limit. **Learn now** on the settings page, or
@@ -356,6 +370,10 @@ behind your gateway.
   `--concurrency`; without Celery, the web server's workers and threads (gunicorn
   `-w 4 -k gthread --threads 8`: heavy queries of the agent then share the web server's
   processes, so give it several workers).
+* **Page files after an upgrade**: Superset lets browsers keep static files for a year
+  (`SEND_FILE_MAX_AGE_DEFAULT`); since 0.2.4 every CSS and JavaScript file of supagent has its
+  content hash in its URL, so an upgrade is seen at once, with no hard reload. (Before 0.2.4 a
+  browser could keep the former files: a half-dark page, or former fixes missing; Ctrl+F5 once.)
 * **Stop**: the chat's Stop button stops the answer at once: the chat takes the next question
   right away. A step already running (an LLM call, a query) ends on its own in the
   background; its result is thrown away and the agent does nothing more for that answer.

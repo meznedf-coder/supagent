@@ -54,5 +54,5 @@
   </div>
 </template>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('supagent_static.static', filename='charts.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
-<script src="{{ url_for('supagent_static.static', filename='chat.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}
+{% block scripts %}<script src="{{ supagent_static('charts.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
+<script src="{{ supagent_static('chat.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

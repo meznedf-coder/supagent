@@ -1,5 +1,28 @@
 # Changes
 
+## 0.2.4 (2026-09-28)
+
+* **The pages load their new files after an upgrade**: Superset lets browsers keep static files
+  for a year, and supagent's URLs did not change with its files, so a browser could keep the
+  former CSS with the new theme script: a half-dark page (dark bubbles with dark text on a light
+  page), and former JavaScript fixes missing. Every CSS and JavaScript URL now has its content
+  hash. (One Ctrl+F5 is enough for browsers that already hold the former files.)
+* **Thousands of metrics are learned in a few runs**: the series counts of 50 metrics come from
+  one query, the labels of metrics with a few series from one shared request, and each metric
+  has one statistics query of its own: about one request per metric instead of about ten for a
+  new one. The start of the data (the depth of the history) is looked up afterwards with the time
+  left, about 8 label-index requests per 50 metrics instead of about 7 per metric. Checked on the
+  lab Mimir: the same series counts and label values as before for all 28 metrics; 3,000
+  metrics in the tests: 60 count queries, 3,000 statistics queries, 60 label requests, 60
+  history requests. `learn --plan` gives the new estimate and the history lookups apart.
+* **The settings page says why a run is partial**: "N of M due today profiled; stopped at the
+  time limit (learn.max_minutes): the next run continues"; history lookups left for later do not
+  make a run partial.
+* **Wrong relations**: an admin marks a measured relation **Wrong** in *Data dictionary →
+  Relations*: it is never measured again nor given to the agent (**Restore** undoes it). A
+  catalog entry of classification *relationships* states the right one. Run
+  `superset supagent init` (two new columns).
+
 ## 0.2.3 (2026-09-28)
 
 * A chat whose first message is not a data question (a greeting) is now named too; before, it

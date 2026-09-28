@@ -185,7 +185,7 @@ def plan_learning(databases: list[str] | None = None) -> list[dict[str, Any]]:
     import math
 
     from supagent.knowledge.learn_indices import group_indices
-    from supagent.knowledge.learn_metrics import HISTORY_REFRESH_DAYS, due
+    from supagent.knowledge.learn_metrics import BATCH, HISTORY_REFRESH_DAYS, SMALL_SERIES, due
     from supagent.knowledge.store import matches, source_for
     from supagent.models import KObject
     from supagent.tools import _connection, _promagg_connection
@@ -211,16 +211,22 @@ def plan_learning(databases: list[str] | None = None) -> list[dict[str, Any]]:
                 new = [n for n in names if n not in known]
                 again = [n for n in names if n in known and due(n, known[n].stats, every, today)]
                 now_ms = time.time() * 1000
-                # a known metric: count, statistics, series sample (3); the depth of its history once a
-                # month (about 7 index lookups); 2 more when its data had stopped (nothing newer?)
-                requests = 2 + 10 * len(new)
+                # the list and the metadata (2); the live series counts of BATCH metrics in one request;
+                # per metric the statistics (1) and the labels (one request of its own, or a share of one
+                # for the metrics with a few series); 2 more when its data had stopped. The depth of the
+                # history comes after, with the time left (8 index lookups per BATCH live metrics).
+                requests = 2 + math.ceil((len(new) + len(again)) / BATCH) + 1.5 * len(new)
+                history_metrics = len(new)
                 for n in again:
                     st = known[n].stats or {}
                     checked = st.get("history_checked_on")
-                    history = not checked or (today - dt.date.fromisoformat(checked)).days >= HISTORY_REFRESH_DAYS
+                    if not checked or (today - dt.date.fromisoformat(checked)).days >= HISTORY_REFRESH_DAYS:
+                        history_metrics += 1
                     stopped = not st.get("data_to_ms") or now_ms - float(st["data_to_ms"]) > 2 * 3_600_000
-                    requests += 3 + (7 if history else 0) + (2 if stopped else 0)
-                row.update(objects=len(names), new=len(new), due=len(new) + len(again))
+                    requests += 1 + (0.05 if 0 < (st.get("series") or 0) <= SMALL_SERIES else 1) + (2 if stopped else 0)
+                requests = math.ceil(requests)
+                row.update(objects=len(names), new=len(new), due=len(new) + len(again),
+                           history_requests=8 * math.ceil(history_metrics / BATCH))
             else:
                 conn = _connection(database, extract=False)
                 try:

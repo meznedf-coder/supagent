@@ -3,11 +3,11 @@
       data-primary="{{ nav.theme.primary or '' }}" data-primary-dark="{{ nav.theme.primary_dark or '' }}">
 <head>
 <meta charset="utf-8">
-<script src="{{ url_for('supagent_static.static', filename='theme.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
+<script src="{{ supagent_static('theme.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="{{ csrf_token() if csrf_token is defined else '' }}">
 <title>{% block title %}Chat{% endblock %} · Superset</title>
-<link rel="stylesheet" href="{{ url_for('supagent_static.static', filename='supagent.css') }}">
+<link rel="stylesheet" href="{{ supagent_static('supagent.css') }}">
 </head>
 <body data-page="{{ nav.active }}" data-admin="{{ 'yes' if nav.is_admin else 'no' }}"
       data-chat-api="{{ url_for('ChatView.index') }}api/"
@@ -28,7 +28,7 @@
 <main class="page page-{{ nav.active }}">
 {% block content %}{% endblock %}
 </main>
-<script src="{{ url_for('supagent_static.static', filename='common.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
+<script src="{{ supagent_static('common.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

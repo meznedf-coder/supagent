@@ -145,6 +145,9 @@
           var x = st.databases[name];
           var bits = [];
           ["metrics", "labels", "indices", "fields"].forEach(function (k) { if (x[k]) bits.push(S.num(x[k]) + " " + k); });
+          if (x.due) bits.push(S.num(x.profiled || 0) + " of " + S.num(x.due) + " due today profiled");
+          if (x.complete === false) bits.push("stopped at the time limit (learn.max_minutes): the next run continues");
+          if (x.history_pending) bits.push(S.num(x.history_pending) + " history lookups left for the next runs");
           if (x.skipped_unchanged) bits.push(S.num(x.skipped_unchanged) + " unchanged today");
           if (x.error) bits.push("error: " + x.error);
           parts.push(name + ": " + (bits.join(", ") || "nothing"));

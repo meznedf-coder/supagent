@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supagent"
-version = "0.2.3"
+version = "0.2.4"
 description = "An AI agent inside Apache Superset: chat page, a data dictionary learned every day (metrics and index fields, their types, units and relationships) stored in Superset's database, tools that act with the user's permissions"
 readme = "README.md"
 requires-python = ">=3.10"

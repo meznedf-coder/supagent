@@ -246,7 +246,7 @@ def _relations(ids: list[int], allowed: set[int],
         return []
     rels = (db.session.query(Relation)
             .filter((Relation.a_id.in_(ids)) | (Relation.b_id.in_(ids)))
-            .filter(Relation.relation.in_(kinds)).all())
+            .filter(Relation.relation.in_(kinds), Relation.rejected_at.is_(None)).all())
     ends = {r.a_id for r in rels} | {r.b_id for r in rels}
     objs = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(ends))} if ends else {}
     out, seen = [], set()
