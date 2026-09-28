@@ -1,5 +1,10 @@
 # Changes
 
+## 0.2.3 (2026-09-28)
+
+* A chat whose first message is not a data question (a greeting) is now named too; before, it
+  stopped `superset supagent tidy-learned` (and the daily renaming) from naming the other chats.
+
 ## 0.2.2 (2026-09-28)
 
 * **Stop works at once, and no chat is blocked**: Stop marks the answer stopped immediately and

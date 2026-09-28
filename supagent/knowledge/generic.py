@@ -144,6 +144,9 @@ def generalize(question: str, earlier: list[str], query: str | None, tool: str |
             return {"question": q[:240], "title": (title or plain_title(q))[:80],
                     "reusable": data.get("reusable") is not False, "generic": True,
                     "same_as": same if same in ids else None}
+        if data:                                   # no data question (a greeting...): still a name
+            return {"question": plain(question), "title": (title or plain_title(question))[:80], "reusable": False,
+                    "generic": True, "same_as": None}
     except Exception as ex:  # pylint: disable=broad-except   (named plainly; rewritten by the daily learning)
         log.warning("supagent: generic question not written: %s", ex)
     return {"question": plain(question), "title": plain_title(question), "reusable": True, "generic": False,

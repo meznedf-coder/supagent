@@ -49,6 +49,8 @@ def test_the_llm_writes_a_standalone_generic_question(app):
     assert "Earlier user message: why is job" in llm.calls[0] and "Final query (execute_sql)" in llm.calls[0]
     down = generalize("why is job 202609253742945492 failing?", [], None, llm=FakeLLM(RuntimeError("503")))
     assert down["generic"] is False and "<id>" in down["question"]      # plain, rewritten later
+    hello = generalize("hello", [], None, llm=FakeLLM({"question": "", "title": "Greeting", "reusable": False}))
+    assert (hello["title"], hello["reusable"], hello["generic"]) == ("Greeting", False, True)   # named, not learned
 
 
 def test_the_values_of_one_case_never_stay(app):

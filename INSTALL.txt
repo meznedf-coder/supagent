@@ -1,8 +1,8 @@
-supagent 0.2.2 - the AI agent inside Apache Superset
+supagent 0.2.3 - the AI agent inside Apache Superset
 =====================================================
 
 What is in this folder
-  supagent-0.2.2-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
+  supagent-0.2.3-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
@@ -10,7 +10,7 @@ What is in this folder
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.2.2-py3-none-any.whl
+   $PY -m pip install supagent-0.2.3-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
    Superset 6.0 (no pydantic there): pip installs pydantic; offline, unzip the pydantic
    wheelhouse next to the wheel and add:  --no-index --find-links ./wheelhouse-pydantic
@@ -77,7 +77,9 @@ Upgrade: pip install the new wheel, superset supagent init, restart.
    marked Helpful to review (Data dictionary -> Learned answers: Confirm / Reject); the ones
    those versions saved by themselves are no longer listed nor used; to delete them:
    superset supagent remove-auto-learned
-   Then, once: superset supagent tidy-learned   (generic questions, duplicates merged; needs the LLM)
+   Then, once: superset supagent tidy-learned   (generic questions and chat names, duplicates merged;
+   needs the LLM, about 5-10 s per learned answer or chat; --limit N; the daily learning also does
+   50 a day by itself)
 
 Many users: without Celery workers, answers run in the web server; start it with several
 workers and threads, e.g. gunicorn -w 4 -k gthread --threads 8 ... "superset.app:create_app()".
