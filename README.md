@@ -73,7 +73,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.3.0-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.4.0-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -184,9 +184,10 @@ Then it measures the **relations** (a metric label and an index field hold the s
 evidence is kept; a relation an admin marked **Wrong** in *Data dictionary → Relations* is
 never measured again nor given to the agent, and a catalog entry of classification
 *relationships* states the right one), applies the **catalog** (what people wrote always wins),
-asks the LLM for descriptions of up to `learn.llm_per_run` objects that have none (default 60
-per run, 10 per LLM call, in the run's time plus ten minutes; exporters' HELP texts and catalog
-texts count as descriptions; marked *AI-written*; raise it to describe more per run), lets the
+asks the LLM for descriptions of what has none (metrics and indices first, 100 objects at a
+time, 10 per LLM call, each call saved at once, in the run's time plus ten minutes; the next run
+goes on where it stopped; a label is described once per database for every metric that has it;
+exporters' HELP texts and catalog texts count as descriptions; marked *AI-written*), lets the
 agent write the **catalog entries it is certain of** (below), and updates the knowledge search.
 
 **Starting again**: `superset supagent forget-learned` shows what the learning learned, per
@@ -269,6 +270,29 @@ charts, investigations, files / e-mails / reports and images only when the quest
 them), and in the chat only the tools the question needs are offered. In the chat the page draws
 every query result as a table and a chart: the agent runs the query, it does not make images.
 
+Since 0.4 the instructions and the tools are the same from one question and one user to the
+next, and what is found for the question (where the data is, the knowledge, the learned
+answers, the user's memories) comes with the question: the LLM server keeps the instructions
+and the tools in its prompt cache (llama.cpp, vLLM) instead of reading them again for every
+question (in the lab: 3,188 of 4,700 prompt tokens from the cache, the first step of an answer
+16 s faster). Words meet across their forms (failed, failure, failing) and a match on a rare
+word counts more than one on a word hundreds of names have (elasticsearch against node).
+
+While it answers, the agent:
+* is told **why a result is empty**, from the data dictionary (no extra query): a value in the
+  wrong case (`'failed' is written 'FAILED'`), not a value of the field or label (the closest
+  ones), a time window before the data starts or after it stopped;
+* never runs the **same call twice** in an answer (reading again after a save is allowed);
+* gets an **empty LLM answer** asked again twice; still empty after a query succeeded, the answer
+  shows that result instead of failing;
+* is sent back once when its answer **announces a step without taking it** ("Let me run the
+  query.");
+* gets a one-line **correction** when its answer says all is well while a check or a query it
+  relies on could not run;
+* compares with **the usual** (`compare_to_usual`, when a question asks whether something is
+  unusual, and in investigations): the same window on the previous weeks, median and median
+  absolute deviation per series, a verdict normal / high / low (unknown with fewer than 3 weeks).
+
 ## Learning from the chats
 
 * **Learned answers** (0.2.2): only an answer marked *Helpful* is learned: its final successful
@@ -282,8 +306,11 @@ every query result as a table and a chart: the agent runs the query, it does not
   The first answer of a chat names it the same way (a 2-6 word generic title).
 * **Where the data was** (0.3, `learn.associations`): after each answer, the words of the
   question and the metrics or indices its successful queries read; the next questions with those
-  words find them first. *Not helpful* takes them back. They are not listed with the learned
-  answers; `learn.associations = false` switches this off.
+  words find them first. *Not helpful* takes them back; one that sent the agent to data that was
+  not there (an error, no rows, while the answer came from elsewhere) loses a use; one no answer
+  used for 60 days, or to a metric or index that is gone, is not used. They are not listed with
+  the learned answers; `learn.associations = false` switches this off. Learned answers and
+  memories that name a metric or index that no longer exists are not given to the agent.
 * **What users state**: a message that tells something about the data ("KO means failed") is read
   for durable facts and rules like the explicit ones below (team ones wait for an admin).
 * **Query timings** per kind of query (values replaced by `?`) and table or metric: the agent is
@@ -313,6 +340,22 @@ every query result as a table and a chart: the agent runs the query, it does not
   facts); the facts left out are still found by the knowledge search. Users see and delete
   theirs with the chat's *Memory* button; admins review the team's on the settings page.
 
+## Measuring it
+
+Nothing is added to the pages; the commands say:
+
+* `superset supagent stats [--days 7]`: where the time of the answers goes (LLM and tools), the
+  LLM calls and tool calls per answer, the prompt sizes, the share the LLM server's prompt cache
+  saved, the slowest answers.
+* `superset supagent evaluate`: does "Where the data is" find the data of the answers users
+  marked *Helpful* (hit@1, hit@3, mean reciprocal rank, and the ones it misses)? Also measured
+  after each learning run (in its statistics): it tells whether the learning improves.
+* `superset supagent gaps [--days 30]`: the questions not answered well (marked *Not helpful*,
+  failed, no data found for their words) and the learned answers about data that is gone: what to
+  add to the dictionary (synonyms, descriptions) or the catalog.
+* `superset supagent test-llm --profile`: the LLM server's answer time with and without thinking,
+  tool calls, and whether its prompt cache works.
+
 ## Knowledge search
 
 Every question comes with the `search.top_k` pieces of knowledge that match it best (at most
@@ -328,7 +371,9 @@ the learned answers, the memories and the documents. They are found:
   database as float16 (2 KB per piece with 1,024 dimensions) and searched in memory, or in a
   **Qdrant** server (`search.vector_store = qdrant`, `qdrant.url`);
 
-and the two rankings are fused. A user only finds what they may see: pieces about databases
+and the two rankings are fused. A piece found by meaning only must be close enough (cosine 0.35
+at least, and within 0.2 of the closest piece): a weak neighbour is noise, not knowledge; each
+result of `search_knowledge` says which search found it. A user only finds what they may see: pieces about databases
 they may query, the team's pieces and their own memories; the filter is applied before
 ranking. Pieces follow their origin (a changed entry is indexed again, a deleted one removed);
 new vectors are computed after each learning run, `embed.per_run` at a time.
@@ -370,7 +415,8 @@ host wrote. Files bigger than `tools.max_file_mb` (default 50 MB) are named but 
 ```
 superset supagent init                 tables, permissions, role "AI Agent"
 superset supagent settings [--set k=v] [--unset k]
-superset supagent test-llm
+superset supagent test-llm [--profile]                                  the LLM (--profile: thinking, tools, cache)
+superset supagent stats [--days N] | evaluate | gaps [--days N]         where the time goes, resolver, gaps
 superset supagent learn [--database NAME] [--no-llm] [--minutes N] [--plan]
 superset supagent import-catalog FILE [--replace] | export-catalog
 superset supagent agent-catalog [--no-docs]                              entries the agent is certain of
@@ -411,6 +457,11 @@ behind your gateway.
   (`SEND_FILE_MAX_AGE_DEFAULT`); since 0.2.4 every CSS and JavaScript file of supagent has its
   content hash in its URL, so an upgrade is seen at once, with no hard reload. (Before 0.2.4 a
   browser could keep the former files: a half-dark page, or former fixes missing; Ctrl+F5 once.)
+* **People first**: the background LLM work (the daily learning's descriptions, learned answers
+  and memory from a *Helpful*) waits while answers are being computed (2 minutes at most per
+  call), so that the LLM serves the people waiting first.
+* **Old chats**: `chats.keep_days` (0, the default: keep every chat) deletes the chats nobody
+  used for that many days, with their messages and files; what they taught stays.
 * **Stop**: the chat's Stop button stops the answer at once: the chat takes the next question
   right away. A step already running (an LLM call, a query) ends on its own in the
   background; its result is thrown away and the agent does nothing more for that answer.

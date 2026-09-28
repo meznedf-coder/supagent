@@ -54,14 +54,28 @@ au aux avec ce ces dans de des du en est et la le les leur mes nos ou par pas po
 quels quelles qui quoi sur un une hier aujourd""".split())
 
 
-def stem(w: str) -> str:
-    """servers -> server, queries -> query, processes -> process (enough to match plurals)."""
+DERIVATIONAL = ("ation", "ment", "ing", "ure", "ed")   # failed / failure / failing -> fail
+MIN_STEM = 4                    # never shorter: "rated" stays (a prefix of "rate"), "duration" too
+
+
+def _plural(w: str) -> str:
     if len(w) > 4 and w.endswith("ies"):
         return w[:-3] + "y"
     if len(w) > 4 and w.endswith(("sses", "xes", "ches", "shes")):
         return w[:-2]
     if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "is", "ous", "tus", "bus", "sus", "rus")):
         return w[:-1]
+    return w
+
+
+def stem(w: str) -> str:
+    """servers -> server, queries -> query, processes -> process; failed, failure, failures,
+    failing -> fail; alerting -> alert; throttled, throttling -> throttl (the word someone types
+    and the word in a name meet; not linguistic roots: a stem is never shorter than MIN_STEM)."""
+    w = _plural(w)
+    for suffix in DERIVATIONAL:
+        if w.endswith(suffix) and len(w) - len(suffix) >= MIN_STEM:
+            return w[:-len(suffix)]
     return w
 
 

@@ -93,7 +93,6 @@ SPECS: list[Spec] = [
          "the metrics or indices its successful queries read (used to find them for the next questions; Not helpful "
          "takes them back). Not listed with the learned answers"),
     Spec("learn.llm_descriptions", True, "bool", "Ask the LLM to describe what has no description (marked unverified)"),
-    Spec("learn.llm_per_run", 60, "int", "LLM descriptions written per run at most"),
     Spec("learn.agent_catalog", True, "bool", "The agent adds catalog entries when the evidence is certain: "
          "formulas used in answers confirmed as helpful, team rules and facts approved by an admin, definitions "
          "quoted word for word from the documents. Written as (agent): edit one to take it over; delete it and the "
@@ -134,6 +133,8 @@ SPECS: list[Spec] = [
     Spec("tools.export_max_rows", 500000, "int", "Rows of an Excel extract at most"),
     Spec("tools.email_allowed_domains", [], "list", "E-mail domains the agent may send to (empty: any)"),
     Spec("tools.keep_days", 7, "int", "Days the files of the answers (images, Excel) are kept"),
+    Spec("chats.keep_days", 0, "int", "Delete the chats nobody used for this many days (0: keep every chat); "
+         "what they taught (learned answers, memory, associations) stays"),
     Spec("tools.max_file_mb", 50, "int", "Files bigger than this (MB) are not kept for the chat page"),
     # ---- where answers are computed
     Spec("agent.executor", "auto", "choice", "Where questions are answered: celery (Superset's workers), "

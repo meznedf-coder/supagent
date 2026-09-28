@@ -156,3 +156,33 @@ def test_stop_on_a_finished_answer_keeps_it(app):
         login(c, "alice")
         assert c.post(f"/supagent/api/messages/{mid}/cancel").get_json()["status"] == "done"
         assert c.get(f"/supagent/api/messages/{mid}").get_json()["content"] == "7 jobs failed."
+
+
+def test_old_chats_go_after_chats_keep_days(app):
+    """chats.keep_days: the chats nobody used for that long go, with their messages and usage;
+    0 (the default) keeps every chat."""
+    import datetime as dt
+
+    from superset.extensions import db
+
+    from supagent import runner, settings
+    from supagent.models import Conversation, Message, Usage
+
+    with app.app_context():
+        old_cid, old_mid = _running()
+        new_cid, _new_mid = _running()
+        long_ago = dt.datetime.utcnow() - dt.timedelta(days=40)
+        for m in db.session.query(Message).filter(Message.conversation_id == old_cid):
+            m.created_at = long_ago
+        db.session.get(Conversation, old_cid).created_at = long_ago
+        db.session.add(Usage(message_id=old_mid, seconds=1.0))
+        db.session.commit()
+        assert runner.purge_old_chats() == 0                         # 0: every chat is kept
+        settings.set_value("chats.keep_days", 30)
+        try:
+            assert runner.purge_old_chats() == 1
+        finally:
+            settings.set_value("chats.keep_days", 0)
+        assert db.session.get(Conversation, old_cid) is None and db.session.get(Usage, old_mid) is None
+        assert db.session.query(Message).filter(Message.conversation_id == old_cid).count() == 0
+        assert db.session.get(Conversation, new_cid) is not None

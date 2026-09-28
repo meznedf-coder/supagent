@@ -159,10 +159,15 @@ def prompt_block(user_id: int | None) -> str:
     items = memories_for(user_id)
     if not items:
         return ""
+    from supagent.knowledge.resolve import gone_names, mentions_gone
+
     budget = int(settings.get("memory.prompt_chars") or 0) or 10 ** 9
+    gone = gone_names()
     lines = ["\n\nWhat this user and the team asked to remember (follow it unless the question says otherwise):"]
     used = 0
     for m in sorted(items, key=lambda m: KIND_ORDER.get(m.kind, 3)):     # stable: mine, then the team's
+        if mentions_gone(m.text, gone):                # about a metric or index that no longer exists
+            continue
         who = "team" if m.scope == "team" else "this user"
         text = " ".join((m.text or "").split())
         line = f"- ({who}, {m.kind}) {text[:ENTRY_CHARS]}{'...' if len(text) > ENTRY_CHARS else ''}"

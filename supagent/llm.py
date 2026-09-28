@@ -18,8 +18,9 @@ import json
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -31,6 +32,45 @@ RETRY_DELAYS = (2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0)
 
 class LLMError(Exception):
     pass
+
+
+class EmptyAnswer(LLMError):
+    """The LLM answered nothing (no text, no tool call), even when asked again."""
+
+
+EMPTY_RETRIES = 2                # an empty answer is asked again this many times (the same request)
+_BACKGROUND = threading.local()
+
+
+@contextmanager
+def background() -> Iterator[None]:
+    """LLM calls made inside wait while answers are being computed (daily learning, learned
+    answers, memory from a Helpful): the people waiting for an answer are served first."""
+    before = getattr(_BACKGROUND, "on", False)
+    _BACKGROUND.on = True
+    try:
+        yield
+    finally:
+        _BACKGROUND.on = before
+
+
+def _usage(body: dict, seconds: float) -> dict[str, Any]:
+    """Seconds and tokens of one call (OpenAI usage; llama.cpp timings: prompt tokens processed,
+    the rest came from its prompt cache; vLLM / OpenAI: prompt_tokens_details.cached_tokens)."""
+    usage = body.get("usage") or {}
+    timings = body.get("timings") or {}
+    prompt = int(usage.get("prompt_tokens") or 0)
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    if cached is None and timings.get("prompt_n") is not None and prompt:
+        cached = max(0, prompt - int(timings["prompt_n"]))
+    return {"calls": 1, "seconds": round(seconds, 2), "prompt_tokens": prompt,
+            "completion_tokens": int(usage.get("completion_tokens") or 0), "cached_tokens": int(cached or 0)}
+
+
+def add_usage(total: dict[str, Any], one: dict[str, Any] | None) -> dict[str, Any]:
+    for k, v in (one or {}).items():
+        total[k] = round(total.get(k, 0) + v, 2) if isinstance(v, float) else total.get(k, 0) + v
+    return total
 
 
 @dataclass
@@ -154,6 +194,7 @@ class LLM:
         self.base = self.cfg.base_url.rstrip("/")
         self.session = requests.Session()
         self._model = self.cfg.model
+        self.last_usage: dict[str, Any] | None = None     # seconds and tokens of the last chat()
 
     def _request(self, method: str, path: str, **kw: Any) -> requests.Response:
         renewed = False
@@ -194,7 +235,17 @@ class LLM:
         return self._model
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None, max_tokens: int | None = None) -> dict:
-        """One chat completion; returns the assistant message (content and/or tool_calls)."""
+        """One chat completion; returns the assistant message (content and/or tool_calls). An empty
+        answer (seen with local models, often right after a big tool result) is asked again
+        EMPTY_RETRIES times before EmptyAnswer. Inside background(), waits first while answers
+        are being computed."""
+        if getattr(_BACKGROUND, "on", False):
+            try:
+                from supagent.priority import wait_for_answers
+
+                wait_for_answers()
+            except Exception:  # pylint: disable=broad-except   (never blocks the work)
+                pass
         body: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": self.cfg.temperature}
         if tools:
             body["tools"] = tools
@@ -203,21 +254,74 @@ class LLM:
             body["max_tokens"] = max_tokens
         if not self.cfg.thinking and _TEMPLATE_KWARGS.get(self.base, True):
             body["chat_template_kwargs"] = {"enable_thinking": False}   # Qwen3 and the like: no reasoning
+        self.last_usage = None
+        for _attempt in range(EMPTY_RETRIES + 1):
+            t0 = time.time()
+            try:
+                r = self._request("POST", "/chat/completions", data=json.dumps(body))
+            except LLMError as ex:
+                if "chat_template_kwargs" not in body or not re.search(r"HTTP (400|422)", str(ex)):
+                    raise
+                _TEMPLATE_KWARGS[self.base] = False          # a gateway that refuses unknown fields
+                body.pop("chat_template_kwargs")
+                r = self._request("POST", "/chat/completions", data=json.dumps(body))
+            try:
+                data = r.json()
+                msg = data["choices"][0]["message"]
+            except (ValueError, KeyError, IndexError, TypeError) as ex:
+                raise LLMError(f"unexpected LLM answer: {r.text[:300]}") from ex
+            self.last_usage = add_usage(self.last_usage or {}, _usage(data, time.time() - t0))
+            text = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S)
+            if text.strip() or msg.get("tool_calls"):
+                return msg
+        raise EmptyAnswer("the LLM returned an empty answer")
+
+    def _raw(self, body: dict) -> tuple[dict, float]:
+        body = {"model": self.model, "temperature": 0, **body}
+        t0 = time.time()
+        r = self._request("POST", "/chat/completions", data=json.dumps(body))
+        return r.json(), round(time.time() - t0, 2)
+
+    def profile(self) -> dict:
+        """What this LLM server is like for the agent (superset supagent test-llm --profile): an
+        answer without and with thinking, a tool call, and whether its prompt cache keeps a shared
+        beginning of the prompt (the agent's instructions and tools are the same from one question
+        to the next: the cache saves their processing on every question)."""
+        out: dict[str, Any] = {"model": self.model}
+        ask = [{"role": "user", "content": "Reply with the single word OK."}]
+        no_think = {"chat_template_kwargs": {"enable_thinking": False}} if _TEMPLATE_KWARGS.get(self.base, True) else {}
+        data, sec = self._raw({"messages": ask, "max_tokens": 16, **no_think})
+        out["answer"] = {"seconds": sec, "text": ((data.get("choices") or [{}])[0].get("message") or {}).get(
+            "content", "")[:40]}
         try:
-            r = self._request("POST", "/chat/completions", data=json.dumps(body))
+            data, sec = self._raw({"messages": ask, "max_tokens": 1024, "chat_template_kwargs": {"enable_thinking": True}})
+            msg = (data.get("choices") or [{}])[0].get("message") or {}
+            out["thinking"] = {"seconds": sec, "completion_tokens": (data.get("usage") or {}).get("completion_tokens"),
+                               "answered": bool(re.sub(r"<think>.*?</think>", "", msg.get("content") or "",
+                                                       flags=re.S).strip())}
         except LLMError as ex:
-            if "chat_template_kwargs" not in body or not re.search(r"HTTP (400|422)", str(ex)):
-                raise
-            _TEMPLATE_KWARGS[self.base] = False          # a gateway that refuses unknown fields
-            body.pop("chat_template_kwargs")
-            r = self._request("POST", "/chat/completions", data=json.dumps(body))
+            out["thinking"] = {"error": str(ex)[:200]}
+        tool = {"type": "function", "function": {"name": "get_time", "description": "The current time",
+                                                  "parameters": {"type": "object", "properties": {}}}}
         try:
-            msg = r.json()["choices"][0]["message"]
-        except (ValueError, KeyError, IndexError) as ex:
-            raise LLMError(f"unexpected LLM answer: {r.text[:300]}") from ex
-        if not (msg.get("content") or "").strip() and not msg.get("tool_calls"):
-            raise LLMError("the LLM returned an empty answer")
-        return msg
+            data, sec = self._raw({"messages": [{"role": "user", "content": "What time is it? Use the tool."}],
+                                   "tools": [tool], "tool_choice": "auto", "max_tokens": 200, **no_think})
+            calls = ((data.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
+            out["tool_calls"] = {"seconds": sec, "works": any((c.get("function") or {}).get("name") == "get_time"
+                                                              for c in calls)}
+        except LLMError as ex:
+            out["tool_calls"] = {"error": str(ex)[:200]}
+        shared = "\n".join(f"Rule {i}: the answer to question {i} is found in table t{i}, column c{i}, "
+                            f"filtered on the day and grouped by application." for i in range(150))
+        cache = []
+        for q in ("Which table answers question 7?", "Which column answers question 12?"):
+            data, sec = self._raw({"messages": [{"role": "system", "content": shared}, {"role": "user", "content": q}],
+                                   "max_tokens": 1, **no_think})
+            u = _usage(data, sec)
+            cache.append({"seconds": sec, "prompt_tokens": u["prompt_tokens"], "cached_tokens": u["cached_tokens"]})
+        out["prompt_cache"] = {"first": cache[0], "second": cache[1],
+                               "works": cache[1]["cached_tokens"] >= 0.5 * max(1, cache[1]["prompt_tokens"])}
+        return out
 
     def check(self) -> dict:
         """What `superset supagent test-llm` and the admin page's test button show."""

@@ -16,11 +16,12 @@ from typing import Any
 
 from superset import db
 
-from supagent import settings
 from supagent.models import KObject, Run
 
 log = logging.getLogger(__name__)
-BATCH = 10
+BATCH = 10                      # objects described per LLM request
+CHUNK = 100                     # objects taken from the database at a time (no limit per run: the time limit)
+SKIPPED_LABELS = ("le", "quantile", "__tenant_id__", "__name__")
 CATEGORY_RULES: list[tuple[str, str]] = [
     (r"(^|_)(http|grpc|request|requests|response|latency|api)(_|$)", "requests"),
     (r"(^|_)cpu(_|$)|(^|_)load[0-9]*(_|$)", "cpu"),
@@ -117,59 +118,114 @@ def _parse(text: str) -> list[dict[str, Any]]:
     return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
 
 
-def candidates(limit: int) -> list[KObject]:
-    """What nobody described yet, metrics and indices first."""
-    rows = (db.session.query(KObject)
-            .filter(KObject.gone_at.is_(None))
-            .filter((KObject.description.is_(None)) | (KObject.description == ""))
-            .all())
-    rows = [o for o in rows if not (o.kind == "label" and o.name in ("le", "quantile", "__tenant_id__"))]
-    rows.sort(key=lambda o: (KIND_ORDER.get(o.kind, 9), o.parent or "", o.name))
-    return rows[:limit]
+def _undescribed(kind: str) -> Any:
+    q = (db.session.query(KObject).filter(KObject.kind == kind, KObject.gone_at.is_(None))
+         .filter((KObject.description.is_(None)) | (KObject.description == "")))
+    return q.filter(KObject.name.notin_(SKIPPED_LABELS)) if kind == "label" else q
+
+
+def left_to_describe() -> int:
+    """Objects no one described yet (a label name counts once per database)."""
+    from sqlalchemy import distinct, func, tuple_
+
+    n = sum(_undescribed(k).count() for k in ("metric", "index", "family", "field"))
+    try:
+        n += _undescribed("label").with_entities(func.count(distinct(tuple_(KObject.source_id, KObject.name)))).scalar()
+    except Exception:  # pylint: disable=broad-except   (databases without tuple counts)
+        db.session.rollback()
+        n += len({(s, nm) for s, nm in _undescribed("label").with_entities(KObject.source_id, KObject.name)})
+    return int(n or 0)
+
+
+def _chunks(kind: str) -> Any:
+    """Ids of the objects of this kind to describe, CHUNK at a time (read again for each chunk:
+    what the run describes leaves the list). A label is described once per database and name:
+    "instance" means the same on ten thousand metrics."""
+    from sqlalchemy import func
+
+    after = 0
+    while True:
+        if kind == "label":
+            rows = (_undescribed("label").with_entities(func.min(KObject.id))
+                    .group_by(KObject.source_id, KObject.name).having(func.min(KObject.id) > after)
+                    .order_by(func.min(KObject.id)).limit(CHUNK).all())
+        else:
+            rows = _undescribed(kind).filter(KObject.id > after).with_entities(KObject.id) \
+                .order_by(KObject.id).limit(CHUNK).all()
+        ids = [r[0] for r in rows]
+        if not ids:
+            return
+        yield ids
+        after = ids[-1]
+
+
+def _label_context(obj: KObject) -> dict[str, Any]:
+    """A label for every metric that has it: its values and a few of its metrics."""
+    siblings = (db.session.query(KObject.parent).filter(KObject.source_id == obj.source_id, KObject.kind == "label",
+                                                        KObject.name == obj.name, KObject.gone_at.is_(None)))
+    metrics = [m for (m,) in siblings.limit(6)]
+    st = obj.stats or {}
+    item = {"id": obj.id, "kind": "label", "name": obj.name, "on_metrics": siblings.count(),
+            "metrics": metrics, "values": _few(st.get("values") or st.get("sample"))}
+    return {k: v for k, v in item.items() if v not in (None, [], {})}
+
+
+def _write(obj: KObject, entry: dict[str, Any]) -> int:
+    """The LLM's description on this object (a label: on every metric that has it); how many."""
+    text = str(entry.get("description") or "").strip()[:600]
+    if not text or obj.description:
+        return 0
+    if obj.kind == "label":
+        return (_undescribed("label").filter(KObject.source_id == obj.source_id, KObject.name == obj.name)
+                .update({"description": text, "description_source": "llm", "verified": False},
+                        synchronize_session=False))
+    obj.description, obj.description_source, obj.verified = text, "llm", False
+    cat = str(entry.get("category") or "").strip().lower()[:64]
+    if cat and not obj.category and obj.kind in ("metric", "index", "family"):
+        obj.category = cat
+    return 1
 
 
 def enrich(run: Run | None, deadline: float, llm: Any = None) -> dict[str, Any]:
-    """LLM descriptions for at most learn.llm_per_run objects."""
+    """LLM descriptions for what nobody described (metrics and indices first), CHUNK objects at a
+    time, BATCH per request, each batch saved at once, until the time limit: the next run goes on
+    where this one stopped. No limit of objects per run."""
     from supagent.llm import LLM
 
-    todo = candidates(int(settings.get("learn.llm_per_run")))
-    out: dict[str, Any] = {"asked": len(todo), "written": 0}
-    if not todo:
-        return out
+    out: dict[str, Any] = {"written": 0, "requests": 0}
     try:
         llm = llm or LLM()
     except Exception as ex:  # pylint: disable=broad-except
         out["error"] = str(ex)[:300]
         return out
-    ids = [o.id for o in todo]
-    for i in range(0, len(ids), BATCH):
-        if time.time() > deadline:
-            out["stopped"] = "time limit"
-            break
-        batch = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(ids[i:i + BATCH]))}
-        items = [_context(o) for o in batch.values()]
-        try:
-            msg = llm.chat([{"role": "system", "content": PROMPT},
-                            {"role": "user", "content": json.dumps(items, ensure_ascii=False, default=str)}],
-                           max_tokens=250 * len(items) + 200)
-        except Exception as ex:  # pylint: disable=broad-except
-            out["error"] = str(ex)[:300]
-            log.warning("supagent learn: LLM descriptions stopped: %s", ex)
-            break
-        for entry in _parse(msg.get("content") or ""):
-            try:
-                obj = batch.get(int(entry.get("id")))
-            except (TypeError, ValueError):
-                continue
-            text = str(entry.get("description") or "").strip()
-            if obj is None or not text or obj.description:
-                continue
-            obj.description = text[:600]
-            obj.description_source = "llm"
-            obj.verified = False
-            cat = str(entry.get("category") or "").strip().lower()[:64]
-            if cat and not obj.category and obj.kind in ("metric", "index", "family"):
-                obj.category = cat
-            out["written"] += 1
-        db.session.commit()
+    for kind in sorted(KIND_ORDER, key=KIND_ORDER.get):
+        for ids in _chunks(kind):
+            for i in range(0, len(ids), BATCH):
+                if time.time() > deadline:
+                    out["stopped"] = "time limit: the next run goes on"
+                    out["left"] = left_to_describe()
+                    return out
+                batch = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(ids[i:i + BATCH]))}
+                items = [_label_context(o) if o.kind == "label" else _context(o) for o in batch.values()]
+                db.session.commit()                          # no metadata connection held during the LLM call
+                try:
+                    msg = llm.chat([{"role": "system", "content": PROMPT},
+                                    {"role": "user", "content": json.dumps(items, ensure_ascii=False, default=str)}],
+                                   max_tokens=250 * len(items) + 200)
+                except Exception as ex:  # pylint: disable=broad-except
+                    out["error"] = str(ex)[:300]
+                    log.warning("supagent learn: LLM descriptions stopped: %s", ex)
+                    out["left"] = left_to_describe()
+                    return out
+                out["requests"] += 1
+                batch = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(list(batch)))}
+                for entry in _parse(msg.get("content") or ""):
+                    try:
+                        obj = batch.get(int(entry.get("id")))
+                    except (TypeError, ValueError):
+                        continue
+                    if obj is not None:
+                        out["written"] += _write(obj, entry)
+                db.session.commit()
+    out["left"] = 0
     return out

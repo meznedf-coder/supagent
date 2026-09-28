@@ -1,5 +1,57 @@
 # Changes
 
+## 0.4.0 (2026-09-29)
+
+Faster answers, fewer wasted calls, learning runs that never block, and commands to measure it.
+Nothing added to the pages or the chat; the same install (pip, `superset supagent init`, restart).
+
+* **The instructions stay in the LLM server's prompt cache**: what is found for a question (where
+  the data is, the knowledge, the learned answers, the user's memories) now comes with the
+  question instead of inside the instructions, which (with the tools) are the same from one
+  question and one user to the next. Measured on the lab LLM (llama.cpp): the first step of an
+  answer processed 4,500-4,700 prompt tokens in 25-27 s; now 1,300-1,550 in 9-11 s (3,188 from
+  the cache).
+* **An empty result says why**, from the data dictionary (no extra query): a value in the wrong
+  case ("'failed' is written 'FAILED'"), not a value of the field or label (the closest ones), a
+  time window before the data starts or after it stopped.
+* **No call twice**: an identical call that succeeded is not run again in the same answer
+  (reading again after a save is allowed).
+* **An empty LLM answer** is asked again twice; still empty after a query succeeded, the answer
+  shows that result instead of failing.
+* **An answer that announces a step without taking it** ("Let me run the query.") is sent back
+  once; offers ("if you want, I can...") are not.
+* **All-clear claims are checked**: an answer that says all is well while a check or a query it
+  relies on could not run gets a one-line correction.
+* **compare_to_usual**: is a metric unusual for this time? The same window on the previous weeks
+  (median and median absolute deviation per series: normal, high, low; unknown with fewer than
+  three weeks). Offered when a question asks ("unusual", "higher than usual", "anormal"...) and in
+  investigations.
+* **Where the data is, learned better**: associations no answer used for 60 days, or to a metric
+  or index that is gone, are not used; one that sent the agent to data that was not there (an
+  error, no rows, while the answer came from elsewhere) loses a use. Learned answers and memories
+  naming a metric or index that no longer exists are not given to the agent.
+* **Better matching**: failed / failure / failing, alerting / alerts, throttled / throttling meet
+  (stems of at least four letters; `init` stems the stored words again); a match on a rare word
+  (elasticsearch) counts more than one on a word hundreds of names have (node).
+* **Knowledge search**: a piece found by meaning only must be close enough (cosine 0.35, within
+  0.2 of the closest); each result of `search_knowledge` says which search found it.
+* **Learning runs never block at the end**: `learn.llm_per_run` is gone. The LLM describes what
+  has no description 100 objects at a time (10 per request, each request saved at once), metrics
+  and indices first, until the run's time limit; the next run goes on. A label is described once
+  per database for every metric that has it (not once per metric). The relations are measured
+  reading the objects in steps (never tens of thousands of labels at once) and written 100 at a
+  time; the rewriting of older learned answers stops at the time limit too.
+* **People first**: the background LLM work (the daily learning, learned answers and memory from a
+  Helpful) waits while answers are being computed (2 minutes at most per call).
+* **Measure it**: `superset supagent stats` (where the time of the answers goes, prompt sizes,
+  prompt cache share, slowest answers), `superset supagent evaluate` (does "Where the data is"
+  find the data of the Helpful answers: hit@1, hit@3, MRR; also after each learning run),
+  `superset supagent gaps` (questions not answered well, learned answers about data that is
+  gone), `superset supagent test-llm --profile` (thinking, tool calls, prompt cache).
+* `chats.keep_days` (0, the default: keep): chats nobody used for that long go; what they taught
+  stays.
+* Run `superset supagent init` (one new table; the stored words are stemmed again).
+
 ## 0.3.0 (2026-09-28)
 
 Faster, surer answers: the agent is told where the data is, gets short strict instructions and

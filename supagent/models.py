@@ -16,7 +16,7 @@ from superset.extensions import encrypted_field_factory
 
 from supagent.textsafe import SafeString, SafeText
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _now() -> dt.datetime:
@@ -362,8 +362,27 @@ class Document(db.Model):  # type: ignore[name-defined]
     updated_by = sa.Column(SafeString(255))
 
 
+class Usage(db.Model):  # type: ignore[name-defined]
+    """What one answer took: its LLM calls (seconds, tokens, and how many prompt tokens the LLM
+    server's prompt cache saved) and its tool calls (superset supagent stats)."""
+
+    __tablename__ = "supagent_usage"
+    message_id = sa.Column(sa.Integer, primary_key=True, autoincrement=False)
+    user_id = sa.Column(sa.Integer)
+    created_at = sa.Column(sa.DateTime, default=_now, index=True)
+    seconds = sa.Column(sa.Float)                 # the whole answer
+    llm_calls = sa.Column(sa.Integer)
+    llm_seconds = sa.Column(sa.Float)
+    prompt_tokens = sa.Column(sa.Integer)
+    completion_tokens = sa.Column(sa.Integer)
+    cached_tokens = sa.Column(sa.Integer)
+    tool_calls = sa.Column(sa.Integer)
+    tool_seconds = sa.Column(sa.Float)
+    failed_calls = sa.Column(sa.Integer)
+
+
 TABLES = [Meta, Setting, Source, KObject, Relation, Run, Change, Conversation, Message, File, Example, Document,
-          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association]
+          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association, Usage]
 
 
 def _add_missing_columns(engine: sa.engine.Engine) -> list[str]:
@@ -384,6 +403,35 @@ def _add_missing_columns(engine: sa.engine.Engine) -> list[str]:
     return added
 
 
+def _restem() -> None:
+    """0.4.0: words are stemmed further (failed, failure -> fail): the words stored by an older
+    version (learned answers, associations) are stemmed again; associations that become the
+    same are merged."""
+    from supagent.knowledge.describe import stem
+
+    for r in db.session.query(Recipe):
+        new = " ".join(sorted({stem(w) for w in (r.words or "").split()}))
+        if new != (r.words or ""):
+            r.words = new
+    db.session.flush()
+    rows = db.session.query(Association).order_by(Association.id).all()
+    kept: dict[tuple, Association] = {}
+    for a in rows:
+        key = (stem(a.word or "")[:64], a.database_id, a.kind, a.parent or "", a.name)
+        if key in kept:                                  # "failed" and "failure" -> one "fail"
+            k = kept[key]
+            k.uses = (k.uses or 0) + (a.uses or 0)
+            k.messages = (list(k.messages or []) + list(a.messages or []))[-50:]
+            db.session.delete(a)
+            continue
+        kept[key] = a
+    db.session.flush()
+    for key, a in kept.items():
+        if a.word != key[0]:
+            a.word = key[0]
+    db.session.flush()
+
+
 def create_or_upgrade() -> tuple[int, int]:
     """Create the missing tables and columns and record the schema version; (version before, after)."""
     engine = db.engine
@@ -400,6 +448,8 @@ def create_or_upgrade() -> tuple[int, int]:
         for r in db.session.query(Recipe).filter(Recipe.status == "confirmed"):
             if r.confirmations:
                 r.status = "helpful"
+    if 0 < before < 4:
+        _restem()
     if row is None:
         db.session.add(Meta(key="schema_version", value=str(SCHEMA_VERSION)))
     else:

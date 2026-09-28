@@ -198,16 +198,28 @@ def merge_duplicates() -> int:
     return merged
 
 
-def tidy_learned(llm: Any = None, limit: int = 50) -> dict[str, int]:
+def tidy_learned(llm: Any = None, limit: int = 50, deadline: float | None = None) -> dict[str, int]:
     """Rewrite the questions of the learned answers and the chat names that are not generic yet;
-    a rewritten question that the LLM finds already kept joins it."""
+    a rewritten question that the LLM finds already kept joins it. Stops at `deadline` (the
+    learning run's time limit): the next run goes on."""
+    import time
+
     from supagent.knowledge.experience import USED, kept_questions, words
     from supagent.models import Conversation, Message, Recipe
 
     out = {"answers": 0, "chats": 0, "merged": 0}
+
+    def late() -> bool:
+        if deadline is not None and time.time() > deadline:
+            out["stopped"] = "time limit"
+            return True
+        return False
+
     for r in (db.session.query(Recipe).filter(Recipe.status.in_(USED),
                                               (Recipe.generic.is_(None)) | (Recipe.generic.is_(False)))
               .order_by(Recipe.id.desc()).limit(limit).all()):
+        if late():
+            break
         if db.session.get(Recipe, r.id) is None:
             continue                               # joined another one in this run
         kept = kept_questions(r.question or "", r.database_id, exclude=r.id, generic_only=True)
@@ -224,7 +236,7 @@ def tidy_learned(llm: Any = None, limit: int = 50) -> dict[str, int]:
         db.session.commit()
         out["answers"] += 1
     for conv in db.session.query(Conversation).order_by(Conversation.id.desc()).limit(500).all():
-        if out["chats"] >= limit:
+        if out["chats"] >= limit or "stopped" in out or late():
             break
         first = (db.session.query(Message).filter(Message.conversation_id == conv.id, Message.role == "user")
                  .order_by(Message.id).first())

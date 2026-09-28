@@ -21,7 +21,7 @@ import time
 from typing import Any, Callable
 
 from supagent import settings
-from supagent.llm import LLM
+from supagent.llm import LLM, EmptyAnswer, add_usage
 
 log = logging.getLogger(__name__)
 MAX_TOOL_CHARS = 8000
@@ -119,7 +119,12 @@ Investigations ("why did the jobs fail", "was a server saturated"): 1) find wher
 (failed jobs by "NODE" or "APPLICATION" and hour), 2) call check_health for that time window with
 entities = the servers / applications found (CPU, memory, disk, OOM kills, outages, queues, HTTP errors,
 latency, licences with from-to and worst value), 3) answer with the problems that match the failures and
-say what was not found. list_alerts shows the alerts firing now.""",
+say what was not found. list_alerts shows the alerts firing now; compare_to_usual says whether a metric
+was unusual for that time (the same window on earlier weeks).""",
+    "usual": """
+
+Unusual or not (asked here): compare_to_usual(promql, start, end) compares the window with the same window
+of the previous weeks and gives a verdict per series; use it rather than judging a number alone.""",
     "files": """
 
 Files, e-mails and reports (asked here): a file or Excel extract -> export_excel (every matching row: no
@@ -145,6 +150,9 @@ INTENTS = {
                         r"e-mail|envoi\w*|send|report\w*|rapport|schedul\w*|every (day|week|morning|monday)|"
                         r"chaque|tous les|quotidien|hebdo\w*|json)\b", re.I),
     "images": re.compile(r"\b(image|images|png|picture|photo|screenshot|capture|mail\w*|e-mail)\b", re.I),
+    "usual": re.compile(r"\b(usual|unusual|abnormal\w*|anomal\w*|normal|baseline|habitu\w*|inhabituel\w*|"
+                        r"anormal\w*)\b|\bcompared? (to|with) (last|previous|the same)|\bthan (usual|normal|last week)",
+                        re.I),
 }
 TOOLS_OF = {
     "charts": {"get_chart_type_schema", "generate_chart", "update_chart", "update_chart_preview", "list_charts",
@@ -152,6 +160,8 @@ TOOLS_OF = {
                "get_dashboard_info", "fix_chart_time_range", "chart_image"},
     "files": {"export_excel", "send_email", "create_report", "list_reports"},
     "images": {"chart_from_sql", "chart_image"},
+    "usual": {"compare_to_usual"},
+    "investigation": {"compare_to_usual"},
 }
 INTENT_TOOLS = set().union(*TOOLS_OF.values())
 
@@ -539,6 +549,8 @@ def unsupported_answer(answer: str, trace: list[dict]) -> str | None:
     return None
 
 
+EMPTY_RICH = "(The model wrote no text for this answer, even when asked again: the result of its last query is below.)"
+EMPTY_PLAIN = "(The model wrote no text for this answer, even when asked again: here is the result of its last query.)"
 UNSUPPORTED_NOTE = ("\n\n(Check: no query ran in this answer: numbers or rows shown here do not come from the "
                     "data. Ask again to have them read from the data.)")
 
@@ -554,6 +566,80 @@ def unsupported_note(answer: str, trace: list[dict]) -> str:
 
 SAVING_TOOLS = {"generate_chart", "update_chart", "generate_dashboard", "add_chart_to_existing_dashboard",
                 "save_sql_query", "create_virtual_dataset", "create_report", "update_chart_preview"}
+REPEAT_NOTE = ("You already made exactly this call in this answer and its result is above: the same call gives the "
+               "same result. Use it: answer the user, or make a different call.")
+# an answer that ends by announcing a step instead of taking it ("Let me run the query.")
+ANNOUNCE = re.compile(
+    r"(?:\b(?:I(?:'ll| will| am going to| shall)|let me|let's|now,? I(?:'ll| will)|next,? I(?:'ll| will))\b"
+    r"[^.!?\n]{0,60}\b(?:run|query|check|call|create|fetch|look up|search|execute|generate|export|send|build|"
+    r"compute|calculate|retrieve|pull|save|draw|plot)\b"
+    r"|\b(?:je vais|laissez-moi|je lance|lan[çc]ons)\b[^.!?\n]{0,60}\b(?:lancer|ex[ée]cuter|v[ée]rifier|chercher|"
+    r"cr[ée]er|interroger|calculer|r[ée]cup[ée]rer|envoyer|exporter|enregistrer|tracer)\b)[^.!?\n]*[.:!…]?\s*$", re.I)
+ANNOUNCE_NUDGE = ("(Check before answering: your text ends by announcing a step (\"{step}\") but you called no "
+                  "tool. Take that step now with the tool, or, if it is not needed, write the final answer without "
+                  "announcing anything. The user did not see the text above.)")
+
+
+def announces_action(answer: str) -> str | None:
+    """The announced step at the end of an answer that called no tool for it, or None. Offers
+    ("if you want, I can...", "let me know...") and questions are not announcements."""
+    tail = (answer or "").strip()[-300:]
+    last = re.split(r"(?<=[.!?])\s+|\n+", tail)[-1] if tail else ""
+    if not last or last.rstrip().endswith("?") or re.search(r"\b(if you|let me know|would you|do you want|shall I|"
+                                                            r"si vous|souhaitez|voulez|dites-moi)\b", last, re.I):
+        return None
+    m = ANNOUNCE.search(last)
+    return last.strip()[:160] if m else None
+
+
+# the answer says all is well while a check or a query of this answer could not run
+ALL_CLEAR = re.compile(
+    r"\bno (?:breach|problem|issue|error|anomal\w*|incident|saturation|alert|failure)s?\b"
+    r"|\b(?:everything|all) (?:is |looks |was |seems )?(?:fine|ok|okay|normal|healthy|good)\b"
+    r"|\b(?:is|are|was|were|looks?|seems?|remained|stayed) (?:healthy|normal|fine|stable)\b"
+    r"|\baucun(?:e)? (?:probl[èe]me|anomalie|incident|erreur|d[ée]passement|saturation|alerte|[ée]chec)\b"
+    r"|\btout (?:est|va|semble|était) (?:bien|normal|ok|correct)\b", re.I)
+NEGATION = re.compile(r"\b(?:cannot|can't|could not|couldn't|unable|not possible|impossible|does not mean|doesn't "
+                      r"mean|not necessarily|whether|if|without|unknown|unclear|n'a pas pu|ne peut|impossible de|"
+                      r"sans|si)\b", re.I)
+CHECK_TOOLS = ("execute_sql", "promql_query", "check_health", "list_alerts", "compare_to_usual")
+
+
+def _unchecked(trace: list[dict]) -> list[str]:
+    """What could not be checked in this answer: checks of check_health that failed, and data
+    tools whose last call failed (a failure fixed by a later successful call does not count)."""
+    out: list[str] = []
+    last: dict[str, str] = {}
+    for t in trace:
+        tool = t.get("called") or t["tool"]
+        if tool not in CHECK_TOOLS:
+            continue
+        last[tool] = t.get("status") or ""
+        if tool == "check_health" and t.get("status") == "done":
+            try:
+                errors = (json.loads(t.get("result") or "{}") or {}).get("errors") or {}
+            except (ValueError, TypeError, AttributeError):
+                errors = {}
+            out += [f"check {name}" for name in errors if f"check {name}" not in out]
+    out += [tool for tool, status in last.items() if status == "error"]
+    return out
+
+
+def claims_all_clear(answer: str) -> bool:
+    for m in ALL_CLEAR.finditer(answer or ""):
+        start = max((answer or "").rfind(".", 0, m.start()), (answer or "").rfind("\n", 0, m.start()), m.start() - 80)
+        if not NEGATION.search(answer[max(0, start):m.start()]):
+            return True
+    return False
+
+
+def honesty_note(answer: str, trace: list[dict]) -> str:
+    """A short correction when the answer says all is well while something it relies on could
+    not run (the model sometimes reads "could not reach" as "found nothing")."""
+    missing = _unchecked(trace)
+    if not missing or not claims_all_clear(answer):
+        return ""
+    return f"\n\n(Check: {', '.join(missing[:6])} could not run in this answer: what it covers was not checked.)"
 
 
 def rule_line(rule: dict[str, str]) -> str:
@@ -611,17 +697,21 @@ class Agent:
         return [s for s in self.specs if s["function"]["name"] not in INTENT_TOOLS or s["function"]["name"] in wanted]
 
     def _system(self, question: str) -> str:
+        """The instructions: the same for every user and every question of a kind, so that the LLM
+        server keeps them and the tools (which follow them) in its prompt cache from one question
+        to the next; what is found for this question and user goes with the question
+        (_question_blocks)."""
         text = CORE + (RICH if self.rich else PLAIN) + OSAGG_RULES + PROMAGG_RULES
         found = intents(question) | ({"charts"} if self.wants_saved_chart else set())
         if not self.rich:
             found |= {"files", "images"}
-        for k in ("charts", "investigation", "files", "images"):
-            if k in found:
+        for k in ("charts", "investigation", "files", "images", "usual"):
+            if k in found and not (k == "usual" and "investigation" in found):
                 text += SECTIONS[k]
         text += "\n\nReminder: answer in the language of the question below."
         if not self.superset.available:
             text += ("\n- Saving charts and dashboards is not available here (" + (self.superset.error or "") +
-                     "): offer SQL results, show_chart, chart_from_sql or export_excel instead.")
+                     "): answer with the query results instead.")
         extra = (settings.get("agent.extra_instructions") or "").strip()
         if extra:
             text += "\n" + extra
@@ -635,6 +725,12 @@ class Agent:
             text += "\n\nRules of the team (from the catalog: always follow them):"
             for r in team_rules:
                 text += "\n- " + rule_line(r)
+        return text
+
+    def _question_blocks(self, question: str) -> str:
+        """What is found for this question and this user, given with the question: their memories,
+        where the data is, the knowledge that matches, the learned answers."""
+        text = ""
         try:
             from flask import g
 
@@ -672,7 +768,7 @@ class Agent:
                 speed = f", {r['seconds']:.1f} s" if r.get("seconds") is not None else ""
                 text += (f"\n- Q: {r['question'][:240]}\n  {r['tool']}{where} ({r['status']}, used {r['uses']} "
                          f"time(s){speed}): {r['query'][:900]}")
-        return text
+        return text.strip()
 
     def _call(self, name: str, args: dict) -> tuple[str, str]:
         """(tool really called, its result text)."""
@@ -719,13 +815,25 @@ class Agent:
                 messages.append({"role": h["role"], "content": str(h["content"])[:3000]})
         lang = question_language(question)
         hint = f" {ANSWER_IN[lang]}" if lang else ""
-        messages.append({"role": "user", "content": f"(Now: {now():%A %Y-%m-%d %H:%M}.{hint})\n{question}"})
+        blocks = self._question_blocks(question)
+        messages.append({"role": "user", "content": (blocks + "\n\n" if blocks else "") +
+                         f"(Now: {now():%A %Y-%m-%d %H:%M}.{hint})\n{question}"})
         trace: list[dict] = []
-        nudged = False
+        nudged = announced = False
+        done: set[str] = set()                         # identical successful calls: not run twice
+        self.usage = {}
         specs = self._specs_for(question)
         for _ in range(self.max_steps):
             self._check_stop()
-            msg = self.llm.chat(messages, tools=specs)
+            try:
+                msg = self.llm.chat(messages, tools=specs)
+            except EmptyAnswer:
+                add_usage(self.usage, self.llm.last_usage)
+                fallback = self._empty_fallback(trace)
+                if fallback is None:
+                    raise
+                return fallback, trace
+            add_usage(self.usage, self.llm.last_usage)
             messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
             calls = msg.get("tool_calls") or []
             if not calls:
@@ -734,6 +842,11 @@ class Agent:
                 if nudge:                              # once: an answer from the tools, not from the summary
                     nudged = True
                     messages.append({"role": "user", "content": nudge})
+                    continue
+                step = None if announced else announces_action(answer)
+                if step:                               # once: "Let me run the query." with no tool call
+                    announced = True
+                    messages.append({"role": "user", "content": ANNOUNCE_NUDGE.format(step=step)})
                     continue
                 missing = [c for c in charts if c.splitlines()[-1].strip() not in answer]
                 if missing:
@@ -746,7 +859,7 @@ class Agent:
                     if any(t.get("full") for t in trace):
                         answer = trim_tables(answer)   # every row is in the page's result view
                 note = unsupported_note(answer, trace) if nudged else ""
-                return answer + claims_check(answer, trace) + note, trace
+                return answer + claims_check(answer, trace) + honesty_note(answer, trace) + note, trace
             for tc in calls:
                 self._check_stop()
                 name = tc["function"]["name"]
@@ -773,6 +886,8 @@ class Agent:
                 elif call_key in failed:
                     content = (f"You already made exactly this call and it failed: {failed[call_key][:600]}. "
                                "Change the arguments as the error says, or answer the user.")
+                elif call_key in done:
+                    content = REPEAT_NOTE
                 else:
                     called, content = self._call(name, args)
                     if name == "show_chart" and not content.startswith("tool error"):
@@ -784,7 +899,12 @@ class Agent:
                     step["status"] = "done"
                     if called == "send_email" and '"sent_to"' in content:
                         emailed.append(content[:300])
-                if called in RESULT_TOOLS and step["status"] == "done":
+                    if content is not REPEAT_NOTE:
+                        if called in SAVING_TOOLS:     # something changed: reading it again is not a repeat
+                            done.clear()
+                        else:
+                            done.add(call_key)
+                if called in RESULT_TOOLS and step["status"] == "done" and content is not REPEAT_NOTE:
                     step["full"] = content               # for the page, never sent to the model whole
                     if called == "execute_sql":
                         from supagent.knowledge.experience import compact_for_llm
@@ -797,6 +917,24 @@ class Agent:
                 self._report(trace)
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", name), "content": content})
         return "(stopped after too many tool calls: ask a narrower question)", trace
+
+    def _empty_fallback(self, trace: list[dict]) -> str | None:
+        """The LLM wrote nothing, even when asked again: the last query result, said plainly (None
+        when no query succeeded: the answer fails as before)."""
+        last = next((t for t in reversed(trace) if t.get("status") == "done"
+                     and (t.get("called") or t["tool"]) in RESULT_TOOLS), None)
+        if last is None:
+            return None
+        if self.rich:
+            return EMPTY_RICH
+        rows = _sql_rows(last)
+        if rows and len(rows) <= 30:
+            cols = list(rows[0])
+            table = "\n".join(["| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
+                              + ["| " + " | ".join(_cell(r.get(c)) for c in cols) + " |" for r in rows])
+        else:
+            table = "```\n" + (last.get("result") or "")[:3000] + "\n```"
+        return EMPTY_PLAIN + "\n\n" + table
 
     def _check_stop(self) -> None:
         if self.should_stop is not None and self.should_stop():

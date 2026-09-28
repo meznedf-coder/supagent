@@ -349,15 +349,29 @@ def learn_from_helpful(message_id: int, llm: Any = None) -> int | None:
 METRIC_FILTER = re.compile(r"metric_name\s*(?:=\s*'([^']+)'|IN\s*\(([^)]*)\))", re.I)
 
 
-def _tables_read(trace: list[dict]) -> set[tuple[int, str, str]]:
-    """(database id, metric | index, name) of what the successful queries of an answer read."""
+def _found_nothing(t: dict) -> bool:
+    """A query step that failed or returned no rows (no series)."""
+    if t.get("status") == "error":
+        return True
+    try:
+        res = json.loads(t.get("full") or t.get("result") or "{}")
+    except (ValueError, TypeError):
+        return False
+    return isinstance(res, dict) and (res.get("row_count") == 0 or res.get("series_count") == 0)
+
+
+def _tables_read(trace: list[dict], empty: bool = False) -> set[tuple[int, str, str]]:
+    """(database id, metric | index, name) of what the successful queries of an answer read (with
+    `empty`: of the queries that failed or found nothing)."""
     from superset.models.core import Database
 
     out: set[tuple[int, str, str]] = set()
     backends: dict[int, str] = {}
     for t in trace:
         tool = t.get("called") or t["tool"]
-        if tool not in ("execute_sql", "export_excel", "promql_query") or t.get("status") != "done":
+        if tool not in ("execute_sql", "export_excel", "promql_query"):
+            continue
+        if (not _found_nothing(t)) if empty else t.get("status") != "done":
             continue
         query, database_id = _query_of(tool, t.get("args") or {})
         if not query or not database_id:
@@ -379,7 +393,9 @@ def _tables_read(trace: list[dict]) -> set[tuple[int, str, str]]:
 
 def record_associations(message_id: int, question: str, trace: list[dict]) -> int:
     """The words of the question and the metrics or indices its successful queries read: where the
-    data of such words is, for the next questions (learn.associations; knowledge/resolve.py)."""
+    data of such words is, for the next questions (learn.associations; knowledge/resolve.py). A
+    metric or index an association pointed to that this answer queried in vain (an error, no
+    rows) while the answer came from elsewhere loses a use (a miss), and goes at none."""
     from supagent import settings
     from supagent.knowledge.resolve import terms
     from supagent.models import Association
@@ -389,6 +405,14 @@ def record_associations(message_id: int, question: str, trace: list[dict]) -> in
     words = terms(question)[:12]
     last = final_step(trace)                       # the query that answered, not the tries before it
     tables = _tables_read([last]) if last is not None else set()
+    missed = _tables_read(trace, empty=True) - tables if tables else set()
+    for database_id, kind, name in missed:
+        for a in db.session.query(Association).filter(Association.word.in_([w[:64] for w in words]),
+                                                      Association.database_id == database_id,
+                                                      Association.kind == kind, Association.name == name[:512]):
+            a.uses = (a.uses or 1) - 1
+            if a.uses <= 0:
+                db.session.delete(a)
     n = 0
     for database_id, kind, name in tables:
         for w in words:
@@ -448,15 +472,22 @@ def recipes_for(question: str, limit: int = 3) -> list[dict[str, Any]]:
     rows = (db.session.query(Recipe).filter(Recipe.status.in_(USED))
             .order_by(Recipe.last_used_at.desc()).limit(2000).all())
     scored = []
+    from supagent.knowledge.describe import stem
+
     for r in rows:
-        common = ws & set((r.words or "").split())
+        common = ws & {stem(w) for w in (r.words or "").split()}      # stored by an older stemmer too
         if len(common) < max(2, len(ws) // 3):
             continue
         scored.append((len(common) + (2 if r.status == "confirmed" else 0) + min(r.uses or 1, 5) * 0.2, r))  # admin first
+    from supagent.knowledge.resolve import gone_names, mentions_gone
+
     out = []
     allowed: dict[int, bool] = {}
+    gone = gone_names()
     for _score, r in sorted(scored, key=lambda x: -x[0]):
         if not r.database_id:                          # database unknown: shared with nobody
+            continue
+        if mentions_gone(r.query, gone):               # its metric or index no longer exists
             continue
         if r.database_id not in allowed:
             d = db.session.get(Database, r.database_id)

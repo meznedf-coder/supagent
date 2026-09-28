@@ -150,16 +150,20 @@ def settings_cmd(pairs: tuple[str, ...], unset: tuple[str, ...]) -> None:
 
 
 @supagent.command("test-llm", help="Get a token (middleware), find the model, ask for one word")
+@click.option("--profile", is_flag=True, help="Also: thinking on and off, tool calls, prompt cache (a minute)")
 @with_appcontext
-def test_llm() -> None:
+def test_llm(profile: bool) -> None:
     from supagent.llm import LLM
 
     try:
-        out = LLM().check()
+        llm = LLM()
+        out = llm.check()
+        if profile:
+            out["profile"] = llm.profile()
     except Exception as ex:  # pylint: disable=broad-except
         raise click.ClickException(f"{type(ex).__name__}: {ex}") from ex
     for k, v in out.items():
-        click.echo(f"{k}: {v}")
+        click.echo(f"{k}: {json.dumps(v) if isinstance(v, dict) else v}")
 
 
 @supagent.command(help="Learn now: metrics (promagg) and indices (osagg), relations, catalog, LLM descriptions")
@@ -320,6 +324,45 @@ def tidy_learned_cmd(limit: int) -> None:
     from supagent.knowledge.generic import tidy_learned
 
     click.echo(json.dumps(tidy_learned(limit=limit), indent=2))
+
+
+@supagent.command(help="Where the time of the answers goes: LLM and tools, prompt sizes, prompt cache, slowest")
+@click.option("--days", default=7, show_default=True, type=int)
+@with_appcontext
+def stats(days: int) -> None:
+    from supagent.knowledge.quality import usage_stats
+
+    click.echo(json.dumps(usage_stats(days), indent=2, ensure_ascii=False))
+
+
+@supagent.command(help="Does 'Where the data is' find the data of the Helpful answers? (hit@1, hit@3, MRR)")
+@click.option("--limit", default=200, show_default=True, type=int)
+@click.option("--user", default=None, help="As this user (default: the learning user)")
+@with_appcontext
+def evaluate(limit: int, user: str | None) -> None:
+    from supagent.knowledge.learner import learning_username
+    from supagent.knowledge.quality import evaluate_resolver
+    from supagent.security import acting_as
+
+    with acting_as(user or learning_username()):
+        click.echo(json.dumps(evaluate_resolver(limit=limit, seconds=600), indent=2, ensure_ascii=False))
+
+
+@supagent.command(help="Questions not answered well (Not helpful, failed, no data found for their words) and "
+                       "learned answers about data that no longer exists: what to add to the dictionary")
+@click.option("--days", default=30, show_default=True, type=int)
+@click.option("--user", default=None, help="As this user (default: the learning user)")
+@with_appcontext
+def gaps(days: int, user: str | None) -> None:
+    from supagent.knowledge.learner import learning_username
+    from supagent.knowledge.quality import gaps as find_gaps
+    from supagent.security import acting_as
+
+    with acting_as(user or learning_username()):
+        for part, lines in find_gaps(days).items():
+            click.echo(f"{part.replace('_', ' ')} ({len(lines)}):")
+            for line in lines:
+                click.echo(f"  {line}")
 
 
 @supagent.command(help="Search the knowledge as a user would (what the agent is given)")

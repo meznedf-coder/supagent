@@ -1226,7 +1226,10 @@ def promql_query(expr: str, start: str | None = None, end: str | None = None, st
                         hint = ("no series: the expression names no existing metric; metrics with these words: "
                                 + (", ".join(near) or ", ".join(names[:20])) + " (describe_data lists them)")
                     else:
-                        hint = "no series in this time range (check the dates: describe_data gives the data range)"
+                        from supagent.knowledge.empty import why_empty_promql
+
+                        hint = why_empty_promql(db_obj, expr) or \
+                            "no series in this time range (check the dates: describe_data gives the data range)"
                 return {"expr": expr, "database": db_obj.database_name, **({"hint": hint} if hint else {}),
                         "start": f"{conn.zone.local(t0):%Y-%m-%d %H:%M}", "end": f"{conn.zone.local(t1):%Y-%m-%d %H:%M}",
                         "step": duration(step_ms) if step_ms else "instant", "series_count": total,
@@ -1356,6 +1359,95 @@ def check_health(start: str, end: str, entities: list[str] | None = None, checks
                 return {"database": db_obj.database_name, "from": start, "to": end,
                         "step_minutes": step // 60000, "checks": list(defs), "breaches": found[:200],
                         "breach_count": len(found), "errors": errors, "note": note}
+            finally:
+                conn.close()
+    except ToolError as ex:
+        return {"error": str(ex)}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:1500]}"}
+
+
+USUAL_MIN_WEEKS = 3              # below this many earlier weeks with data: no verdict
+USUAL_SENSITIVITY = 3.5          # median absolute deviations from the median that count as unusual
+USUAL_MIN_CHANGE = 0.2           # and at least this relative change (a flat series moves little)
+
+
+def _usual(now: float | None, before: list[float]) -> dict[str, Any]:
+    """Verdict of one series: normal, high, low or unknown, from the same window on earlier weeks
+    (median and median absolute deviation: one bad week does not widen the band)."""
+    import statistics
+
+    out: dict[str, Any] = {"now": None if now is None else round(now, 6),
+                           "previous_weeks": [round(v, 6) for v in before]}
+    if now is None or len(before) < USUAL_MIN_WEEKS:
+        out.update(verdict="unknown", reason=f"{len(before)} earlier week(s) with data, {USUAL_MIN_WEEKS} needed")
+        return out
+    med = statistics.median(before)
+    mad = statistics.median([abs(v - med) for v in before])
+    scale = max(mad, abs(med) * 0.05, 1e-9)
+    dev = (now - med) / scale
+    change = abs(now - med) / abs(med) if med else (math.inf if now else 0.0)
+    verdict = "normal"
+    if abs(dev) >= USUAL_SENSITIVITY and change >= USUAL_MIN_CHANGE:
+        verdict = "high" if dev > 0 else "low"
+    out.update(median=round(med, 6), deviations=round(dev, 1), change_pct=None if math.isinf(change) else
+               round(100 * (now - med) / abs(med), 1) if med else None, verdict=verdict)
+    return out
+
+
+@mcp.tool
+def compare_to_usual(promql: str, start: str, end: str, weeks: int = 4, database: str | int | None = None) -> dict:
+    """Is a metric unusual for this time? The average of a PromQL expression over start-end
+    compared with the same window of each of the previous `weeks` weeks (median and median
+    absolute deviation, per series): verdict normal, high, low (or unknown without 3 earlier
+    weeks), with the numbers. `start` / `end`: local times ("2026-09-24 02:00"), at most 7 days
+    apart. For "is it unusual / abnormal / higher than usual" questions."""
+    try:
+        with _as_user():
+            db_obj = _metrics_database(database)
+            conn = _promagg_connection(db_obj)
+            try:
+                from superset.extensions import db as meta
+
+                meta.session.commit()        # no connection of Superset's own pool is held while the queries run
+                if len(promql) > 4000:
+                    raise ToolError("expression too long (4000 characters max)")
+                t0, t1 = _time_arg(conn, start, 0), _time_arg(conn, end, 0)
+                if t1 <= t0:
+                    raise ToolError("end must be after start")
+                week = 7 * 86_400_000
+                if t1 - t0 > week:
+                    raise ToolError("the window must be at most 7 days (it is compared with earlier weeks)")
+                weeks = max(1, min(int(weeks or 4), 8))
+                step = max(60_000, (t1 - t0) // 60 // 60_000 * 60_000)
+
+                def means(k: int) -> dict[tuple, float]:
+                    series = conn.client.query_range(promql, t0 - k * week, t1 - k * week, step)
+                    out: dict[tuple, float] = {}
+                    for s in series:
+                        vals = [v for _t, v in s.points if v is not None and not math.isnan(v)]
+                        if vals:
+                            key = tuple(sorted((k2, v2) for k2, v2 in s.labels.items() if k2 != "__name__"))
+                            out[key] = sum(vals) / len(vals)
+                    return out
+
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    per_week = list(pool.map(means, range(weeks + 1)))
+                keys = list(per_week[0]) or sorted({k for w in per_week[1:] for k in w})
+                rows = []
+                for key in keys:
+                    item = {"labels": dict(key)}
+                    item.update(_usual(per_week[0].get(key), [w[key] for w in per_week[1:] if key in w]))
+                    rows.append(item)
+                rank = {"high": 0, "low": 0, "normal": 1, "unknown": 2}
+                rows.sort(key=lambda r: (rank[r["verdict"]], -abs(r.get("deviations") or 0)))
+                unusual = sum(1 for r in rows if r["verdict"] in ("high", "low"))
+                return {"database": db_obj.database_name, "from": start, "to": end, "weeks": weeks,
+                        "series_count": len(rows), "unusual": unusual, "series": rows[:30],
+                        "note": (f"{unusual} of {len(rows)} series unusual for this time" if rows else
+                                 "no series in this window (check the expression and the dates)")}
             finally:
                 conn.close()
     except ToolError as ex:

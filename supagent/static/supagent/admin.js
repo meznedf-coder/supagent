@@ -24,7 +24,7 @@
     "learn.metrics": "Only these metrics", "learn.metrics_exclude": "Never these metrics",
     "learn.max_minutes": "Time limit (minutes)", "learn.max_objects": "Metrics or indices per database at most",
     "learn.profile_hours": "Statistics window (hours)", "learn.llm_descriptions": "LLM descriptions",
-    "learn.llm_per_run": "LLM descriptions per run", "mcp.user": "User of the MCP server mode",
+    "mcp.user": "User of the MCP server mode",
     "tools.export_dir": "Export directory", "tools.export_max_rows": "Excel rows at most",
     "tools.email_allowed_domains": "Allowed e-mail domains", "tools.keep_days": "Keep answer files (days)",
     "tools.max_file_mb": "Largest file kept (MB)", "agent.celery_queue": "Celery queue",

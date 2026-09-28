@@ -208,7 +208,7 @@ def test_llm_descriptions_are_marked_and_never_overwrite(world):
     llm = FakeLLM()
     out = enrich(None, deadline=9e18, llm=llm)
     assert "NODE" not in llm.asked and "le" not in llm.asked
-    assert out["written"] == out["asked"] > 0
+    assert out["written"] == len(llm.asked) > 0 and out["left"] == 0
     status = db.session.query(KObject).filter_by(kind="field", name="STATUS").one()
     assert (status.description, status.description_source, status.verified) == ("About STATUS", "llm", False)
     assert db.session.query(KObject).filter_by(kind="field", name="NODE").one().description == "Server of the run"
@@ -421,3 +421,71 @@ def test_sql_on_metrics_goes_to_the_metrics_database(world, monkeypatch):
                     "SELECT * FROM promql('up')"):
             assert tools._database(None, sql=sql).id == world["metrics"].id, sql
         assert tools._database(None, sql="SELECT COUNT(*) FROM jobs").id == world["jobs"].id
+
+
+def test_descriptions_go_on_chunk_after_chunk_until_the_time_limit(world, monkeypatch):
+    """No limit of objects per run: CHUNK objects at a time, each batch saved at once, until the
+    time limit; the next run goes on. A label is described once for every metric that has it."""
+    import time
+
+    from superset.extensions import db
+
+    from supagent.knowledge import enrich as E
+    from supagent.knowledge.store import upsert
+    from supagent.models import KObject
+
+    s_prom = world["s_prom"]
+    for i in range(7):
+        upsert(world["run"], s_prom, "metric", "", f"grid_metric_{i}", {"metric_type": "gauge", "stats": {"series": 1}})
+        upsert(world["run"], s_prom, "label", f"grid_metric_{i}", "node",
+               {"data_type": "string", "stats": {"cardinality": 2, "values": ["srv-1", "srv-2"]}})
+    db.session.commit()
+    monkeypatch.setattr(E, "CHUNK", 3)
+    monkeypatch.setattr(E, "BATCH", 2)
+
+    class FakeLLM:
+        def __init__(self, stop_after=None):
+            self.calls, self.items, self.stop_after = 0, [], stop_after
+
+        def chat(self, messages, tools=None, max_tokens=None):
+            self.calls += 1
+            items = json.loads(messages[1]["content"])
+            self.items += items
+            if self.stop_after and self.calls >= self.stop_after:
+                deadline[0] = 0.0                                     # the time limit passes
+            return {"content": json.dumps([{"id": i["id"], "description": f"About {i['name']}"} for i in items])}
+
+    deadline = [9e18]
+    monkeypatch.setattr(E.time, "time", lambda: 1.0 if deadline[0] else 2.0)
+    first = FakeLLM(stop_after=2)
+    out = E.enrich(None, deadline=1.5, llm=first)
+    assert out["stopped"].startswith("time limit") and out["written"] == 3 and out["left"] > 0     # chunk of 3: 2 + 1
+    deadline[0] = 9e18
+    rest = FakeLLM()
+    out = E.enrich(None, deadline=1.5, llm=rest)
+    assert out["left"] == 0
+    labels = [i for i in first.items + rest.items if i["kind"] == "label"]
+    node = [i for i in labels if i["name"] == "node"]
+    assert len(node) == 1 and node[0]["on_metrics"] == 8                # grid_metric_0..6 + node_cpu_seconds_total
+    assert {o.description for o in db.session.query(KObject).filter_by(kind="label", name="node")} == {"About node"}
+    assert db.session.query(KObject).filter(KObject.kind == "metric", KObject.description.is_(None)).count() == 0
+    assert time is not None
+
+
+def test_relations_are_measured_once_per_label_name(world):
+    """Hundreds of metrics sharing the label node: one relation node <-> NODE, and the objects
+    are read in steps."""
+    from superset.extensions import db
+
+    from supagent.knowledge import relations as R
+    from supagent.knowledge.store import upsert
+    from supagent.models import Relation
+
+    for i in range(250):
+        upsert(world["run"], world["s_prom"], "label", f"grid_metric_{i}", "node",
+               {"data_type": "string", "stats": {"cardinality": 3, "values": ["srv-1", "srv-2", "srv-3"]}})
+    db.session.commit()
+    out = R.learn_relations()
+    assert out == {"same_values": 1, "removed": 0, "rejected": 0}
+    assert db.session.query(Relation).filter_by(relation="same_values").count() == 1
+    assert R.learn_relations() == {"same_values": 1, "removed": 0, "rejected": 0}     # measured again: kept

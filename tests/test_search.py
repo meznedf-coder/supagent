@@ -227,3 +227,68 @@ def test_memory_and_documents_api(app):
         bad = c.post("/supagent/admin/api/docs", json={"url": "http://127.0.0.1/secret"})
         assert bad.status_code == 400 and "private" in bad.get_json()["error"]
         assert c.get("/supagent/admin/api/memory").status_code == 200
+
+
+def test_learned_answers_and_memories_about_vanished_data_are_not_given(clean_knowledge):
+    """A metric the learning saw disappear: the learned answers and memories that name it are not
+    given to the agent any more (they would send it to data that is not there)."""
+    import datetime as dt
+
+    from superset.extensions import db, security_manager as sm
+
+    from supagent.knowledge import resolve
+    from supagent.knowledge.experience import recipes_for
+    from supagent.knowledge.memory import add, prompt_block
+    from supagent.models import KObject, Recipe
+    from supagent.security import acting_as
+
+    world = clean_knowledge
+    alice = sm.find_user(username="alice").id
+    for q, sql in (("cpu of the servers", 'SELECT AVG(rate) FROM "node_cpu_seconds_total"'),
+                   ("cpu load of the servers", 'SELECT COUNT(*) FROM "jobs"')):
+        db.session.add(Recipe(question=q, words=" ".join(sorted({"cpu", "server", "load"})), tool="execute_sql",
+                              database_id=world["jobs"].id, query=sql, signature=f"sig-{q}", status="confirmed",
+                              uses=1, generic=True))
+    db.session.commit()
+    add(alice, "node_cpu_seconds_total is the CPU of the grid servers", kind="fact")
+    add(alice, "Always show CPU in percent", kind="rule")
+    resolve._CACHE.clear()
+    with acting_as("admin"):
+        assert len(recipes_for("cpu load of the servers")) == 2
+    assert "node_cpu_seconds_total" in prompt_block(alice)
+    db.session.query(KObject).filter_by(kind="metric", name="node_cpu_seconds_total").one().gone_at = dt.datetime.utcnow()
+    db.session.commit()
+    resolve._CACHE.clear()
+    with acting_as("admin"):
+        assert [r["query"] for r in recipes_for("cpu load of the servers")] == ['SELECT COUNT(*) FROM "jobs"']
+    block = prompt_block(alice)
+    assert "node_cpu_seconds_total" not in block and "CPU in percent" in block
+    assert resolve.mentions_gone("see node_cpu_seconds_total") and not resolve.mentions_gone("see node_cpu")
+
+
+def test_weak_neighbours_found_by_meaning_only_are_left_out(clean_knowledge, monkeypatch):
+    """A piece found by meaning only must be close enough (cosine floor, and not far behind the
+    closest one); each result says which search found it."""
+    from supagent import settings
+    from supagent.knowledge import embeddings as E
+    from supagent.knowledge import search as S
+    from supagent.knowledge.index import sync
+    from supagent.models import Chunk
+    from supagent.security import acting_as
+    from superset.extensions import db
+
+    sync()
+    chunks = {c.title: c.id for c in db.session.query(Chunk)}
+    cpu = next(i for t, i in chunks.items() if t.startswith("metric node_cpu"))
+    others = [i for t, i in chunks.items() if i != cpu]
+    real_get = settings.get
+    monkeypatch.setattr(settings, "get", lambda k: "fake-model" if k == "embed.model" else real_get(k))
+    monkeypatch.setattr(E, "embed", lambda texts: [np.ones(4, dtype=np.float32)] * len(texts))
+    monkeypatch.setattr(E, "nearest", lambda qv, allowed, k: [(cpu, 0.82)] + [(i, 0.30) for i in others])
+    with acting_as("admin"):
+        found = S.search("processor load", k=8)
+        meaning_only = [f["title"] for f in found if f["via"] == "meaning"]
+        assert len(meaning_only) == 1 and meaning_only[0].startswith("metric node_cpu")     # 0.30: left out
+        assert all(f["via"] in ("words", "meaning", "words and meaning") for f in found)
+        monkeypatch.setattr(E, "nearest", lambda qv, allowed, k: [(i, 0.30) for i in [cpu] + others])
+        assert all(f["via"] != "meaning" for f in S.search("processor load", k=8))     # nothing close enough

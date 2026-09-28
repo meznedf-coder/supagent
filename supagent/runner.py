@@ -8,6 +8,7 @@ import datetime as dt
 import logging
 import mimetypes
 import os
+import time
 import traceback
 from typing import Any
 
@@ -164,6 +165,24 @@ def _name_chat(conversation_id: int, question: str, earlier: list, trace: list[d
         return None
 
 
+def _record_usage(message_id: int, user_id: int | None, seconds: float, llm: dict[str, Any],
+                  trace: list[dict]) -> None:
+    """What the answer took (superset supagent stats); never breaks an answer."""
+    from supagent.models import Usage
+
+    try:
+        db.session.merge(Usage(
+            message_id=message_id, user_id=user_id, seconds=round(seconds, 1), llm_calls=int(llm.get("calls") or 0),
+            llm_seconds=round(float(llm.get("seconds") or 0), 1), prompt_tokens=int(llm.get("prompt_tokens") or 0),
+            completion_tokens=int(llm.get("completion_tokens") or 0), cached_tokens=int(llm.get("cached_tokens") or 0),
+            tool_calls=len(trace), tool_seconds=round(sum(float(t.get("seconds") or 0) for t in trace), 1),
+            failed_calls=sum(1 for t in trace if t.get("status") == "error")))
+        db.session.commit()
+    except Exception:  # pylint: disable=broad-except   (table not created yet: superset supagent init)
+        db.session.rollback()
+        log.info("supagent: usage of answer %s not recorded", message_id)
+
+
 def run_answer(message_id: int) -> None:
     """Compute the answer of an assistant message (status pending -> running -> done / error)."""
     from superset.extensions import security_manager
@@ -205,6 +224,7 @@ def run_answer(message_id: int) -> None:
 
     agent = None
     trace: list[dict] = []
+    started = time.time()
     try:
         with acting_as(username):
             agent = Agent(username, on_step=on_step, rich_results=True, should_stop=should_stop)
@@ -222,6 +242,7 @@ def run_answer(message_id: int) -> None:
                     db.session.query(File).filter(File.id.in_(kept)).delete(synchronize_session=False)
                     db.session.commit()
                 return
+            _record_usage(message_id, user_id, time.time() - started, getattr(agent, "usage", None) or {}, trace)
             from supagent.knowledge.experience import learn_from_answer
 
             learn_from_answer(message_id, user_id, question, trace)      # query timings
@@ -245,6 +266,34 @@ def run_answer(message_id: int) -> None:
               finished_at=dt.datetime.utcnow())
     finally:
         db.session.remove()
+
+
+def purge_old_chats() -> int:
+    """Chats nobody used for chats.keep_days days (0: never) go, 100 at a time, with their messages,
+    files and usage; what they taught stays (learned answers, memory, associations)."""
+    from sqlalchemy import func
+
+    from supagent.models import Usage
+
+    days = int(settings.get("chats.keep_days") or 0)
+    if days <= 0:
+        return 0
+    limit = dt.datetime.utcnow() - dt.timedelta(days=days)
+    last = (db.session.query(Message.conversation_id, func.max(Message.created_at).label("at"))
+            .group_by(Message.conversation_id).subquery())
+    old = [cid for (cid,) in db.session.query(Conversation.id).outerjoin(last, last.c.conversation_id == Conversation.id)
+           .filter(func.coalesce(last.c.at, Conversation.created_at) < limit)]
+    for i in range(0, len(old), 100):
+        ids = old[i:i + 100]
+        mids = [m for (m,) in db.session.query(Message.id).filter(Message.conversation_id.in_(ids))]
+        for j in range(0, len(mids), 500):
+            part = mids[j:j + 500]
+            db.session.query(File).filter(File.message_id.in_(part)).delete(synchronize_session=False)
+            db.session.query(Usage).filter(Usage.message_id.in_(part)).delete(synchronize_session=False)
+        db.session.query(Message).filter(Message.conversation_id.in_(ids)).delete(synchronize_session=False)
+        db.session.query(Conversation).filter(Conversation.id.in_(ids)).delete(synchronize_session=False)
+        db.session.commit()
+    return len(old)
 
 
 def purge_old_files() -> int:

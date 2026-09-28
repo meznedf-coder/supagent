@@ -94,11 +94,18 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
                                                         text, re.I):
                     text += " What this database can run: " + SQL_RULES[backend]
                 return {"success": False, "error": text}
-            return {"success": True, "database": database.database_name,
-                    "columns": [{"name": c} for c in columns],
-                    "rows": [{c: _plain(v) for c, v in zip(columns, r)} for r in rows],
-                    "row_count": len(rows), "truncated": truncated, "seconds": round(time.time() - t0, 2),
-                    "error": None}
+            out = {"success": True, "database": database.database_name,
+                   "columns": [{"name": c} for c in columns],
+                   "rows": [{c: _plain(v) for c, v in zip(columns, r)} for r in rows],
+                   "row_count": len(rows), "truncated": truncated, "seconds": round(time.time() - t0, 2),
+                   "error": None}
+            if not rows:                                   # why, from the dictionary (no query)
+                from supagent.knowledge.empty import why_empty
+
+                hint = why_empty(database, request.sql)
+                if hint:
+                    out["hint"] = hint
+            return out
     except Exception as ex:  # pylint: disable=broad-except
         return {"success": False, "error": f"{type(ex).__name__}: {str(ex)[:1500]}"}
 

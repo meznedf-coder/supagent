@@ -73,7 +73,15 @@ def running_run() -> Run | None:
 
 def run_learning(reason: str = "manual", databases: list[str] | None = None, llm: bool = True,
                  max_minutes: int | None = None) -> dict[str, Any]:
-    """Learn now; returns the run's summary (also stored in supagent_run)."""
+    """Learn now; returns the run's summary (also stored in supagent_run). Its LLM calls wait
+    while answers are being computed (supagent.priority)."""
+    from supagent.llm import background
+
+    with background():
+        return _run_learning(reason, databases, llm, max_minutes)
+
+
+def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minutes: int | None) -> dict[str, Any]:
     from supagent.knowledge.curated import apply_catalog
     from supagent.knowledge.enrich import enrich, infer_categories
     from supagent.knowledge.learn_indices import learn_indices
@@ -144,11 +152,18 @@ def run_learning(reason: str = "manual", databases: list[str] | None = None, llm
                 from supagent.knowledge.generic import tidy_learned
 
                 try:
-                    stats["generic_questions"] = tidy_learned(limit=50)   # older learned answers and chats
+                    stats["generic_questions"] = tidy_learned(limit=50, deadline=deadline + 600)   # older ones
                 except Exception as ex:  # pylint: disable=broad-except
                     db.session.rollback()
                     stats["generic_questions"] = {"error": str(ex)[:300]}
             stats["index"] = index_knowledge()
+            try:                                      # does "Where the data is" find the Helpful answers' data?
+                from supagent.knowledge.quality import evaluate_resolver
+
+                stats["resolver"] = evaluate_resolver(limit=100, seconds=60)
+            except Exception as ex:  # pylint: disable=broad-except
+                db.session.rollback()
+                stats["resolver"] = {"error": str(ex)[:300]}
     except Exception as ex:  # pylint: disable=broad-except
         db.session.rollback()
         log.exception("supagent learn: run %s failed", run_id)

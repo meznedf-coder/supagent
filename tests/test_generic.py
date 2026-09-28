@@ -210,3 +210,24 @@ def test_the_daily_learning_joins_what_the_llm_finds_already_kept(world):
     (r,) = db.session.query(Recipe).all()
     assert (r.id, r.status, r.uses, r.query) == (old.id, "confirmed", 4, "SELECT COUNT(*) FROM jobs WHERE APP = 'X'")
     assert f"{old.id}: Number of failed jobs" in llm.calls[0]
+
+
+def test_the_daily_tidying_stops_at_the_time_limit(world):
+    """The learning run's LLM steps stop at its time limit (a run once looked blocked at the end
+    rewriting old answers one LLM call after another); the next run goes on."""
+    from superset.extensions import db
+
+    from supagent.knowledge.generic import tidy_learned
+    from supagent.models import Recipe
+
+    db.session.query(Recipe).delete()
+    db.session.commit()
+    for i in range(3):
+        db.session.add(Recipe(question=f"failed jobs of app {i} on the 23rd", words="fail job", tool="execute_sql",
+                              database_id=world["jobs"].id, query=f"SELECT {i}", signature=f"s{i}",
+                              status="helpful", uses=1, generic=False))
+    db.session.commit()
+    llm = FakeLLM({"question": "Failed jobs of a given application on a given day", "title": "Failed jobs",
+                   "reusable": True})
+    assert tidy_learned(llm=llm, deadline=0.0) == {"answers": 0, "chats": 0, "merged": 0, "stopped": "time limit"}
+    assert not llm.calls

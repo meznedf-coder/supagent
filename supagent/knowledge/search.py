@@ -17,6 +17,8 @@ from supagent.models import Chunk
 
 log = logging.getLogger(__name__)
 RRF = 60
+VECTOR_FLOOR = 0.35     # a piece found by meaning only must be at least this close (cosine)...
+VECTOR_MARGIN = 0.2     # ... and not far behind the closest one: a weak neighbour is noise, not knowledge
 
 
 def _allowed_query(kinds: tuple[str, ...] | None = None) -> Any:
@@ -68,13 +70,21 @@ def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = Non
     k = int(k or settings.get("search.top_k"))
     q = _allowed_query(kinds)
     ranks: dict[int, float] = {}
-    for rank, cid in enumerate(_lexical(q, _terms(query))):
+    by_words = _lexical(q, _terms(query))
+    for rank, cid in enumerate(by_words):
         ranks[cid] = ranks.get(cid, 0.0) + 1.0 / (RRF + rank)
+    by_meaning: set[int] = set()
     if E.enabled():
         try:
             allowed = {cid for (cid,) in q.with_entities(Chunk.id)}
             qv = E.embed([query])[0]
-            for rank, (cid, _score) in enumerate(E.nearest(qv, allowed, 50)):
+            hits = E.nearest(qv, allowed, 50)
+            floor = max(VECTOR_FLOOR, (hits[0][1] - VECTOR_MARGIN) if hits else 0.0)
+            words = set(by_words)
+            for rank, (cid, score) in enumerate(hits):
+                if score < floor and cid not in words:       # a weak neighbour found by meaning only
+                    continue
+                by_meaning.add(cid)
                 ranks[cid] = ranks.get(cid, 0.0) + 1.0 / (RRF + rank)
         except Exception as ex:  # pylint: disable=broad-except   (words still work)
             log.warning("supagent search: vectors not used: %s", ex)
@@ -82,11 +92,15 @@ def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = Non
     if not best:
         return []
     rows = {c.id: c for c in db.session.query(Chunk).filter(Chunk.id.in_([cid for cid, _s in best]))}
+    words_found = set(by_words)
     out = []
     for cid, score in best:
         c = rows.get(cid)
         if c is not None:
-            out.append({"ref": c.ref, "kind": c.kind, "title": c.title, "text": c.text, "score": round(score, 4)})
+            via = "words and meaning" if cid in words_found and cid in by_meaning else \
+                ("words" if cid in words_found else "meaning")
+            out.append({"ref": c.ref, "kind": c.kind, "title": c.title, "text": c.text, "score": round(score, 4),
+                        "via": via})
     return out
 
 
@@ -100,6 +114,10 @@ def knowledge_block(question: str) -> str:
         return ""
     if not found:
         return ""
+    from supagent.knowledge.resolve import gone_names, mentions_gone
+
+    gone = gone_names()
+    found = [f for f in found if f["kind"] not in ("recipe", "memory") or not mentions_gone(f["text"], gone)]
     budget = int(settings.get("search.prompt_chars"))
     lines = ["\n\nBackground that looks relevant to this question (from the data dictionary, the catalog, the "
              "team's learned answers and memory, the documents). It is a summary, not an answer: call "

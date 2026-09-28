@@ -12,6 +12,7 @@ may query (Superset's database access)."""
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -29,7 +30,7 @@ NAMED = 6                         # more candidates, by name only
 LIVE_LOOKUPS = 4                  # label lookups for metrics the dictionary does not know yet
 BUDGET_S = 3.0
 
-SYNONYMS: dict[str, set[str]] = {
+_SYNONYMS: dict[str, set[str]] = {
     "cpu": {"cpu", "processor", "proc"}, "processor": {"cpu", "processor"}, "processeur": {"cpu", "processor"},
     "load": {"load"}, "charge": {"load"},
     "memory": {"memory", "mem", "heap", "ram", "rss"}, "mem": {"memory", "mem"}, "ram": {"memory", "mem", "ram"},
@@ -54,12 +55,18 @@ SYNONYMS: dict[str, set[str]] = {
     "node": {"node", "server", "host", "instance"}, "host": {"host", "node", "server", "instance"},
 }
 
+# the same words as the questions and the names become (stems): failed and failure are "fail"
+SYNONYMS: dict[str, set[str]] = {}
+for _k, _v in _SYNONYMS.items():
+    SYNONYMS.setdefault(stem(_k), set()).update(stem(x) for x in _v)
+
 # words that say what to do with the data, not which data: never matched on names
 GENERIC = set("""over during since until per rate rates count number total totals average avg sum max min maximum
 minimum value values chart graph plot table need see want show give get last past next hour minute day week
 month year today yesterday now please can could would top highest lowest most least trend evolution compare list
 what which much many time times current currently moyenne nombre taux graphique courbe tableau dernier derniere
 heure jour semaine mois annee aujourd hier maintenant plus moin evolution liste""".split())
+GENERIC |= {stem(w) for w in GENERIC}
 
 _LOCK = threading.Lock()
 _CACHE: dict[Any, tuple[float, Any]] = {}
@@ -136,21 +143,42 @@ def _dictionary(source_ids: tuple[int, ...]) -> list[dict[str, Any]]:
     return _cached(("dictionary", source_ids), make)
 
 
-def _score(q: list[str], tokens: list[str], words: set[str], labels: set[str] | None = None) -> float:
-    """The word itself in the name 3, a synonym 2, the start of a name word 1.5, the description 1;
-    a word naming one of the metric's labels ("per application") 1; two name matches 1 more."""
+class Rarity:
+    """How rare each word of the names is: a match on a word few names have ("elasticsearch")
+    counts more than one on a word hundreds of names have ("node" of node_*); from 0.7 (in every
+    name) to 1 (in one, or none)."""
+
+    def __init__(self, names: list[list[str]]) -> None:
+        from collections import Counter
+
+        self.n = max(1, len(names))
+        self.df = Counter(t for tokens in names for t in set(tokens))
+
+    def __call__(self, t: str) -> float:
+        df = self.df.get(t, 0)
+        if df <= 1 or self.n <= 1:
+            return 1.0
+        return 0.7 + 0.3 * max(0.0, 1.0 - math.log(1 + df) / math.log(1 + self.n))
+
+
+def _score(q: list[str], tokens: list[str], words: set[str], labels: set[str] | None = None,
+           rarity: Rarity | None = None) -> float:
+    """The word itself in the name 3, a synonym 2, the start of a name word 1.5 (each weighted by
+    the rarity of the word), the description 1; a word naming one of the metric's labels ("per
+    application") 1; two name matches 1 more."""
     score, matched = 0.0, 0
     tset = set(tokens)
     for t in q:
         alts = SYNONYMS.get(t, set()) - {t}
+        w = rarity(t) if rarity is not None else 1.0
         if t in tset:
-            score += 3
+            score += 3 * w
             matched += 1
         elif alts & tset:
-            score += 2
+            score += 2 * (min(rarity(a) for a in alts & tset) if rarity is not None else 1.0)
             matched += 1
         elif any(len(a) >= 4 and len(n) >= 4 and (n.startswith(a) or a.startswith(n)) for a in alts | {t} for n in tset):
-            score += 1.5
+            score += 1.5 * w
             matched += 1
         elif ({t} | alts) & words:
             score += 1
@@ -159,6 +187,22 @@ def _score(q: list[str], tokens: list[str], words: set[str], labels: set[str] | 
     if matched >= 2:
         score += 1
     return score - 0.1 * max(0, len(tset) - matched)
+
+
+def _rarity(known: list[dict[str, Any]], lists: dict[int, list[tuple[str, list[str]]]]) -> Rarity:
+    """The rarity of the words of every name the resolver scores (cached with the lists)."""
+    key = ("rarity", len(known), tuple((i, len(v)) for i, v in sorted(lists.items())))
+
+    def make() -> Rarity:
+        seen: dict[str, list[str]] = {}
+        for o in known:
+            seen.setdefault(o["name"], name_tokens(o["name"]))
+        for names in lists.values():
+            for n, tokens in names:
+                seen.setdefault(n, tokens)
+        return Rarity(list(seen.values()))
+
+    return _cached(key, make)
 
 
 def _databases() -> list[Any]:
@@ -188,30 +232,37 @@ def resolve(question: str) -> list[dict[str, Any]]:
             db.session.rollback()
     db.session.commit()
     known = _dictionary(tuple(sorted(by_source)))
-    for o in known:
-        d = by_source.get(o["source_id"])
-        labels = {stem(norm(str(x))) for x in o.get("labels") or []}
-        score = _score(q, name_tokens(o["name"]), o["words"], labels)
-        if d is None or score < 2:
-            continue
-        found[(d.id, o["kind"], o["parent"], o["name"])] = {**o, "database": d, "score": score}
+    lists: dict[int, list[tuple[str, list[str]]]] = {}     # the live metric names of each metrics database
     for d in databases:
         if d.backend != "promagg" or time.time() - t0 > BUDGET_S:
             continue
         try:
-            names = _metric_names(d)
+            lists[d.id] = _metric_names(d)
         except Exception as ex:  # pylint: disable=broad-except
             log.info("supagent resolve: metrics of %s: %s", d.database_name, ex)
+    rarity = _rarity(known, lists)
+    for o in known:
+        d = by_source.get(o["source_id"])
+        labels = {stem(norm(str(x))) for x in o.get("labels") or []}
+        score = _score(q, name_tokens(o["name"]), o["words"], labels, rarity)
+        if d is None or score < 2:
             continue
+        found[(d.id, o["kind"], o["parent"], o["name"])] = {**o, "database": d, "score": score}
+    live: dict[int, set[str]] = {}                  # metrics that exist now, per metrics database
+    for d in databases:
+        names = lists.get(d.id)
+        if names is None:
+            continue
+        live[d.id] = {n for n, _t in names}
         for name, tokens in names:
             key = (d.id, "metric", "", name)
             if key in found:
                 continue
-            score = _score(q, tokens, set())
+            score = _score(q, tokens, set(), None, rarity)
             if score >= 2:
                 found[key] = {"kind": "metric", "parent": "", "name": name, "database": d, "score": score,
                               "words": set()}
-    _associations(q, found, databases)
+    _associations(q, found, databases, live, _gone(tuple(sorted(by_source))), by_source)
     known_sources = {o["source_id"] for o in known}
     learned = {d.id for sid, d in by_source.items() if sid in known_sources}
     try:
@@ -234,14 +285,68 @@ def resolve(question: str) -> list[dict[str, Any]]:
     return ranked[:DETAILED + NAMED]
 
 
-def _associations(q: list[str], found: dict[tuple, dict[str, Any]], databases: list[Any]) -> None:
-    """What earlier successful answers used for these words: a boost (or a new candidate)."""
+ASSOCIATION_DAYS = 60             # an association no answer used for this long is not used
+
+
+def _gone(source_ids: tuple[int, ...]) -> set[tuple[int, str, str]]:
+    """(source id, kind, name) of the metrics and indices the learning saw disappear."""
+    from supagent.models import KObject
+
+    def make() -> set[tuple[int, str, str]]:
+        rows = (db.session.query(KObject.source_id, KObject.kind, KObject.name)
+                .filter(KObject.source_id.in_(source_ids), KObject.kind.in_(("metric", "index")),
+                        KObject.gone_at.isnot(None)).all())
+        return {(sid, kind, name) for sid, kind, name in rows}
+
+    return _cached(("gone", source_ids), make) if source_ids else set()
+
+
+def gone_names() -> set[str]:
+    """Names of the metrics and indices the learning saw disappear and that no database still has."""
+    from supagent.models import KObject
+
+    def make() -> set[str]:
+        kinds = ("metric", "index")
+        gone = {n for (n,) in db.session.query(KObject.name).filter(KObject.kind.in_(kinds),
+                                                                     KObject.gone_at.isnot(None))}
+        if not gone:
+            return set()
+        alive = {n for (n,) in db.session.query(KObject.name).filter(KObject.kind.in_(kinds), KObject.gone_at.is_(None),
+                                                                      KObject.name.in_(list(gone)[:5000]))}
+        return gone - alive
+
+    try:
+        return _cached(("gone_names",), make)
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        return set()
+
+
+def mentions_gone(text: str | None, names: set[str] | None = None) -> bool:
+    """A learned answer or a memory that names a metric or index that no longer exists: not given
+    to the agent (it would send it to data that is not there)."""
+    names = gone_names() if names is None else names
+    if not names or not text:
+        return False
+    return any(w in names for w in re.findall(r"[A-Za-z0-9_:.@\-]+", text))
+
+
+def _associations(q: list[str], found: dict[tuple, dict[str, Any]], databases: list[Any],
+                  live: dict[int, set[str]] | None = None, gone: set[tuple[int, str, str]] | None = None,
+                  by_source: dict[int, Any] | None = None) -> None:
+    """What earlier successful answers used for these words: a boost (or a new candidate). Not
+    used: associations no answer used for ASSOCIATION_DAYS, and those to a metric that no longer
+    exists (live list) or to a metric or index the learning saw disappear."""
+    import datetime as dt
+
     from supagent import settings
     from supagent.models import Association
 
     if not settings.get("learn.associations"):
         return
     ids = {d.id: d for d in databases}
+    source_of = {d.id: sid for sid, d in (by_source or {}).items()}
+    since = dt.datetime.utcnow() - dt.timedelta(days=ASSOCIATION_DAYS)
     try:
         rows = db.session.query(Association).filter(Association.word.in_(q)).all()
     except Exception:  # pylint: disable=broad-except   (table not created yet: superset supagent init)
@@ -250,6 +355,12 @@ def _associations(q: list[str], found: dict[tuple, dict[str, Any]], databases: l
     for a in rows:
         d = ids.get(a.database_id)
         if d is None:
+            continue
+        if a.updated_at is not None and a.updated_at < since:
+            continue
+        if a.kind == "metric" and live and a.database_id in live and a.name not in live[a.database_id]:
+            continue
+        if gone and (source_of.get(a.database_id), a.kind, a.name) in gone:
             continue
         key = (d.id, a.kind, a.parent or "", a.name)
         c = found.setdefault(key, {"kind": a.kind, "parent": a.parent or "", "name": a.name, "database": d,

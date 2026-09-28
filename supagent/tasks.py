@@ -36,9 +36,11 @@ def remember_task(message_id: int) -> None:
     from superset import db
 
     from supagent.knowledge.memory import learn_from_message
+    from supagent.llm import background
 
     try:
-        learn_from_message(message_id)
+        with background():
+            learn_from_message(message_id)
     finally:
         db.session.remove()
 
@@ -59,10 +61,12 @@ def learn_helpful(message_id: int) -> None:
     from supagent.knowledge.autocatalog import run as agent_catalog
     from supagent.knowledge.experience import learn_from_helpful
     from supagent.knowledge.index import sync
+    from supagent.llm import background
 
-    if learn_from_helpful(message_id) is not None:
-        sync(("recipe:",))
-        agent_catalog(llm_docs=False, parts=("formulas",))
+    with background():                     # the people waiting for an answer first
+        if learn_from_helpful(message_id) is not None:
+            sync(("recipe:",))
+            agent_catalog(llm_docs=False, parts=("formulas",))
 
 
 @celery_app.task(name="supagent.catalog", ignore_result=True, soft_time_limit=600, time_limit=660)
@@ -85,11 +89,14 @@ def doc_task(doc_id: int) -> None:
     from supagent.knowledge.index import index_knowledge
     from supagent.models import Doc
 
+    from supagent.llm import background
+
     try:
         d = db.session.get(Doc, doc_id)
         if d is not None:
-            refresh(d)
-            index_knowledge()
+            with background():
+                refresh(d)
+                index_knowledge()
     finally:
         db.session.remove()
 
@@ -100,10 +107,11 @@ def learn_tick() -> None:
     from superset import db
 
     from supagent.knowledge.learner import due_today, run_learning
-    from supagent.runner import purge_old_files
+    from supagent.runner import purge_old_chats, purge_old_files
 
     try:
         purge_old_files()
+        purge_old_chats()
         if due_today():
             run_learning(reason="schedule")
         else:
@@ -150,14 +158,20 @@ def _queue() -> dict[str, str]:
     return {"queue": queue} if queue else {}
 
 
-def _in_thread(fn: Any, *args: Any) -> None:
+def _in_thread(fn: Any, *args: Any, background: bool = False) -> None:
     from flask import current_app
 
     app = current_app._get_current_object()
 
     def run() -> None:
+        from supagent.llm import background as llm_background
+
         with app.app_context():
-            fn(*args)
+            if background:                 # its LLM calls wait while answers are computed
+                with llm_background():
+                    fn(*args)
+            else:
+                fn(*args)
 
     threading.Thread(target=run, name=f"supagent-{fn.__name__}", daemon=True).start()
 
@@ -213,7 +227,7 @@ def _dispatch(task: Any, fn: Any, *args: Any) -> str:
             return "celery"
         except Exception as ex:  # pylint: disable=broad-except
             log.warning("supagent: Celery refused %s (%s), running it here", task.name, ex)
-    _in_thread(fn, *args)
+    _in_thread(fn, *args, background=True)
     return "thread"
 
 
