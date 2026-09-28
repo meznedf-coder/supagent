@@ -34,7 +34,8 @@
     "embed.per_run": "Pieces embedded per run", "search.vector_store": "Vectors kept in",
     "qdrant.url": "Qdrant server", "qdrant.api_key": "Qdrant API key", "qdrant.collection": "Qdrant collection",
     "docs.allowed_domains": "Allowed domains for documents", "docs.max_kb": "Largest page or file (KB)",
-    "memory.enabled": "Learn from the chats", "memory.team_approval": "Team memories need approval"
+    "memory.enabled": "Learn from the chats", "memory.team_approval": "Team memories need approval",
+    "memory.prompt_chars": "Characters of memories per question", "chats.keep_days": "Keep chats (days, 0: always)"
   };
 
   function status() {
