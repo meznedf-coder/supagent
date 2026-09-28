@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supagent"
+version = "0.2.0"
+description = "An AI agent inside Apache Superset: chat page, a data dictionary learned every day (metrics and index fields, their types, units and relationships) stored in Superset's database, tools that act with the user's permissions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# everything else comes with Superset (Flask-AppBuilder, SQLAlchemy, Celery, requests, PyYAML,
+# markdown, nh3, Pillow); pydantic comes with Superset 6.1 but not 6.0; fastmcp (Superset's MCP
+# service, to save charts and dashboards) is optional
+dependencies = ["pydantic>=2.8,<3"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.entry-points."flask.commands"]
+supagent = "supagent.cli:supagent"
+
+[tool.setuptools.packages.find]
+include = ["supagent*"]
+
+[tool.setuptools.package-data]
+supagent = ["templates/supagent/*.html", "static/supagent/*"]

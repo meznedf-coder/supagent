@@ -1,0 +1,93 @@
+{% extends "supagent/base.html" %}
+{% block title %}Data dictionary{% endblock %}
+{% block content %}
+<div class="dict">
+  <section class="dict-head">
+    <div>
+      <h1>Data dictionary</h1>
+      <p class="muted">Learned every day from the databases you may query: what each metric, index, field and
+        label is, its type and unit, its values, and how they relate. Texts marked <span class="badge llm">AI-written</span>
+        are guesses of the LLM until an admin approves or corrects them.</p>
+    </div>
+    <div id="sources" class="sources"></div>
+  </section>
+  <nav class="subtabs" role="tablist">
+    <button type="button" role="tab" data-tab="browse" class="on">Browse</button>
+    <button type="button" role="tab" data-tab="relations">Relations</button>
+    <button type="button" role="tab" data-tab="changes">Changes</button>
+    <button type="button" role="tab" data-tab="learned">Learned answers</button>
+    <button type="button" role="tab" data-tab="search">Search</button>
+  </nav>
+  <section id="tab-search" class="tab" hidden>
+    <p class="muted">Search everything the agent knows, as the agent does for each question: the dictionary, the
+      catalog's notes, rules and formulas, the learned answers, the memory, the documents.</p>
+    <form id="k-form" class="filters" autocomplete="off">
+      <input id="k-q" type="search" placeholder="e.g. why do jobs fail on a saturated server" aria-label="Search the knowledge">
+      <select id="k-kind" aria-label="Kind"><option value="">Everything</option><option value="metric">Metrics</option>
+        <option value="index">Indices</option><option value="note">Notes</option><option value="rule">Rules</option>
+        <option value="glossary">Glossary</option><option value="formula">Formulas</option>
+        <option value="recipe">Learned answers</option>
+        <option value="memory">Memory</option><option value="doc">Documents</option></select>
+      <button type="submit" class="btn primary">Search</button>
+    </form>
+    <div id="k-results" class="k-results"></div>
+  </section>
+  <section id="tab-browse" class="tab">
+    <form id="filters" class="filters" autocomplete="off">
+      <select id="f-source" aria-label="Database"><option value="">All databases</option></select>
+      <select id="f-kind" aria-label="Kind">
+        <option value="">Everything</option><option value="metric">Metrics</option><option value="label">Metric labels</option>
+        <option value="family">Metric families</option><option value="index">Indices</option><option value="field">Index fields</option>
+      </select>
+      <select id="f-show" aria-label="Show">
+        <option value="">Current</option><option value="unverified">AI-written, not approved</option>
+        <option value="undescribed">Without description</option><option value="gone">Gone</option>
+      </select>
+      <input id="f-q" type="search" placeholder="Search names and descriptions" aria-label="Search">
+    </form>
+    <div class="table-wrap"><table class="grid" id="objects">
+      <thead><tr><th>Name</th><th>Kind</th><th>Type</th><th>Unit</th><th>Description</th><th class="num">Size</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="pager"><button type="button" class="btn" id="prev">Previous</button><span id="page-info" class="muted"></span><button type="button" class="btn" id="next">Next</button></div>
+  </section>
+  <section id="tab-relations" class="tab" hidden>
+    <p class="muted">How metrics and index fields relate: written in the catalog, or measured on the data (the values two
+      columns have in common). The agent uses them to join indices and to match metric labels with index fields.</p>
+    <div class="table-wrap"><table class="grid" id="relations">
+      <thead><tr><th>Relation</th><th>Origin</th><th class="num">Confidence</th></tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+  <section id="tab-changes" class="tab" hidden>
+    <div class="filters"><label>Last <select id="c-days"><option>1</option><option selected>7</option><option>30</option></select> days</label></div>
+    <div class="table-wrap"><table class="grid" id="changes">
+      <thead><tr><th>When</th><th>Change</th><th>What</th><th>Database</th><th>Detail</th></tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+  <section id="tab-learned" class="tab" hidden>
+    <p class="muted">What the agent learned from the answers of the team: the shortest way to a result (the final
+      query, or the chart that was saved), how long it took, how often it was used. <strong>confirmed</strong>: a user
+      found the answer helpful; <strong>rejected</strong>: not helpful (never proposed again); automatic ones are
+      proposed once used twice. You only see what concerns the databases you may query.</p>
+    <div class="filters"><select id="r-status" aria-label="Status"><option value="">All</option>
+      <option value="confirmed">Confirmed</option><option value="auto">Automatic</option>
+      <option value="rejected">Rejected</option></select></div>
+    <div class="table-wrap"><table class="grid" id="recipes">
+      <thead><tr><th>Question</th><th>Way</th><th class="num">Time</th><th class="num">Uses</th><th>Status</th><th></th></tr></thead>
+      <tbody></tbody></table></div>
+    <h2 class="section-title">Query timings</h2>
+    <p class="muted">How long each kind of query took (values removed), slowest first: the agent sees them next to
+      the metric or index it is about to query.</p>
+    <div class="table-wrap"><table class="grid" id="timings">
+      <thead><tr><th>On</th><th>Kind of query</th><th class="num">Calls</th><th class="num">Average</th>
+        <th class="num">Slowest</th><th class="num">Failed</th></tr></thead><tbody></tbody></table></div>
+  </section>
+</div>
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="d-title">
+    <button type="button" class="close" id="d-close" aria-label="Close">&times;</button>
+    <div id="d-body"></div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('supagent_static.static', filename='dictionary.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

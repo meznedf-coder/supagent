@@ -1,0 +1,130 @@
+"""The Superset tools the agent uses most, in-process (no MCP service needed): SQL, databases,
+datasets. Same names and request shapes as Superset's MCP tools; Superset's own checks decide
+what the user may see (raise_for_access for SQL, database / dataset access for the lists)."""
+
+from __future__ import annotations
+
+import datetime as dt
+import decimal
+import math
+import time
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from supagent.tools import _as_user, _run, mcp
+
+
+def _plain(v: Any) -> Any:
+    if isinstance(v, (dt.datetime, dt.date)):
+        return v.isoformat(sep=" ") if isinstance(v, dt.datetime) else v.isoformat()
+    if isinstance(v, decimal.Decimal):
+        return float(v)
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        return v.hex()
+    return v
+
+
+class ExecuteSqlRequest(BaseModel):
+    database_id: int = Field(description="Database id (list_databases)")
+    sql: str = Field(description="One SELECT statement")
+    limit: int = Field(default=1000, description="Rows returned at most (at most 10000)")
+
+
+@mcp.tool
+def execute_sql(request: ExecuteSqlRequest) -> dict:
+    """Run one SELECT on a database, with your permissions, and return its rows."""
+    t0 = time.time()
+    try:
+        with _as_user():
+            from superset.extensions import db
+            from superset.models.core import Database
+
+            database = db.session.get(Database, int(request.database_id))
+            if database is None:
+                return {"success": False, "error": f"database {request.database_id} not found (list_databases)"}
+            limit = max(1, min(int(request.limit or 1000), 10000))
+            from supagent.knowledge.experience import guard_sql
+
+            refused = guard_sql(database, request.sql)
+            if refused:
+                return {"success": False, "error": refused}
+            columns, rows, truncated = _run(database, request.sql, limit, extract=False)
+            return {"success": True, "database": database.database_name,
+                    "columns": [{"name": c} for c in columns],
+                    "rows": [{c: _plain(v) for c, v in zip(columns, r)} for r in rows],
+                    "row_count": len(rows), "truncated": truncated, "seconds": round(time.time() - t0, 2),
+                    "error": None}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"success": False, "error": f"{type(ex).__name__}: {str(ex)[:1500]}"}
+
+
+@mcp.tool
+def list_databases() -> dict:
+    """The databases you may query: id, name, engine (osagg = OpenSearch indices, promagg =
+    Prometheus / Mimir metrics)."""
+    with _as_user():
+        from superset.extensions import db, security_manager
+        from superset.models.core import Database
+
+        out = []
+        for d in db.session.query(Database).order_by(Database.id):
+            if security_manager.can_access_database(d):
+                out.append({"id": d.id, "name": d.database_name, "backend": d.backend,
+                            "kind": {"osagg": "OpenSearch indices", "promagg": "Prometheus / Mimir metrics"}.get(
+                                d.backend, d.backend)})
+        return {"databases": out}
+
+
+class ListDatasetsRequest(BaseModel):
+    search: str | None = Field(default=None, description="Part of the dataset name")
+    database_id: int | None = Field(default=None, description="Only this database")
+    page_size: int = Field(default=50, description="Datasets returned at most")
+
+
+@mcp.tool
+def list_datasets(request: ListDatasetsRequest | None = None) -> dict:
+    """Superset datasets you may use (for charts): id, name, database."""
+    request = request or ListDatasetsRequest()
+    with _as_user():
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.extensions import db, security_manager
+
+        q = db.session.query(SqlaTable).order_by(SqlaTable.id)
+        if request.database_id is not None:
+            q = q.filter(SqlaTable.database_id == int(request.database_id))
+        if request.search:
+            q = q.filter(SqlaTable.table_name.ilike(f"%{request.search}%"))
+        out = []
+        for ds in q:
+            if len(out) >= max(1, min(request.page_size, 200)):
+                break
+            if security_manager.can_access_datasource(ds):
+                out.append({"id": ds.id, "table_name": ds.table_name, "database_id": ds.database_id,
+                            "database": ds.database.database_name, "schema": ds.schema,
+                            "description": (ds.description or "")[:200]})
+        return {"datasets": out, "count": len(out)}
+
+
+class DatasetInfoRequest(BaseModel):
+    identifier: int = Field(description="Dataset id (list_datasets)")
+
+
+@mcp.tool
+def get_dataset_info(request: DatasetInfoRequest) -> dict:
+    """A dataset's columns (name, type, time column, description) and saved metrics."""
+    with _as_user():
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.extensions import db, security_manager
+
+        ds = db.session.get(SqlaTable, int(request.identifier))
+        if ds is None or not security_manager.can_access_datasource(ds):
+            return {"error": f"dataset {request.identifier} not found or not allowed"}
+        return {"id": ds.id, "table_name": ds.table_name, "database_id": ds.database_id,
+                "database": ds.database.database_name, "main_dttm_col": ds.main_dttm_col,
+                "columns": [{"column_name": c.column_name, "type": c.type, "is_dttm": bool(c.is_dttm),
+                             "description": c.description or ""} for c in ds.columns],
+                "metrics": [{"metric_name": m.metric_name, "expression": m.expression,
+                             "description": m.description or ""} for m in ds.metrics]}

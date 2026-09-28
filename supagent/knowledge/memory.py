@@ -1,0 +1,140 @@
+"""Preferences, rules and facts learned from the chats, for a user or for the team.
+
+Learned only on explicit signals (never from every chat: a wrong rule would change everyone's
+answers, and the LLM is shared): an answer marked Helpful, or a question that says "always",
+"from now on", "remember", "by default", "toujours", "désormais", "retiens", "par défaut"...
+The LLM extracts the durable points of that exchange; a user can also add or delete their own.
+
+Personal memories are used at once, in their author's answers only. Team memories are used
+after an admin's approval (memory.team_approval, default) or at once when approval is off.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any
+
+from superset import db
+
+from supagent import settings
+from supagent.models import Conversation, Memory, Message
+
+log = logging.getLogger(__name__)
+SIGNALS = re.compile(r"\b(always|never|from now on|remember|by default|in future|keep in mind|i prefer|we prefer|"
+                     r"toujours|jamais|d[ée]sormais|dor[ée]navant|retiens|souviens|par d[ée]faut|je pr[ée]f[èe]re|"
+                     r"nous pr[ée]f[ée]rons|à l'avenir)\b", re.I)
+PROMPT = """You keep the memory of a data assistant used by a team. From the exchange below, list
+only DURABLE points worth remembering for later questions: how this user or the team wants
+answers (format, units, sorting, time zone, what 'yesterday' or 'today' means, environments to
+exclude...), business rules and definitions stated by the user, facts about the data the user
+asserted. Do not list what the assistant found in the data (results change), nor one-off
+requests: an instruction for this question only ("compute it as X", "for 23 September", "as a
+table") is not durable unless the user says it applies from now on, always, or to everyone.
+Answer with a JSON list only (empty list when nothing is durable):
+[{"text": "...", "scope": "personal" or "team", "kind": "preference" or "rule" or "fact",
+  "category": "a short topic"}]
+scope "team" only when the user says it applies to everyone or states a business rule."""
+
+
+def _norm(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9àâçéèêëîïôûùüÿœ]+", (text or "").lower()))
+
+
+def _similar(a: str, b: str) -> bool:
+    wa, wb = set(_norm(a).split()), set(_norm(b).split())
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / max(len(wa), len(wb)) >= 0.8
+
+
+def add(user_id: int, text: str, scope: str = "user", kind: str = "preference", category: str | None = None,
+        source: str = "manual", message_id: int | None = None, approved_by: str | None = None) -> Memory | None:
+    """A memory (None when an equivalent one exists)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    scope = "team" if scope in ("team", "everyone") else "user"
+    q = db.session.query(Memory).filter(Memory.status != "disabled")
+    q = q.filter(Memory.scope == "team") if scope == "team" else q.filter(Memory.scope == "user",
+                                                                           Memory.user_id == user_id)
+    if any(_similar(m.text, text) for m in q.limit(2000)):
+        return None
+    status = "active"
+    if scope == "team" and settings.get("memory.team_approval") and not approved_by:
+        status = "proposed"
+    m = Memory(scope=scope, user_id=user_id, kind=kind if kind in ("preference", "rule", "fact") else "preference",
+               text=text[:1000], category=(category or None), status=status, source=source, message_id=message_id,
+               approved_by=approved_by)
+    db.session.add(m)
+    db.session.commit()
+    return m
+
+
+def worth_learning(question: str) -> bool:
+    return bool(SIGNALS.search(question or ""))
+
+
+def learn_from_message(message_id: int, llm: Any = None) -> list[int]:
+    """The durable points of the exchange that ends with this answer."""
+    from supagent.llm import LLM
+
+    if not settings.get("memory.enabled"):
+        return []
+    answer = db.session.get(Message, message_id)
+    if answer is None or answer.role != "assistant":
+        return []
+    conv = db.session.get(Conversation, answer.conversation_id)
+    question = (db.session.query(Message).filter(Message.conversation_id == answer.conversation_id,
+                                                 Message.id < message_id, Message.role == "user")
+                .order_by(Message.id.desc()).first())
+    if conv is None or question is None:
+        return []
+    exchange = f"USER: {question.content[:3000]}\nASSISTANT: {(answer.content or '')[:3000]}"
+    try:
+        msg = (llm or LLM()).chat([{"role": "system", "content": PROMPT}, {"role": "user", "content": exchange}],
+                                  max_tokens=600)
+    except Exception as ex:  # pylint: disable=broad-except
+        log.warning("supagent memory: %s", ex)
+        return []
+    text = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S)
+    start, end = text.find("["), text.rfind("]")
+    try:
+        items = json.loads(text[start:end + 1]) if 0 <= start < end else []
+    except ValueError:
+        items = []
+    made = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not str(it.get("text") or "").strip():
+            continue
+        m = add(conv.user_id, str(it["text"]), scope="team" if it.get("scope") == "team" else "user",
+                kind=str(it.get("kind") or "preference"), category=it.get("category"), source="chat",
+                message_id=message_id)
+        if m is not None:
+            made.append(m.id)
+    if made:
+        from supagent.knowledge.index import sync
+
+        sync(("memory:",))
+    return made
+
+
+def memories_for(user_id: int | None, limit: int = 15) -> list[Memory]:
+    """The user's personal memories and the team's active ones (for the prompt)."""
+    q = db.session.query(Memory).filter(Memory.status == "active")
+    mine = q.filter(Memory.scope == "user", Memory.user_id == user_id).order_by(Memory.id.desc()).limit(limit).all() \
+        if user_id is not None else []
+    team = q.filter(Memory.scope == "team").order_by(Memory.id.desc()).limit(limit).all()
+    return mine + team
+
+
+def prompt_block(user_id: int | None) -> str:
+    items = memories_for(user_id)
+    if not items:
+        return ""
+    lines = ["\n\nWhat this user and the team asked to remember (follow it unless the question says otherwise):"]
+    for m in items:
+        who = "team" if m.scope == "team" else "this user"
+        lines.append(f"- ({who}, {m.kind}) {m.text}")
+    return "\n".join(lines)

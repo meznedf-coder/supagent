@@ -1,0 +1,58 @@
+{% extends "supagent/base.html" %}
+{% block title %}Chat{% endblock %}
+{% block content %}
+<div class="chat">
+  <aside class="convs" aria-label="Conversations">
+    <button id="new-chat" class="btn primary wide" type="button">New conversation</button>
+    <button id="open-memory" class="btn wide" type="button" title="What the agent remembers for you and the team">Memory</button>
+    <ul id="conv-list" class="conv-list"></ul>
+  </aside>
+  <section class="thread">
+    <div id="messages" class="messages" aria-live="polite"></div>
+    <form id="ask" class="composer" autocomplete="off">
+      <label for="question" class="visually-hidden">Question</label>
+      <textarea id="question" rows="2" maxlength="8000"
+                placeholder="Ask about your data: failed jobs, servers, metrics, what a field means&hellip;  (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button type="submit" class="btn primary" id="send">Send</button>
+    </form>
+  </section>
+</div>
+<div id="memory-drawer" class="drawer" hidden>
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="memory-h">
+    <button type="button" class="close" id="memory-close" aria-label="Close">&times;</button>
+    <h2 id="memory-h">Memory</h2>
+    <p class="muted">What the agent keeps in mind in your answers: your preferences, and the team's rules. It also
+      learns them when you mark an answer Helpful, or when you say "always", "from now on", "remember"...</p>
+    <div class="edit">
+      <textarea id="memory-text" rows="3" placeholder="e.g. Show durations in minutes. Yesterday means the business date D-1."
+        aria-label="Something to remember"></textarea>
+      <div class="actions">
+        <select id="memory-scope" aria-label="For whom"><option value="user">For me only</option>
+          <option value="team">For the team (after an admin's approval)</option></select>
+        <button type="button" class="btn primary" id="memory-save">Remember</button>
+        <span id="memory-result" class="result"></span>
+      </div>
+    </div>
+    <div class="section"><h3>For you</h3><ul class="mem-list" id="memory-mine"></ul></div>
+    <div class="section"><h3>For the team</h3><ul class="mem-list" id="memory-team"></ul></div>
+    <div class="section" id="memory-proposed-box" hidden><h3>Waiting for an admin's approval</h3>
+      <ul class="mem-list" id="memory-proposed"></ul></div>
+  </div>
+</div>
+<template id="welcome">
+  <div class="welcome">
+    <h1>Ask your data</h1>
+    <p>The agent answers with what you may see in Superset: your databases, datasets and charts.
+       It knows the data dictionary it learns every day: what each metric, index and field means,
+       their types and units, and how they relate.</p>
+    <div class="suggestions">
+      <button type="button" class="chip">What data can you query for me?</button>
+      <button type="button" class="chip">Which metrics are related to the jobs index, and through which fields?</button>
+      <button type="button" class="chip">What changed in the data this week?</button>
+      <button type="button" class="chip">Which applications had the most failed jobs yesterday?</button>
+    </div>
+  </div>
+</template>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('supagent_static.static', filename='charts.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
+<script src="{{ url_for('supagent_static.static', filename='chat.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

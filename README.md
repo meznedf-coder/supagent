@@ -1,0 +1,342 @@
+# supagent: the AI agent inside Apache Superset
+
+supagent is a Python package that you install in Superset's virtualenv, like a database driver.
+It adds:
+
+* **a chat page** (the **Chat** tab of Superset's top bar). A user asks a question in plain words; the agent
+  works with **that user's Superset permissions**, runs the queries, and answers with the key
+  figures. Every query result is shown under the answer as a **table and a chart** (bars for
+  rankings, lines over time, figures for a single row). The user can switch between them,
+  **copy** the rows, the SQL or the answer, and **download** CSV, Excel or a PNG of the chart.
+  The agent also makes **Excel extracts** (a download button in the chat), **screenshots** of
+  saved charts and dashboards (shown in the chat), e-mails, scheduled reports and Superset
+  charts. It can be stopped, and *Helpful* keeps the answer's SQL as an example for similar
+  questions.
+* **a data dictionary learned every day** (*Settings → Data dictionary*, and a tab of the chat page), stored in
+    Superset's own database:
+    * every OpenSearch index and field (through osagg): its type, values, ranges, fill rate and
+      time range;
+    * every Prometheus / Mimir metric (through promagg): its type (counter, gauge, histogram,
+      summary), unit, meaning, series count, data range, typical values, and its labels with
+      their values;
+    * **how they relate**: metric labels that hold the same values as index fields (label `node`
+      = jobs `NODE`, measured), join keys between indices, metric families (histogram
+      `_bucket` / `_sum` / `_count`), metrics that share labels;
+    * **what changed** since the day before: new, gone or back objects, changed types or units,
+      big changes in series counts.
+
+    Descriptions come from your catalog first, then from the source (the exporters' HELP
+    texts), then from the LLM. LLM texts are marked *AI-written* until an admin approves or
+    corrects them.
+
+* **learning from the chats** (0.2): the shortest way each answer was reached (the final
+  query, confirmed by *Helpful*), how long each kind of query takes, and what users ask to
+  remember (preferences for them, rules and facts for the team). A similar question later
+  starts from what worked.
+* **knowledge search** (0.2): every question comes with the few pieces of knowledge that match
+  it (dictionary, catalog, learned answers, memory, your documents and sites), found by words
+  (PostgreSQL full-text search) and by meaning (an embedding model such as BGE-M3). No
+  database extension: the vectors are kept in Superset's database, or in Qdrant.
+* **a catalog in separate entries** (0.2): title, classification, category and content, each
+  edited on its own with its history. The agent adds entries itself when the evidence is
+  certain (formulas of confirmed answers, approved team rules, definitions quoted from your
+  documents), marked as written by the agent.
+* **a settings page for admins** (*Settings → Chat settings*): the LLM, including company
+  token middleware; the daily learning; knowledge search, memory, documents and sites; the
+  catalog entries; the learning runs.
+
+Everything is Python, HTML and JavaScript served by Superset itself: there is no JavaScript
+build, no external script, no Docker and no extra service. The pages work with Superset's
+Content-Security-Policy (Talisman nonces).
+
+## Requirements
+
+* Apache Superset 6.x in a Python 3.10–3.12 virtualenv. Tested with 6.1.0 on PostgreSQL
+  (production-like, with Celery workers and beat) and on SQLite; the test suite also passes on
+  6.0.0. supagent needs `pydantic>=2.8`, which Superset 6.1 already has; on 6.0 pip installs it
+  (offline: the small `pydantic` wheelhouse delivered with supagent).
+* Saving Superset charts and dashboards from the chat uses Superset 6.1's own MCP service
+  (package `fastmcp`, which Superset 6.1 installs with its `mcp` extra). Without it everything
+  else works; the agent says that it cannot save charts.
+* The learner reads OpenSearch through **osagg** and Prometheus / Mimir through **promagg**.
+  Both are optional: supagent learns the databases of these two kinds.
+* The chat answers in Superset's **Celery workers** when they run (recommended); without a
+  worker it answers in a thread of the web server. The daily learning is started by Superset's
+  **Celery beat**; without beat, run `superset supagent learn` from cron.
+* An OpenAI-compatible LLM with tool calls (llama.cpp `--jinja`, vLLM, a company gateway...).
+* Optional: an OpenAI-compatible **embedding** endpoint (`/embeddings`, e.g. BGE-M3 behind the
+  same gateway) for search by meaning. Without it the search uses words only. No `pgvector`
+  or other database extension is needed.
+
+## Install (pip only)
+
+```bash
+# the Python of Superset's virtualenv
+PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
+$PY -m pip install supagent-0.2.0-py3-none-any.whl          # Superset 6.1: nothing else to install
+# Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
+```
+
+One line in `superset_config.py` registers it. It holds no logic:
+
+```python
+from supagent import init_app as FLASK_APP_MUTATOR
+```
+
+If your config already has a `FLASK_APP_MUTATOR`, chain it:
+`import supagent; FLASK_APP_MUTATOR = supagent.chain(my_mutator)`.
+
+Then, once, and again after each upgrade of the package:
+
+```bash
+superset supagent init        # tables supagent_*, permissions, role "AI Agent" (idempotent)
+superset supagent grant alice bob     # or give the role "AI Agent" in Superset's user list
+```
+
+Restart the web server, the Celery workers and beat.
+
+The role **AI Agent** gives the chat and the data dictionary; the settings stay with the
+Admin role. `superset init` never gives these pages to Gamma or Alpha. What a user can query
+through the agent stays what Superset lets that user query.
+
+## Connect the LLM
+
+Use *Settings → Chat settings → LLM* (the **Test the LLM** button asks the model for one
+word), or the command line:
+
+```bash
+# a server without authentication (e.g. llama.cpp in the same network)
+superset supagent settings --set llm.base_url=http://llm-host:8080/v1
+
+# a fixed access token
+superset supagent settings --set llm.auth=token --set llm.token=...
+
+# a company middleware that issues short-lived tokens (OAuth2 client credentials)
+superset supagent settings \
+  --set llm.base_url=https://llm-gateway.example/openai \
+  --set llm.model=qwen3.6-27b \
+  --set llm.auth=middleware \
+  --set llm.middleware.token_url=https://middleware.example/oauth2/token \
+  --set llm.middleware.consumer_key=... \
+  --set llm.middleware.consumer_secret=... \
+  --set llm.middleware.cert_path=/etc/superset/agent-client.pem \
+  --set llm.middleware.key_path=/etc/superset/agent-client.key \
+  --set llm.ca_bundle=/etc/superset/company-ca.pem
+superset supagent test-llm
+```
+
+In **middleware** mode supagent does what the company code does. It sends
+`POST <token_url>` with `grant_type=client_credentials` (plus `scope` if set), with the
+consumer key and secret as HTTP Basic and the client certificate (mutual TLS). It reads
+`access_token` and `expires_in` from the answer, then calls
+`<base_url>/chat/completions` with `Authorization: Bearer <token>`. The token is reused
+until `llm.middleware.renew_before` seconds (default 60) before it expires. A 401 from the
+LLM renews it once. One token is shared by the threads of a process.
+
+Secrets (the token and the consumer secret) are stored encrypted with Superset's
+`SECRET_KEY` and are never shown again. Every setting can also come from `superset_config.py`
+or from the environment, using the key in upper case with `SUPAGENT_` in front
+(`SUPAGENT_LLM_MIDDLEWARE_CONSUMER_SECRET`). The admin page wins over the config, and the
+config wins over the environment.
+
+Reasoning models: `llm.thinking` (default off) sends `chat_template_kwargs.enable_thinking=false`
+(Qwen 3 and similar). If a gateway refuses that field, supagent stops sending it.
+
+## The daily learning
+
+**One run per day**, at `learn.hour` (server time, default 02:00) on the days of `learn.days`
+(default every day). Celery beat ticks every hour only to catch up: a day that has no run yet
+gets it at the next tick, after an install or an outage too. Nothing is learned every N hours.
+
+A run is gentle with Mimir and OpenSearch, because production has millions of series and
+billions of documents:
+
+* **Cheap daily pass**: the list of metrics with their type, unit and HELP text (one metadata
+  request), the list of indices with their mappings. New, gone and changed objects are found
+  this way every day.
+* **Rolling profiles**: the statistics (series count, data range, typical values, label and
+  field values, fill rates) are refreshed for each metric or index every
+  `learn.profile_every_days` days (default 7), about a seventh of them each day, plus the new
+  ones. About 3 requests per metric: a series count, one combined statistics query, a sample
+  of `learn.series_sample` series for the labels. Metrics above `learn.stats_max_series`
+  series get no value statistics; the start of a metric's data is looked up once a month.
+* **Dated and rolled-over indices** (`logs-2026.09.27`, `traces-000123`) are learned as one
+  family: the newest member is profiled, the family keeps the pattern.
+* **Field statistics** are batched (`learn.fields_per_request` per request) on a sample of
+  `learn.sample_docs` documents per shard.
+* **Limits**: at most `learn.max_requests_per_minute` requests per minute to each database, one
+  at a time, each with `learn.request_timeout` seconds; after `learn.stop_after_errors`
+  overload errors in a row (429, 503, timeouts, circuit breakers) the run leaves that database
+  for the day. A run stops after `learn.max_minutes` (default 30); the next one continues.
+
+Then it measures the **relations** (a metric label and an index field hold the same values; the
+evidence is kept), applies the **catalog** (what people wrote always wins), asks the LLM for
+descriptions of up to `learn.llm_per_run` objects that have none (marked *AI-written*), lets
+the agent write the **catalog entries it is certain of** (below), and updates the knowledge
+search.
+
+`superset supagent learn --plan` tells what today's run would do, without reading any data:
+objects due, requests, minutes at the rate limit. **Learn now** on the settings page, or
+`superset supagent learn`, runs one at once. Limit what is learned with `learn.indices` /
+`learn.indices_exclude` and `learn.metrics` / `learn.metrics_exclude` (patterns with `*`).
+
+Lab measurement (Raspberry Pi 4, first 0.2 run): 6 indices and 95 fields, 28 metrics with 94
+labels, and a federated database of 4 tenants with 35 metrics. The lab's metrics stopped on 25
+September, so the end of each metric's data was searched in the series index, and its history
+checked once: 5 requests to OpenSearch and 1,451 to Mimir (about 23 per metric), at 60 per minute,
+no error; 27 minutes with 40 LLM descriptions. The history is checked again only once a month,
+and a metric whose data stopped now costs about 6 requests when its profile is due (an estimate:
+that path has not run in the lab yet, nothing being due for 7 days); a live metric about 3.
+
+## The catalog
+
+What people know about the data, kept as **separate entries** so that one edit never touches
+the rest: the glossary, one entry per index, groups of metrics, relationships, health checks,
+rules the agent always follows, notes and runbooks, formulas. Each entry has a title, a
+classification, a category and its content (YAML for the structured ones, checked with the
+line and column of an error before it is saved). Every change is kept and can be restored;
+deleting is soft; two admins editing the same entry cannot overwrite each other.
+
+When two entries define the same index, metric, term or check, the most recent change wins,
+except that **a person's entry always wins over the agent's**; the settings page lists such
+conflicts. `superset supagent import-catalog catalog.yaml` splits a whole catalog (the format
+of the osagg bundle's `catalog.yaml`) into entries (`--replace` also deletes the structured
+entries the file does not have); `export-catalog` merges them back into one YAML. Upgrading
+from 0.1 splits the former single catalog into entries once and keeps it as a backup.
+
+### Entries written by the agent
+
+With `learn.agent_catalog` (on by default) the agent adds entries itself, **only on evidence
+it can check**, never on its own judgement:
+
+* **formulas**: a calculated column (name = expression, on a table) of answers confirmed with
+  *Helpful*: the same expression in two confirmed answers (or one, used three times), never
+  another expression under that name, never an answer marked *Not helpful*. Plain reads
+  (`COUNT(*)`, `SUM(bytes)`, `ROUND(AVG(x), 2)`) are not formulas. A formula learned on a
+  database is found only by the users who may query that database;
+* **team rules and facts** an admin approved in the team memory: they move into rule and note
+  entries (and leave the memory, so the prompt carries them once);
+* **definitions from your documents** (`learn.agent_catalog_docs`): the LLM points at the
+  sentences that define a term; an entry keeps only a sentence that is word for word in the
+  document and reads as a definition ("X is the...", "X means...", "X: ...", a glossary table
+  row). The value is the document's own sentence, never the LLM's words. One glossary entry
+  per document, read once per new or changed content.
+
+They are marked **agent** in the list (a filter shows them), and each shows its evidence (the
+answers, the approval, the document). When the evidence breaks (an answer marked *Not
+helpful*, another expression, the document removed), the agent takes its entry back. **Once a
+person edits an agent entry it is theirs**: the agent never changes it again; delete it and the
+agent never writes it again. `superset supagent agent-catalog` runs this pass at once.
+
+## Learning from the chats
+
+* **Learned answers**: the final successful query of every answer (SQL, PromQL or chart) is
+  kept with its time and size; *Helpful* confirms it, *Not helpful* rejects it. A similar
+  question of anyone in the team starts from the confirmed ones and those used several times,
+  on the databases the user may query.
+* **Query timings** per kind of query (literals removed) and table or metric: the agent is told
+  which way is fast.
+* **Answers come from the tools**: the knowledge given with a question is a summary, never an
+  answer. An answer written with no tool call, or showing results (a JSON block, a table of
+  numbers, "SQL run") that no query returned, goes back to the model once to be done with the
+  tools. `SUM(value)` or `AVG(value)` of a counter (its value is cumulative) is refused before it
+  runs, with `rate` / `increase` and the catalog's formulas for that metric.
+* **Big results** reach the LLM as a summary (row count, columns, the first 25 rows, min / max /
+  average / sum of the numbers, the most frequent values) unless the question asks for every row; the user still gets every row in the table, chart and files.
+  Reading a metric of more than 50,000 series without aggregation is refused with advice.
+* **Memory**: when a question says *always*, *from now on*, *remember*, *by default*,
+  *toujours*, *désormais*, *retiens*... or an answer is marked *Helpful*, the LLM extracts the
+  durable points: a user's preferences (used at once, in that user's answers only) and the
+  team's rules and facts (used after an admin approves them, `memory.team_approval`). Users
+  see and delete theirs with the chat's *Memory* button; admins review the team's on the
+  settings page.
+
+## Knowledge search
+
+Every question comes with the `search.top_k` pieces of knowledge that match it best (at most
+`search.prompt_chars` characters), and the agent can search more (`search_knowledge`). The
+pieces are the learned metrics and indices, the catalog's rules, notes, glossary and formulas,
+the learned answers, the memories and the documents. They are found:
+
+* by **words**: PostgreSQL full-text search, built in (other databases: counted in Python);
+* by **meaning** when `embed.model` is set: vectors of an OpenAI-compatible embedding endpoint
+  (e.g. `bge-m3`, named exactly as the gateway lists it; `embed.base_url`, empty: the LLM's; same
+  authentication as the LLM, middleware included: tested in the lab through a mock of the company
+  middleware), stored in Superset's
+  database as float16 (2 KB per piece with 1,024 dimensions) and searched in memory, or in a
+  **Qdrant** server (`search.vector_store = qdrant`, `qdrant.url`);
+
+and the two rankings are fused. A user only finds what they may see: pieces about databases
+they may query, the team's pieces and their own memories; the filter is applied before
+ranking. Pieces follow their origin (a changed entry is indexed again, a deleted one removed);
+new vectors are computed after each learning run, `embed.per_run` at a time.
+
+## Documents and sites
+
+Admins add documents (text, Markdown or HTML files) and web pages or whole sites (the pages
+under the same address, up to a number of pages, read again every N days) on the settings page.
+Fetching is safe by default: http(s) only, `docs.max_kb` per page, 20 s per request, redirects
+checked; only `docs.allowed_domains` are read (with none set, only public addresses: no
+intranet, no localhost). PDF is not read (it would need a package Superset does not have).
+
+## Where things are kept
+
+Tables in Superset's database. They have no foreign key to Superset's tables, so deleting a
+user or a database is never blocked. `superset supagent init` creates them and adds the
+columns of newer versions.
+
+| table | holds |
+|---|---|
+| supagent_setting | settings (secrets encrypted) |
+| supagent_source, supagent_object, supagent_relation | the learned dictionary |
+| supagent_run, supagent_change | learning runs and what they found different |
+| supagent_conversation, supagent_message | the chats (each user sees only their own) |
+| supagent_file | images and Excel files of the answers (kept `tools.keep_days`, default 7) |
+| supagent_example | questions answered well (*Helpful*) with their SQL |
+| supagent_entry, supagent_entry_version | the catalog entries and every version of them |
+| supagent_recipe, supagent_query_stat | learned answers, query timings |
+| supagent_memory | preferences, rules and facts (personal or team) |
+| supagent_doc | documents and sites (their text) |
+| supagent_chunk | the searchable pieces of knowledge (text and vector) |
+| supagent_document | the 0.1 catalog, kept as a backup after the upgrade |
+
+Files are kept in the database so that the web server can serve what a worker on another
+host wrote. Files bigger than `tools.max_file_mb` (default 50 MB) are named but not kept.
+
+## Command line
+
+```
+superset supagent init                 tables, permissions, role "AI Agent"
+superset supagent settings [--set k=v] [--unset k]
+superset supagent test-llm
+superset supagent learn [--database NAME] [--no-llm] [--minutes N] [--plan]
+superset supagent import-catalog FILE [--replace] | export-catalog
+superset supagent agent-catalog [--no-docs]                              entries the agent is certain of
+superset supagent index [--refresh-docs]                                 searchable pieces and vectors
+superset supagent search "words" [--user U]                              what the agent would find
+superset supagent knowledge [--changes DAYS]
+superset supagent describe "words" [--name INDEX_OR_METRIC] [--user U]   what the agent reads
+superset supagent ask "question" --user U                                 an answer in this process
+superset supagent grant USER...
+superset supagent push-descriptions [--labels] | push-metrics            catalog -> datasets
+superset supagent mcp [--host 127.0.0.1 --port 5009]                     the tools for other agents
+```
+
+## Other agents (MCP)
+
+`superset supagent mcp` serves the same tools over MCP (streamable HTTP) for another agent. It
+acts as the Superset user `mcp.user` (default `MCP_DEV_USERNAME`). Keep it on localhost or
+behind your gateway.
+
+## Operations
+
+* **Where answers run**: `agent.executor` = `auto` (Celery when a worker answers, else a
+  thread of the web server), `celery` or `thread`. An answer with no progress for 35 minutes
+  is marked as failed, so a restarted worker never locks a conversation.
+* **Stop**: the chat's Stop button ends the answer before its next step.
+* **Upgrade**: `pip install` the new wheel, `superset supagent init`, then restart. From 0.1:
+  `init` adds the new tables and columns and splits the catalog into entries (the former
+  catalog is kept as a backup).
+* **Uninstall**: remove the config line and restart. The tables stay until you drop them
+  (`supagent_*`).
+* **Logs**: logger `supagent` (answers, learning runs); the runs are also on the settings page.

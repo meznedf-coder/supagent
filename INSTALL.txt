@@ -1,0 +1,76 @@
+supagent 0.2.0 - the AI agent inside Apache Superset
+=====================================================
+
+What is in this folder
+  supagent-0.2.0-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
+  supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
+  catalog.example.yaml              an example catalog, to adapt
+  SHA256SUMS                        checksums
+
+1. Install in Superset's virtualenv (pip only)
+
+   PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
+   $PY -m pip install supagent-0.2.0-py3-none-any.whl
+   Superset 6.1: nothing else is needed (offline too).
+   Superset 6.0 (no pydantic there): pip installs pydantic; offline, unzip the pydantic
+   wheelhouse next to the wheel and add:  --no-index --find-links ./wheelhouse-pydantic
+
+2. Register it: one line in superset_config.py (no logic)
+
+   from supagent import init_app as FLASK_APP_MUTATOR
+
+   (already a FLASK_APP_MUTATOR?  import supagent; FLASK_APP_MUTATOR = supagent.chain(yours))
+
+3. Tables, permissions, role "AI Agent"
+
+   superset supagent init
+   superset supagent grant <user> [<user>...]        (or the role "AI Agent" in Superset's user list)
+
+4. The LLM (or in Superset: Settings -> Chat settings)
+
+   company middleware (token from the middleware, renewed before it expires):
+   superset supagent settings \
+     --set llm.base_url=https://<llm gateway>/openai \
+     --set llm.model=<model name> \
+     --set llm.auth=middleware \
+     --set llm.middleware.token_url=https://<middleware>/<token path> \
+     --set llm.middleware.consumer_key=<consumer key> \
+     --set llm.middleware.consumer_secret=<consumer secret> \
+     --set llm.middleware.cert_path=/path/client.pem \
+     --set llm.middleware.key_path=/path/client.key \
+     --set llm.ca_bundle=/path/company-ca.pem
+   a fixed token instead:  --set llm.auth=token --set llm.token=<token>
+   no authentication:      --set llm.auth=none
+   check:                  superset supagent test-llm
+
+   search by meaning (optional; without it the search uses words only; no pgvector needed):
+   superset supagent settings --set embed.model=bge-m3
+     (the same gateway and authentication as the LLM; another endpoint: --set embed.base_url=...;
+      give the model name exactly as the gateway lists it, e.g. GET <llm.base_url>/models)
+   vectors in a Qdrant server instead of Superset's database (optional):
+     --set search.vector_store=qdrant --set qdrant.url=http://<qdrant>:6333 [--set qdrant.api_key=...]
+
+5. Restart the web server, the Celery workers and Celery beat.
+
+6. Learn now (then every day at learn.hour, 02:00 by default, through Celery beat)
+
+   superset supagent import-catalog catalog.yaml       (optional, recommended)
+   superset supagent learn
+
+   What today's run would do, without reading any data (objects, requests, minutes):
+   superset supagent learn --plan
+
+   One run per day. It is gentle: at most learn.max_requests_per_minute (60) requests per
+   minute per database, one at a time, statistics of each metric or index refreshed every
+   learn.profile_every_days (7) days, the database left for the day after
+   learn.stop_after_errors (5) overload errors. Limit what is learned if the clusters are shared:
+   superset supagent settings --set "learn.indices=batch-jobs*" --set "learn.metrics=node_*,batch_*"
+
+7. Documents and sites for the agent (optional): Settings -> Chat settings -> Documents and sites.
+   Intranet sites need their domain allowed first:
+   superset supagent settings --set "docs.allowed_domains=wiki.company.com"
+
+Upgrade: pip install the new wheel, superset supagent init, restart.
+   From 0.1: init adds the new tables and columns and splits the catalog into entries (the
+   former catalog is kept as a backup in supagent_document).
+Remove: delete the config line and restart (the supagent_* tables stay until you drop them).
