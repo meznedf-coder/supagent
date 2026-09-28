@@ -99,7 +99,8 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
                    "rows": [{c: _plain(v) for c, v in zip(columns, r)} for r in rows],
                    "row_count": len(rows), "truncated": truncated, "seconds": round(time.time() - t0, 2),
                    "error": None}
-            if not rows:                                   # why, from the dictionary (no query)
+            if not rows or (len(rows) == 1 and all(v is None for v in rows[0])):   # nothing (an aggregate of
+                # no rows gives one row of NULLs): why, from the dictionary (no query)
                 from supagent.knowledge.empty import why_empty
 
                 hint = why_empty(database, request.sql)

@@ -83,6 +83,11 @@ def test_execute_sql_gives_the_hint_with_an_empty_result(world, monkeypatch):
             database_id=world["jobs"].id, sql='SELECT "NODE" FROM "jobs" WHERE "STATUS" = \'FAILED\''))
     assert out["success"] and out["row_count"] == 0 and "'Failed' is written 'FAILED'" in out["hint"]
     assert "hint" not in full
+    monkeypatch.setattr(tools_superset, "_run", lambda database, sql, limit, extract: (["avg"], [(None,)], False))
+    with acting_as("admin"):
+        nulls = tools_superset.execute_sql(tools_superset.ExecuteSqlRequest(      # AVG over no rows: one NULL row
+            database_id=world["jobs"].id, sql='SELECT AVG("D") FROM "jobs" WHERE "STATUS" = \'failed\''))
+    assert nulls["row_count"] == 1 and "'failed' is written 'FAILED'" in nulls["hint"]
 
 
 def test_the_same_value_written_otherwise_is_recognised():
