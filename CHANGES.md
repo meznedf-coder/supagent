@@ -40,7 +40,9 @@ Nothing added to the pages or the chat; the same install (pip, `superset supagen
   and indices first, until the run's time limit; the next run goes on. A label is described once
   per database for every metric that has it (not once per metric). The relations are measured
   reading the objects in steps (never tens of thousands of labels at once) and written 100 at a
-  time; the rewriting of older learned answers stops at the time limit too.
+  time; a relation marked Wrong holds for the label name of every metric (the first run of 0.4.0
+  may measure some relations again: the label that stands for a name is now always the same);
+  the rewriting of older learned answers stops at the time limit too.
 * **People first**: the background LLM work (the daily learning, learned answers and memory from a
   Helpful) waits while answers are being computed (2 minutes at most per call).
 * **Measure it**: `superset supagent stats` (where the time of the answers goes, prompt sizes,

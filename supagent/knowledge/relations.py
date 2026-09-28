@@ -38,6 +38,27 @@ def _stream(kind: str) -> Any:
         yield oid, sid, name, parent or "", {str(v) for v in vals if str(v).strip().lower() not in IGNORED_VALUES}
 
 
+def _end(c: tuple) -> tuple:
+    """What an end of a relation stands for: a label stands for its name in its database (every
+    metric that has it), a field for itself."""
+    return ("label", c[2], c[3]) if c[1] == "label" else ("id", c[0])
+
+
+def _wrong_pairs(rejected: list[Relation]) -> set[frozenset]:
+    """The pairs admins marked Wrong, by what their ends stand for: a Wrong mark made on one
+    metric's label holds for the same label name of every metric of that database."""
+    ids = {r.a_id for r in rejected} | {r.b_id for r in rejected}
+    if not ids:
+        return set()
+    objs = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(list(ids)))}
+
+    def end(oid: int) -> tuple:
+        o = objs.get(oid)
+        return ("label", o.source_id, o.name) if o is not None and o.kind == "label" else ("id", oid)
+
+    return {frozenset((end(r.a_id), end(r.b_id))) for r in rejected}
+
+
 def learn_relations() -> dict[str, int]:
     """Recompute the value-overlap relations over every source: the objects are read in steps,
     one label per database and name stands for all the metrics that have it, and the relations
@@ -65,6 +86,7 @@ def learn_relations() -> dict[str, int]:
             for y in range(x + 1, len(members)):
                 common[(members[x], members[y])] += 1
     existing = {(r.a_id, r.b_id): r for r in db.session.query(Relation).filter(Relation.relation == "same_values")}
+    wrong = _wrong_pairs([r for r in existing.values() if r.rejected_at is not None])
     kept: set[int] = set()
     made = skipped = pending = 0
     for (i, j), n in common.items():
@@ -82,7 +104,7 @@ def learn_relations() -> dict[str, int]:
         if a[0] > b[0]:                           # the smaller id first: same for the evidence
             a, b, va, vb = b, a, vb, va
         rel = existing.get((a[0], b[0]))
-        if rel is not None and rel.rejected_at is not None:
+        if (rel is not None and rel.rejected_at is not None) or frozenset((_end(a), _end(b))) in wrong:
             skipped += 1                          # an admin said it is wrong: never again
             continue
         if rel is None:

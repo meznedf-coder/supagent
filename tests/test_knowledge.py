@@ -489,3 +489,27 @@ def test_relations_are_measured_once_per_label_name(world):
     assert out == {"same_values": 1, "removed": 0, "rejected": 0}
     assert db.session.query(Relation).filter_by(relation="same_values").count() == 1
     assert R.learn_relations() == {"same_values": 1, "removed": 0, "rejected": 0}     # measured again: kept
+
+
+def test_a_wrong_mark_holds_for_the_label_name_whatever_metric_stands_for_it(world):
+    """A relation marked Wrong on one metric's label stays rejected when the label that stands for
+    every metric with that name is another object (another metric, or after a relearn)."""
+    import datetime as dt
+
+    from superset.extensions import db
+
+    from supagent.knowledge import relations as R
+    from supagent.knowledge.store import upsert
+    from supagent.models import KObject, Relation
+
+    assert R.learn_relations()["same_values"] == 1
+    rel = db.session.query(Relation).filter_by(relation="same_values").one()
+    rel.rejected_at, rel.rejected_by = dt.datetime.utcnow(), "admin"
+    db.session.commit()
+    first = db.session.query(KObject).filter_by(kind="label", name="node", parent="node_cpu_seconds_total").one()
+    first.gone_at = dt.datetime.utcnow()                       # its metric went: another "node" stands for the name
+    upsert(world["run"], world["s_prom"], "label", "node_load1", "node",
+           {"data_type": "string", "stats": {"cardinality": 4, "values": ["srv-1", "srv-2", "srv-3", "srv-9"]}})
+    db.session.commit()
+    out = R.learn_relations()
+    assert out["same_values"] == 0 and out["rejected"] == 1
