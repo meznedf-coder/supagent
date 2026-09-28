@@ -154,7 +154,8 @@
           parts.push(name + ": " + (bits.join(", ") || "nothing"));
         });
         if (st.relations) parts.push("relations: " + (st.relations.same_values || 0) + " measured");
-        if (st.llm) parts.push("AI descriptions: " + (st.llm.written || 0) + (st.llm.error ? " (" + st.llm.error + ")" : ""));
+        if (st.llm) parts.push("AI descriptions: " + (st.llm.written || 0) + (st.llm.left ? ", " + st.llm.left +
+          " left (the next run goes on)" : "") + (st.llm.error ? " (" + st.llm.error + ")" : ""));
         if (r.error) parts.push(r.error);
         if (r.status === "running") running = true;
         tb.appendChild(el("tr", {}, [el("td", { text: "#" + r.id }), el("td", { text: r.reason }), el("td", { text: S.when(r.started_at) }),
