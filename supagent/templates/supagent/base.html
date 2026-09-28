@@ -1,7 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light" data-superset-dark="{{ 'yes' if nav.theme.dark else 'no' }}"
+      data-primary="{{ nav.theme.primary or '' }}" data-primary-dark="{{ nav.theme.primary_dark or '' }}">
 <head>
 <meta charset="utf-8">
+<script src="{{ url_for('supagent_static.static', filename='theme.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf-token" content="{{ csrf_token() if csrf_token is defined else '' }}">
 <title>{% block title %}Chat{% endblock %} · Superset</title>

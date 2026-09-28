@@ -81,10 +81,12 @@ def _is_admin() -> bool:
 def _nav(active: str) -> dict:
     from superset.extensions import security_manager
 
+    from supagent.theme import superset_theme
+
     return {"active": active, "user": g.user.username if getattr(g, "user", None) else "",
             "can_chat": security_manager.can_access("can_read", ChatView.class_permission_name),
             "can_dictionary": security_manager.can_access("can_read", KnowledgeView.class_permission_name),
-            "is_admin": _is_admin()}
+            "is_admin": _is_admin(), "theme": superset_theme()}
 
 
 STALE_MINUTES = 35          # no progress for this long: the worker died (the Celery task's limit is 30)

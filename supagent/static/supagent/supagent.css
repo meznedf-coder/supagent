@@ -1,4 +1,5 @@
-/* supagent pages: Superset-like, light and dark */
+/* supagent pages: Superset-like, light and dark (dark when theme.js sets data-theme="dark": the
+   mode chosen in Superset, or the system's when none was chosen and Superset has a dark theme) */
 :root {
   --bg: #f6f8f9;
   --panel: #ffffff;
@@ -27,8 +28,7 @@
   --mono: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
   color-scheme: light;
 }
-@media (prefers-color-scheme: dark) {
-  :root {
+:root[data-theme="dark"] {
     --bg: #12181c;
     --panel: #1a2228;
     --ink: #e4eaee;
@@ -51,7 +51,6 @@
     --grid: #26313a;
     --axis: #3a4750;
     color-scheme: dark;
-  }
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }

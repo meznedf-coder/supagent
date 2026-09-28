@@ -263,3 +263,23 @@ def test_check_health_says_when_its_entities_match_nothing(app, monkeypatch):
     assert wrong["breach_count"] == 0 and "nothing was checked" in wrong["note"] and "1 breach" in wrong["note"]
     other = tools.check_health("2026-09-24 00:00", "2026-09-24 08:00", entities=["srv-emea-041"])
     assert other["note"] == "no breach on ['srv-emea-041']; 1 breach(es) on other entities"
+
+
+def test_pages_follow_supersets_theme(app, monkeypatch):
+    """Dark mode as Superset has it: available only when Superset has a dark theme; the mode
+    itself is chosen in the browser (theme.js reads Superset's saved choice)."""
+    from conftest import login
+
+    from supagent.theme import superset_theme
+
+    with app.app_context():
+        t = superset_theme()
+        assert t["dark"] is True and t["primary"] == "#2893B3"          # Superset 6.1's defaults
+        monkeypatch.setitem(app.config, "THEME_DARK", None)
+        monkeypatch.setitem(app.config, "ENABLE_UI_THEME_ADMINISTRATION", False)
+        assert superset_theme()["dark"] is False                         # dark mode turned off by the admin
+    with app.test_client() as c:
+        login(c, "alice")
+        page = c.get("/supagent/").get_data(as_text=True)
+    assert 'data-superset-dark="no"' in page and "theme.js" in page
+    assert page.index("theme.js") < page.index("supagent.css")          # before the styles: no flash
