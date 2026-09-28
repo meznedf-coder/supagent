@@ -101,6 +101,34 @@ def remove_auto_learned() -> None:
     click.echo(f"{n} learned answers saved automatically deleted (the ones marked Helpful stay)")
 
 
+@supagent.command("forget-learned",
+                  help="Forget what the learning learned (dictionary, AI descriptions, measured relations, changes) "
+                       "to learn it again from scratch; without --yes, only show what would go")
+@click.option("--database", "databases", multiple=True, help="Only this database (name or id; repeat); default: all")
+@click.option("--everything", is_flag=True, help="Also what people did in the Data dictionary page "
+                                                  "(written or approved descriptions, synonyms, relations marked Wrong)")
+@click.option("--yes", is_flag=True, help="Do it (otherwise only show what would be forgotten)")
+@with_appcontext
+def forget_learned(databases: tuple[str, ...], everything: bool, yes: bool) -> None:
+    from supagent.knowledge.forget import forget
+
+    rows = forget(list(databases) or None, everything=everything, apply=yes)
+    if not rows:
+        click.echo("nothing learned yet" + (f" for {', '.join(databases)}" if databases else ""))
+        return
+    for r in rows:
+        plural = {"index": "indices", "family": "families"}
+        objs = ", ".join(f"{n} {plural.get(k, k + 's')}" for k, n in sorted(r["objects"].items())) or "no object"
+        click.echo(f"{r['database']}: {objs}, {r['relations']} relations, {r['changes']} changes"
+                   + (f"; kept (people's work, learned facts cleared): {r['kept']} objects" if r["kept"] else ""))
+    if yes:
+        click.echo("Forgotten. The next run learns these databases again from scratch: superset supagent learn "
+                   "(large databases: --minutes 240 once), or the daily run. The catalog entries, learned answers, "
+                   "memory, documents and chats are kept.")
+    else:
+        click.echo("Nothing was changed. Add --yes to forget it (--everything: also people's work in the dictionary).")
+
+
 @supagent.command("settings", help="Show or change settings: --set key=value (repeat), --unset key")
 @click.option("--set", "pairs", multiple=True, metavar="KEY=VALUE")
 @click.option("--unset", "unset", multiple=True, metavar="KEY")

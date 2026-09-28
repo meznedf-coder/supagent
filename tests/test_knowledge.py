@@ -326,3 +326,61 @@ def test_topic_words_match_plurals(ctx):
     assert "server" in _bag("1-minute load average of the server")
     assert [stem(w) for w in ("queries", "processes", "status", "cpus", "boxes")] == \
         ["query", "process", "status", "cpu", "box"]
+
+
+def test_forgetting_what_was_learned_keeps_peoples_work(world):
+    """forget-learned: the learned dictionary of a database goes (objects, measured relations,
+    changes); objects people described or approved, and relations marked Wrong, stay (their
+    learned facts cleared); --everything takes them too. Dry run by default."""
+    import datetime as dt
+
+    from superset.extensions import db
+
+    from supagent.knowledge.forget import forget
+    from supagent.knowledge.relations import learn_relations
+    from supagent.models import Change, KObject, Relation, Source
+
+    learn_relations()
+    node = db.session.query(KObject).filter_by(kind="field", name="NODE").one()
+    node.description, node.description_source, node.verified = "The server of the job", "curated", True
+    rel = db.session.query(Relation).filter_by(relation="same_values").one()
+    rel.rejected_at, rel.rejected_by = dt.datetime.utcnow(), "admin"
+    rel_id = rel.id
+    db.session.commit()
+    jobs = world["jobs"].database_name
+    before = db.session.query(KObject).filter_by(source_id=world["s_jobs"].id).count()
+    (dry,) = forget([jobs])
+    assert dry["kept"] == 1 and sum(dry["objects"].values()) == before - 1
+    assert db.session.query(KObject).filter_by(source_id=world["s_jobs"].id).count() == before     # nothing changed
+    (done,) = forget([jobs], apply=True)
+    assert done == dry
+    left = db.session.query(KObject).filter_by(source_id=world["s_jobs"].id).all()
+    assert [o.name for o in left] == ["NODE"] and left[0].stats is None and left[0].description == "The server of the job"
+    kept_rel = db.session.get(Relation, rel_id)                # both its ends stay: the Wrong mark stays
+    assert kept_rel is not None and kept_rel.rejected_by == "admin"
+    assert db.session.query(Change).join(KObject, Change.object_id == KObject.id).filter(
+        KObject.source_id == world["s_jobs"].id).count() == 0
+    assert db.session.get(Source, world["s_jobs"].id).last_learned_at is None
+    assert db.session.query(KObject).filter_by(source_id=world["s_prom"].id).count() > 0          # the other database stays
+    forget([jobs], everything=True, apply=True)
+    assert db.session.query(KObject).filter_by(source_id=world["s_jobs"].id).count() == 0
+    assert db.session.query(Relation).filter(Relation.id == rel_id).count() == 0
+
+
+def test_what_the_catalog_gives_is_not_peoples_work(world, monkeypatch):
+    """A description the catalog gives an object is written again by the next run: forgetting does
+    not keep the object for it; a description an admin wrote in the dictionary page differs."""
+    from superset.extensions import db
+
+    from supagent.knowledge import curated
+    from supagent.knowledge.forget import _people
+    from supagent.models import KObject
+
+    status = db.session.query(KObject).filter_by(kind="field", name="STATUS").one()
+    status.description, status.description_source, status.verified = "Job status", "curated", True
+    db.session.commit()
+    monkeypatch.setattr(curated, "load_catalog", lambda: {"indices": {"jobs": {"fields": {"STATUS": "Job status"}}}})
+    catalog = curated.catalog_texts()
+    assert not _people(status, catalog)                        # from the catalog: applied again
+    status.description = "The status of the run, as an admin explained it"
+    assert _people(status, catalog)                            # written in the dictionary page

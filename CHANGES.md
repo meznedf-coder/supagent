@@ -1,5 +1,15 @@
 # Changes
 
+## 0.2.5 (2026-09-28)
+
+* **Learning again from scratch**: `superset supagent forget-learned` shows, per database, what
+  the learning learned (nothing changes without `--yes`); `--yes` forgets it (dictionary
+  objects with their statistics and AI-written descriptions, measured relations, history of
+  changes) for every database or those given with `--database`, and the next run learns them
+  again as new. The catalog entries, learned answers, query timings, memory, documents, chats
+  and settings are kept, and so is what admins did in the Data dictionary page (descriptions
+  written or approved there, synonyms, relations marked Wrong); `--everything` forgets that too.
+
 ## 0.2.4 (2026-09-28)
 
 * **The pages load their new files after an upgrade**: Superset lets browsers keep static files

@@ -73,7 +73,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.2.4-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.2.5-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -188,6 +188,16 @@ asks the LLM for descriptions of up to `learn.llm_per_run` objects that have non
 per run, 10 per LLM call, in the run's time plus ten minutes; exporters' HELP texts and catalog
 texts count as descriptions; marked *AI-written*; raise it to describe more per run), lets the
 agent write the **catalog entries it is certain of** (below), and updates the knowledge search.
+
+**Starting again**: `superset supagent forget-learned` shows what the learning learned, per
+database (without `--yes` nothing changes); `--yes` forgets it: the indices, fields, metrics,
+labels and families with their statistics and AI-written descriptions, the measured relations
+and the history of changes, for every database or those given with `--database`. The next run
+(`superset supagent learn`, or the daily one) learns them again as new. Kept: the catalog
+entries (applied again), the learned answers, query timings, memory, documents, chats and
+settings, and what admins did in the Data dictionary page (descriptions written or approved
+there, synonyms, relations marked Wrong: those objects stay, with their learned facts cleared);
+`--everything` forgets that too.
 
 `superset supagent learn --plan` tells what today's run would do, without reading any data:
 objects due, requests, minutes at the rate limit. **Learn now** on the settings page, or
@@ -340,6 +350,8 @@ superset supagent learn [--database NAME] [--no-llm] [--minutes N] [--plan]
 superset supagent import-catalog FILE [--replace] | export-catalog
 superset supagent agent-catalog [--no-docs]                              entries the agent is certain of
 superset supagent tidy-learned [--limit N]                               generic questions, duplicates merged
+superset supagent forget-learned [--database D] [--everything] [--yes]    learn again from scratch (dry run
+                                                                          without --yes)
 superset supagent remove-auto-learned                                    answers 0.2.1 saved by themselves
 superset supagent index [--refresh-docs]                                 searchable pieces and vectors
 superset supagent search "words" [--user U]                              what the agent would find

@@ -41,6 +41,25 @@ def _curate(obj: KObject, description: str | None, unit: str | None = None, syno
     return changed
 
 
+def catalog_texts() -> dict[tuple[str, str, str], dict[str, Any]]:
+    """(kind, parent, name) -> the description and synonyms the catalog gives that object (what
+    apply_catalog writes again at every run)."""
+    cat = load_catalog()
+    out: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for index, spec in (cat.get("indices") or {}).items():
+        out[("index", "", index)] = {"description": spec.get("description")}
+        for fname, fspec in (spec.get("fields") or {}).items():
+            fspec = fspec if isinstance(fspec, dict) else {"description": str(fspec)}
+            out[("field", index, fname)] = {"description": fspec.get("description") or fspec.get("label"),
+                                            "synonyms": fspec.get("synonyms")}
+    for name, spec in ((cat.get("metrics") or {}).get("tables") or {}).items():
+        spec = spec or {}
+        out[("metric", "", name)] = {"description": spec.get("description"), "synonyms": spec.get("synonyms")}
+        for label, text in (spec.get("labels") or {}).items():
+            out[("label", name, label)] = {"description": str(text)}
+    return out
+
+
 def apply_catalog() -> dict[str, int]:
     cat = load_catalog()
     out = {"curated": 0, "relations": 0}
