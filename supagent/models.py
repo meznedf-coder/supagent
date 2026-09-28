@@ -16,7 +16,7 @@ from superset.extensions import encrypted_field_factory
 
 from supagent.textsafe import SafeString, SafeText
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _now() -> dt.datetime:
@@ -235,8 +235,11 @@ class Recipe(db.Model):  # type: ignore[name-defined]
     seconds = sa.Column(sa.Float)
     rows = sa.Column(sa.Integer)
     steps = sa.Column(sa.Integer)               # tool calls the answer needed
-    status = sa.Column(SafeString(16), default="auto")    # auto | confirmed | rejected
-    confirmations = sa.Column(sa.JSON)          # ids of the answers marked Helpful that used it
+    # helpful: a user marked an answer Helpful (an admin confirms or rejects it) | confirmed |
+    # rejected | auto: saved by itself by 0.2.1 and before (no longer listed nor used)
+    status = sa.Column(SafeString(16), default="helpful")
+    confirmations = sa.Column(sa.JSON)          # ids of the answers marked Helpful that it comes from
+    generic = sa.Column(sa.Boolean, default=False)   # question written generic by the LLM (not the user's words)
     uses = sa.Column(sa.Integer, default=1)
     user_id = sa.Column(sa.Integer)
     message_id = sa.Column(sa.Integer, index=True)
@@ -260,6 +263,7 @@ class QueryStat(db.Model):  # type: ignore[name-defined]
     max_seconds = sa.Column(sa.Float, default=0.0)
     total_rows = sa.Column(sa.Integer, default=0)
     last_error = sa.Column(SafeText)
+    last_query = sa.Column(SafeText)             # the last query of this kind as it ran (admins see it)
     last_at = sa.Column(sa.DateTime, default=_now)
 
 
@@ -369,7 +373,14 @@ def create_or_upgrade() -> tuple[int, int]:
     _add_missing_columns(engine)
     row = db.session.get(Meta, "schema_version")
     before = int(row.value) if row else 0
-    # future versions: ALTER TABLE steps for before < n <= SCHEMA_VERSION go here
+    if 0 < before < 3:
+        # 0.2.2: learned answers come only from Helpful. A 0.2.1 "confirmed" answer with
+        # confirmations was marked Helpful by users: it now waits for an admin ("helpful"); one
+        # without was confirmed by an admin and stays. Answers saved by themselves ("auto") are
+        # kept but no longer listed nor used (superset supagent remove-auto-learned deletes them).
+        for r in db.session.query(Recipe).filter(Recipe.status == "confirmed"):
+            if r.confirmations:
+                r.status = "helpful"
     if row is None:
         db.session.add(Meta(key="schema_version", value=str(SCHEMA_VERSION)))
     else:

@@ -100,7 +100,7 @@ def test_stuck_answers_never_lock_a_conversation(app):
         login(c, "alice")
         r = c.post("/supagent/api/ask", json={"question": "and yesterday?", "conversation_id": cid2})
         assert r.status_code == 409                                          # a live answer: wait
-        assert c.post(f"/supagent/api/messages/{mid2}/cancel").get_json()["status"] == "cancelling"
+        assert c.post(f"/supagent/api/messages/{mid2}/cancel").get_json()["status"] == "cancelled"
 
 
 def test_feedback_keeps_the_sql_as_an_example(app):
@@ -274,7 +274,7 @@ def test_pages_follow_supersets_theme(app, monkeypatch):
 
     with app.app_context():
         t = superset_theme()
-        assert t["dark"] is True and t["primary"] == "#2893B3"          # Superset 6.1's defaults
+        assert t["dark"] is True and t["primary"] in (None, "#2893B3")  # 6.1's default color; 6.0 sets none
         monkeypatch.setitem(app.config, "THEME_DARK", None)
         monkeypatch.setitem(app.config, "ENABLE_UI_THEME_ADMINISTRATION", False)
         assert superset_theme()["dark"] is False                         # dark mode turned off by the admin

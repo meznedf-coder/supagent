@@ -256,7 +256,9 @@ class ChatView(BaseView):
     @expose("/api/messages/<int:mid>/cancel", methods=("POST",))
     @has_access_api
     def cancel(self, mid: int) -> Response:
-        """Stop an answer: the agent stops before its next step."""
+        """Stop an answer, at once: the conversation takes the next question right away. A step
+        already running (an LLM call, a query) ends on its own; its result is thrown away and
+        the agent does nothing more."""
         from superset import db
 
         from supagent.models import Message
@@ -265,12 +267,14 @@ class ChatView(BaseView):
         if m is None:
             abort(404)
         self._conversation(m.conversation_id)
-        if m.status == "pending":
-            m.status, m.content, m.finished_at = "cancelled", "(stopped)", dt.datetime.utcnow()
-        elif m.status == "running":
-            m.status = "cancelling"
+        now = dt.datetime.utcnow()
+        # only an answer still being answered: one that has just finished keeps its answer
+        (db.session.query(Message).filter(Message.id == mid, Message.status.in_(("pending", "running", "cancelling")))
+         .update({"status": "cancelled", "content": "(stopped)", "finished_at": now, "updated_at": now},
+                 synchronize_session=False))
         db.session.commit()
-        return _json({"status": m.status})
+        status = db.session.query(Message.status).filter(Message.id == mid).scalar()
+        return _json({"status": status})
 
     @expose("/api/messages/<int:mid>/results/<int:n>.xlsx", methods=("GET",))
     @has_access_api
@@ -359,7 +363,8 @@ class ChatView(BaseView):
     @expose("/api/messages/<int:mid>/feedback", methods=("POST",))
     @has_access_api
     def feedback(self, mid: int) -> Response:
-        """+1 keeps the question and the SQL that answered it as an example for later questions."""
+        """Helpful (+1) makes a learned answer of it (in the background: the LLM writes its generic
+        question), for an admin to confirm or reject; Not helpful (-1) or 0 takes it back."""
         from superset import db
 
         from supagent.models import Example, Message
@@ -386,15 +391,17 @@ class ChatView(BaseView):
                     kept = True
         db.session.commit()
         from supagent.knowledge.experience import feedback as recipe_feedback
+        from supagent.tasks import dispatch_catalog, dispatch_helpful, dispatch_memory
 
-        recipes = recipe_feedback(m.id, value)
-        _sync_chunks("recipe:")
-        from supagent.tasks import dispatch_catalog, dispatch_memory
-
+        recipes = 0
         if value == 1:
+            dispatch_helpful(m.id)                   # a learned answer, for an admin to confirm or reject
             dispatch_memory(m.id)                    # what is worth remembering from this exchange
-        if recipes:
-            dispatch_catalog()                       # a formula confirmed (or no longer certain)
+        else:
+            recipes = recipe_feedback(m.id, value)   # its Helpful taken back
+            if recipes:
+                _sync_chunks("recipe:")
+                dispatch_catalog()                   # a formula no longer certain
         return _json({"feedback": m.feedback, "example_kept": kept, "recipes": recipes})
 
     @expose("/api/files/<int:fid>", methods=("GET",))
@@ -438,6 +445,8 @@ class _RecipesMixin:
         status = request.args.get("status")
         if status:
             q = q.filter(Recipe.status == status)
+        else:
+            q = q.filter(Recipe.status != "auto")    # saved by themselves by 0.2.1 and before
         out = []
         for r in q.limit(500):
             if not admin and (not r.database_id or r.database_id not in visible):
@@ -445,7 +454,7 @@ class _RecipesMixin:
             out.append({"id": r.id, "question": r.question, "tool": r.tool, "database_id": r.database_id,
                         "target": r.target, "query": r.query, "seconds": r.seconds, "rows": r.rows,
                         "steps": r.steps, "status": r.status, "uses": r.uses, "created_at": r.created_at,
-                        "last_used_at": r.last_used_at})
+                        "helpful": len(r.confirmations or []), "last_used_at": r.last_used_at})
         return _json({"recipes": out, "is_admin": admin})
 
     @expose("/api/recipes/<int:rid>", methods=("POST", "DELETE"))
@@ -463,12 +472,17 @@ class _RecipesMixin:
         if request.method == "DELETE":
             db.session.delete(r)
             db.session.commit()
+            _sync_chunks("recipe:")
             return _json({"deleted": rid})
         status = str(_body().get("status") or "")
-        if status not in ("auto", "confirmed", "rejected"):
-            return _json({"error": "status: auto, confirmed or rejected"}, 400)
+        if status not in ("helpful", "confirmed", "rejected"):
+            return _json({"error": "status: helpful, confirmed or rejected"}, 400)
         r.status = status
         db.session.commit()
+        _sync_chunks("recipe:")
+        from supagent.tasks import dispatch_catalog
+
+        dispatch_catalog()                           # the formulas it supports (agent catalog)
         return _json({"id": rid, "status": status})
 
     @expose("/api/timings", methods=("GET",))
@@ -483,8 +497,10 @@ class _RecipesMixin:
         return _json({"timings": [{"target": r.target, "database_id": r.database_id, "pattern": r.pattern,
                                    "calls": r.calls, "errors": r.errors, "avg_seconds": round((r.total_seconds or 0) /
                                                                                           max(r.calls or 1, 1), 2),
-                                   "max_seconds": r.max_seconds, "last_error": r.last_error, "last_at": r.last_at}
-                                  for r in rows if r.database_id in visible or (admin and not r.database_id)]})
+                                   "max_seconds": r.max_seconds, "last_error": r.last_error, "last_at": r.last_at,
+                                   "last_query": r.last_query if admin else None}
+                                  for r in rows if r.database_id in visible or (admin and not r.database_id)],
+                      "is_admin": admin})
 
 
 class KnowledgeView(_RecipesMixin, BaseView):

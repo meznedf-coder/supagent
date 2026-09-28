@@ -344,12 +344,20 @@
     send.title = id ? "Stop this answer" : "Send (Enter)";
   }
 
-  function stopPolling() { if (polling) { clearTimeout(polling); polling = null; } }
+  /* Each poll belongs to the chat on screen: opening another chat (or a new one) ends it, and a
+     poll already on its way is then ignored, so that it never turns Send into Stop elsewhere. */
+  var pollRound = 0;
+  function stopPolling() {
+    pollRound += 1;
+    if (polling) { clearTimeout(polling); polling = null; }
+  }
 
   function poll(id) {
-    busy(id);
     stopPolling();
+    var round = pollRound;
+    busy(id);
     S.chat("GET", "messages/" + id).then(function (m) {
+      if (round !== pollRound) return;
       var node = box.querySelector('.msg.assistant[data-id="' + id + '"]');
       if (m.error && !m.id) { polling = setTimeout(function () { poll(id); }, 4000); return; }
       if (node) {
@@ -363,6 +371,8 @@
       } else {
         busy(null);
         input.focus();
+        /* the agent names the chat after its first answer (a short generic title): show it */
+        [6000, 20000].forEach(function (ms) { setTimeout(function () { loadConversations(null).then(markList); }, ms); });
       }
     });
   }
@@ -371,7 +381,10 @@
 
   function submit() {
     if (running) {                        // the button says Stop
-      S.chat("POST", "messages/" + running + "/cancel", {}).then(function () { poll(running); });
+      var stopping = running;
+      S.chat("POST", "messages/" + stopping + "/cancel", {}).then(function () {
+        if (running === stopping) poll(stopping);
+      });
       return;
     }
     var q = input.value.trim();

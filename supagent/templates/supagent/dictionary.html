@@ -65,19 +65,22 @@
     </table></div>
   </section>
   <section id="tab-learned" class="tab" hidden>
-    <p class="muted">What the agent learned from the answers of the team: the shortest way to a result (the final
-      query, or the chart that was saved), how long it took, how often it was used. <strong>confirmed</strong>: a user
-      found the answer helpful; <strong>rejected</strong>: not helpful (never proposed again); automatic ones are
-      proposed once used twice. You only see what concerns the databases you may query.</p>
+    <p class="muted">The answers users marked <strong>Helpful</strong> in the chat, under a short generic question
+      the agent wrote, with the way to the result (the final query, or the chart that was saved) and how long it
+      took. The agent starts from them for similar questions. <strong>helpful</strong>: waiting for an admin;
+      <strong>confirmed</strong>: approved by an admin (proposed first); <strong>rejected</strong>: never proposed.
+      You only see what concerns the databases you may query.</p>
     <div class="filters"><select id="r-status" aria-label="Status"><option value="">All</option>
-      <option value="confirmed">Confirmed</option><option value="auto">Automatic</option>
-      <option value="rejected">Rejected</option></select></div>
+      <option value="helpful">Helpful, to review</option><option value="confirmed">Confirmed</option>
+      <option value="rejected">Rejected</option><option value="auto">Saved automatically (0.2.1 and before)</option>
+      </select></div>
     <div class="table-wrap"><table class="grid" id="recipes">
-      <thead><tr><th>Question</th><th>Way</th><th class="num">Time</th><th class="num">Uses</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>Question</th><th>Way</th><th class="num">Time</th><th class="num">Helpful</th><th>Status</th><th></th></tr></thead>
       <tbody></tbody></table></div>
     <h2 class="section-title">Query timings</h2>
-    <p class="muted">How long each kind of query took (values removed), slowest first: the agent sees them next to
-      the metric or index it is about to query.</p>
+    <p class="muted">How long each kind of query took (values replaced by ?), slowest first: the agent sees them
+      next to the metric or index it is about to query. Open a query to read it whole and its last error; admins
+      also see the last one as it ran.</p>
     <div class="table-wrap"><table class="grid" id="timings">
       <thead><tr><th>On</th><th>Kind of query</th><th class="num">Calls</th><th class="num">Average</th>
         <th class="num">Slowest</th><th class="num">Failed</th></tr></thead><tbody></tbody></table></div>

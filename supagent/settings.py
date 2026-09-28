@@ -51,6 +51,9 @@ SPECS: list[Spec] = [
     Spec("llm.extra_headers", {}, "json", "More HTTP headers for the LLM calls (JSON object)"),
     # ---- the agent
     Spec("agent.max_steps", 16, "int", "Tool calls per question at most"),
+    Spec("agent.osagg_max_scan_rows", 20000, "int", "OpenSearch (osagg): raw documents one query of the agent may "
+         "read when it cannot be pushed down (the connection's own cap applies if lower); above, the query is "
+         "refused at once with the reason instead of running for minutes. 0: the connection's cap"),
     Spec("agent.now", "", "str", "A fixed 'now' (YYYY-MM-DD HH:MM) for demos on old data; empty: the clock"),
     Spec("agent.extra_instructions", "", "str", "More instructions added to the agent's prompt"),
     Spec("agent.disabled_tools", [], "list", "Tools the agent must not use (e.g. send_email)"),

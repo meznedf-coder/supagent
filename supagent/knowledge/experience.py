@@ -1,10 +1,11 @@
 """What the agent learns from its own answers, for the whole team:
 
-* recipes: the shortest successful way an answer was reached (the final SQL / PromQL, or the
-  chart configuration that Superset saved), with its time and size. They are `auto` after an
-  answer, `confirmed` by Helpful, `rejected` by Not helpful; a similar question later starts from
-  the confirmed ones (and the automatic ones used several times), adapted to its own dates and
-  filters, only on databases the user may query;
+* learned answers (recipes): the way an answer marked Helpful was reached (the final SQL /
+  PromQL, or the chart configuration that Superset saved), with its time and size, under a
+  short generic question the LLM writes. Only Helpful makes one (`helpful`); an admin then
+  confirms or rejects it. A similar question later starts from the helpful and confirmed
+  ones, adapted to its own dates and filters, only on databases the user may query. (0.2.1
+  and before saved every answer by itself: those `auto` ones are no longer listed nor used);
 * query timings: how long each kind of query takes (literals removed) per table or metric, so
   that the agent knows which shapes are fast on the big metrics and indices;
 * compact results: a result too big for the LLM is summarised for it (columns, first rows,
@@ -24,6 +25,7 @@ from superset import db
 from supagent.models import QueryStat, Recipe
 
 QUERY_TOOLS = ("execute_sql", "promql_query")
+USED = ("helpful", "confirmed")      # the learned answers that are listed and used
 RECIPE_TOOLS = ("execute_sql", "promql_query", "generate_chart", "update_chart", "export_excel")
 LLM_ROWS = 60             # a result with more rows reaches the LLM as a summary
 LLM_ROWS_ALL = 500        # when the question asks for JSON or for every row
@@ -136,9 +138,10 @@ def record_timings(trace: list[dict]) -> int:
         row.calls = (row.calls or 0) + 1
         row.total_seconds = (row.total_seconds or 0) + seconds
         row.max_seconds = max(row.max_seconds or 0, seconds)
+        row.last_query = query[:8000]
         if t.get("status") == "error":
             row.errors = (row.errors or 0) + 1
-            row.last_error = (t.get("result") or "")[:500]
+            row.last_error = (t.get("result") or "")[:1500]
         else:
             row.total_rows = (row.total_rows or 0) + int(_rows_of(t) or 0)
         row.last_at = dt.datetime.utcnow()
@@ -148,6 +151,8 @@ def record_timings(trace: list[dict]) -> int:
 
 
 def _rows_of(t: dict) -> int | None:
+    if isinstance(t.get("rows"), int):
+        return t["rows"]
     try:
         res = json.loads(t.get("full") or t.get("result") or "{}")
     except ValueError:
@@ -161,11 +166,65 @@ def _rows_of(t: dict) -> int | None:
     return len(res.get("series") or []) or None
 
 
-def record_recipe(message_id: int, user_id: int, question: str, trace: list[dict]) -> Recipe | None:
-    """The final successful query (or saved chart) of an answer -> a recipe (or one more use)."""
+def final_step(trace: list[dict]) -> dict | None:
+    """The step a recipe keeps: the last saved chart, else the last successful query."""
+    done = [t for t in trace if (t.get("called") or t["tool"]) in RECIPE_TOOLS and t.get("status") == "done"]
+    charts = [t for t in done if (t.get("called") or t["tool"]) in ("generate_chart", "update_chart")]
+    return (charts or done or [None])[-1]
+
+
+def final_query(trace: list[dict]) -> tuple[str | None, str | None]:
+    """(tool, query or chart configuration) of the step a recipe keeps."""
+    step = final_step(trace)
+    if step is None:
+        return None, None
+    tool = step.get("called") or step["tool"]
+    args = step.get("args") or {}
+    if tool in ("generate_chart", "update_chart"):
+        req = args.get("request") if isinstance(args.get("request"), dict) else args
+        return tool, json.dumps(req.get("config") or req, sort_keys=True, default=str)[:1500]
+    return tool, _query_of(tool, args)[0]
+
+
+def final_database(trace: list[dict]) -> int:
+    """The database of the step a recipe keeps (0 when unknown)."""
+    step = final_step(trace)
+    if step is None:
+        return 0
+    args = step.get("args") or {}
+    req = args.get("request") if isinstance(args.get("request"), dict) else args
+    return database_of(step.get("called") or step["tool"], req)
+
+
+def kept_questions(text: str, database_id: int | None, exclude: int | None = None, limit: int = 5,
+                   generic_only: bool = False) -> list[tuple[int, str]]:
+    """(id, question) of the learned answers on this database that share the most words with
+    `text`: the LLM says whether one of them is the same question (knowledge/generic.py)."""
+    ws = words(text)
+    if not ws or not database_id:
+        return []
+    q = db.session.query(Recipe.id, Recipe.question, Recipe.words).filter(Recipe.database_id == database_id,
+                                                                          Recipe.status.in_(USED))
+    if generic_only:
+        q = q.filter(Recipe.generic.is_(True))
+    scored = sorted(((len(ws & set((w or "").split())), i, question) for i, question, w in q.limit(5000)
+                     if i != exclude), key=lambda x: (-x[0], -x[1]))
+    return [(i, question) for n, i, question in scored[:limit] if n >= 2]
+
+
+def record_recipe(message_id: int, user_id: int, question: str, trace: list[dict],
+                  generic: dict | None = None) -> Recipe | None:
+    """The final successful query (or saved chart) of an answer marked Helpful -> a learned
+    answer waiting for an admin, or one more confirmation of the same one. `generic`: the
+    question as the LLM wrote it, generic (knowledge/generic.py); the user's own words, which
+    may hold the data of one case, are not kept."""
     done = [t for t in trace if (t.get("called") or t["tool"]) in RECIPE_TOOLS and t.get("status") == "done"]
     if not done:
         return None
+    if generic is not None:
+        if not generic.get("reusable", True):
+            return None
+        question = generic.get("question") or question
     charts = [t for t in done if (t.get("called") or t["tool"]) in ("generate_chart", "update_chart")]
     final = charts[-1] if charts else done[-1]
     tool = final.get("called") or final["tool"]
@@ -183,9 +242,23 @@ def record_recipe(message_id: int, user_id: int, question: str, trace: list[dict
         target = ",".join(targets)
     sig = signature(f"{tool}:{pattern}")
     ws = " ".join(sorted(words(question)))
-    old = (db.session.query(Recipe).filter(Recipe.signature == sig, Recipe.status != "rejected")
-           .order_by(Recipe.id.desc()).first())
-    if old is not None and len(set(old.words.split()) & set(ws.split())) >= max(1, len(ws.split()) // 2):
+    is_generic = bool(generic and generic.get("generic"))
+    same = db.session.get(Recipe, generic["same_as"]) if is_generic and generic.get("same_as") else None
+    if same is not None and (same.status not in USED or same.database_id != database_id
+                             or (same.status == "confirmed" and same.signature != sig)):
+        same = None               # a way an admin confirmed is only changed by an admin
+    if same is not None and same.signature != sig:      # the same question, answered another way: the newest
+        same.tool, same.query, same.signature, same.args, same.target = tool, query, sig, args, target[:512]
+        same.rows, same.steps = _rows_of(final), len(trace)
+    old = same or (db.session.query(Recipe).filter(Recipe.signature == sig, Recipe.status.in_(USED))
+                   .order_by(Recipe.id.desc()).first())
+    if old is not None and (old is same or
+                            len(set(old.words.split()) & set(ws.split())) >= max(1, len(ws.split()) // 2)):
+        if is_generic and not old.generic:        # the same answer, now with a generic question
+            old.question, old.words, old.generic = question[:2000], ws[:2000], True
+        if message_id in (old.confirmations or []):
+            return old                            # this answer already counted
+        old.confirmations = list(old.confirmations or []) + [message_id]
         old.uses = (old.uses or 1) + 1
         old.last_used_at = dt.datetime.utcnow()
         old.seconds = round(((old.seconds or 0) * (old.uses - 1) + float(final.get("seconds") or 0)) / old.uses, 2)
@@ -194,36 +267,89 @@ def record_recipe(message_id: int, user_id: int, question: str, trace: list[dict
         return old
     r = Recipe(question=(question or "")[:2000], words=ws[:2000], tool=tool, database_id=database_id,
                target=target[:512], query=query, signature=sig, args=args, seconds=final.get("seconds"),
-               rows=_rows_of(final), steps=len(trace), status="auto", uses=1, user_id=user_id, message_id=message_id)
+               rows=_rows_of(final), steps=len(trace), status="helpful", uses=1, user_id=user_id,
+               message_id=message_id, confirmations=[message_id], generic=is_generic)
     db.session.add(r)
     db.session.commit()
     return r
 
 
 def feedback(message_id: int, value: int) -> int:
-    """Helpful / Not helpful on an answer -> its recipes confirmed / rejected (0: back to what the
-    other answers said). The answers that confirmed a recipe are counted: two similar questions
-    answered the same way are one recipe confirmed twice."""
-    rows = db.session.query(Recipe).filter_by(message_id=message_id).all()
-    for r in rows:
-        ids = [i for i in (r.confirmations or []) if i != message_id]
-        if value == 1:
-            ids.append(message_id)
-            r.status = "confirmed"
-        elif value == -1:
-            r.status = "rejected"
+    """Not helpful, or Helpful taken back, on an answer: its Helpful no longer counts. A learned
+    answer that only rested on it is removed; one an admin confirmed stays (an admin decides).
+    Helpful itself is learned in the background (learn_from_helpful: it asks the LLM)."""
+    if value == 1:
+        return 0
+    changed = 0
+    for r in db.session.query(Recipe).filter(Recipe.status.in_(USED)).all():
+        ids = list(r.confirmations or [])
+        if message_id not in ids:
+            continue
+        ids = [i for i in ids if i != message_id]
+        if not ids and r.status == "helpful":
+            db.session.delete(r)
         else:
-            r.status = "confirmed" if ids else "auto"
-        r.confirmations = ids
+            r.confirmations, r.uses = ids, max(1, (r.uses or 1) - 1)
+        changed += 1
     db.session.commit()
-    return len(rows)
+    return changed
+
+
+def trace_of(message: Any) -> list[dict]:
+    """The steps of a saved answer as a trace (the page keeps each step's tool, status, time and
+    arguments; the row counts are in its results)."""
+    counts = {(r.get("sql") or ""): r.get("row_count") for r in message.results or []}
+    out = []
+    for s in message.steps or []:
+        step = {"tool": s.get("tool"), "called": s.get("tool"), "status": s.get("status"), "args": s.get("args") or {},
+                "seconds": s.get("seconds"), "result": s.get("result") or ""}
+        req = step["args"].get("request") if isinstance(step["args"].get("request"), dict) else step["args"]
+        if isinstance(counts.get(req.get("sql") or req.get("expr") or ""), int):
+            step["rows"] = counts[req.get("sql") or req.get("expr")]
+        out.append(step)
+    return out
+
+
+def learn_from_helpful(message_id: int, llm: Any = None) -> int | None:
+    """An answer marked Helpful -> a learned answer (or one more confirmation of the same one),
+    under the generic question the LLM writes, as the user who asked; its id. Nothing when the
+    Helpful was taken back meanwhile, or when the answer ran no query."""
+    from superset.extensions import security_manager
+
+    from supagent.knowledge.generic import generalize
+    from supagent.models import Conversation, Message
+    from supagent.security import acting_as
+
+    m = db.session.get(Message, message_id)
+    if m is None or m.role != "assistant" or m.feedback != 1 or m.status != "done":
+        return None
+    conv = db.session.get(Conversation, m.conversation_id)
+    user = security_manager.get_user_by_id(conv.user_id) if conv is not None else None
+    if user is None:
+        return None
+    said = [u.content or "" for u in db.session.query(Message).filter(
+        Message.conversation_id == m.conversation_id, Message.id < m.id, Message.role == "user").order_by(Message.id)]
+    if not said:
+        return None
+    trace = trace_of(m)
+    tool, query = final_query(trace)
+    if not query:
+        return None
+    with acting_as(user.username):
+        kept = kept_questions(" ".join(said[-3:]), final_database(trace))
+        db.session.commit()                              # no metadata connection held during the LLM call
+        generic = generalize(said[-1], said[:-1], query, tool, llm=llm, kept=kept)
+        m = db.session.get(Message, message_id)
+        if m is None or m.feedback != 1:
+            return None                                  # Helpful taken back meanwhile
+        r = record_recipe(message_id, conv.user_id, said[-1], trace, generic=generic)
+        return r.id if r is not None else None
 
 
 def learn_from_answer(message_id: int, user_id: int, question: str, trace: list[dict]) -> dict[str, Any]:
+    """After every answer: the timings of its queries (a learned answer needs Helpful)."""
     try:
-        timings = record_timings(trace)
-        recipe = record_recipe(message_id, user_id, question, trace)
-        return {"timings": timings, "recipe": recipe.id if recipe is not None else None}
+        return {"timings": record_timings(trace)}
     except Exception as ex:  # pylint: disable=broad-except   (learning never breaks an answer)
         db.session.rollback()
         return {"error": str(ex)[:300]}
@@ -233,8 +359,8 @@ def learn_from_answer(message_id: int, user_id: int, question: str, trace: list[
 # using what was learned
 # --------------------------------------------------------------------------- #
 def recipes_for(question: str, limit: int = 3) -> list[dict[str, Any]]:
-    """Recipes for a similar question, on databases the current user may query: confirmed ones,
-    and automatic ones used at least twice; never rejected ones."""
+    """Learned answers for a similar question, on databases the current user may query: the ones
+    an admin confirmed first, then the ones marked Helpful; never rejected or automatic ones."""
     from superset.models.core import Database
 
     from supagent.security import can_use_database
@@ -242,16 +368,14 @@ def recipes_for(question: str, limit: int = 3) -> list[dict[str, Any]]:
     ws = words(question)
     if not ws:
         return []
-    rows = (db.session.query(Recipe).filter(Recipe.status != "rejected")
+    rows = (db.session.query(Recipe).filter(Recipe.status.in_(USED))
             .order_by(Recipe.last_used_at.desc()).limit(2000).all())
     scored = []
     for r in rows:
-        if r.status == "auto" and (r.uses or 1) < 2:
-            continue
         common = ws & set((r.words or "").split())
         if len(common) < max(2, len(ws) // 3):
             continue
-        scored.append((len(common) + (2 if r.status == "confirmed" else 0) + min(r.uses or 1, 5) * 0.2, r))
+        scored.append((len(common) + (2 if r.status == "confirmed" else 0) + min(r.uses or 1, 5) * 0.2, r))  # admin first
     out = []
     allowed: dict[int, bool] = {}
     for _score, r in sorted(scored, key=lambda x: -x[0]):

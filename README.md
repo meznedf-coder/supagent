@@ -10,8 +10,8 @@ It adds:
   **copy** the rows, the SQL or the answer, and **download** CSV, Excel or a PNG of the chart.
   The agent also makes **Excel extracts** (a download button in the chat), **screenshots** of
   saved charts and dashboards (shown in the chat), e-mails, scheduled reports and Superset
-  charts. It can be stopped, and *Helpful* keeps the answer's SQL as an example for similar
-  questions.
+  charts. It can be stopped at any time, and an answer marked *Helpful* becomes a learned
+  answer for similar questions.
 * **a data dictionary learned every day** (*Settings → Data dictionary*, and a tab of the chat page), stored in
     Superset's own database:
     * every OpenSearch index and field (through osagg): its type, values, ranges, fill rate and
@@ -29,17 +29,17 @@ It adds:
     texts), then from the LLM. LLM texts are marked *AI-written* until an admin approves or
     corrects them.
 
-* **learning from the chats** (0.2): the shortest way each answer was reached (the final
-  query, confirmed by *Helpful*), how long each kind of query takes, and what users ask to
-  remember (preferences for them, rules and facts for the team). A similar question later
-  starts from what worked.
+* **learning from the chats** (0.2): the answers users mark *Helpful* (the final query, under a
+  short generic question; an admin confirms or rejects them), how long each kind of query
+  takes, and what users ask to remember (preferences for them, rules and facts for the team).
+  A similar question later starts from what worked.
 * **knowledge search** (0.2): every question comes with the few pieces of knowledge that match
   it (dictionary, catalog, learned answers, memory, your documents and sites), found by words
   (PostgreSQL full-text search) and by meaning (an embedding model such as BGE-M3). No
   database extension: the vectors are kept in Superset's database, or in Qdrant.
 * **a catalog in separate entries** (0.2): title, classification, category and content, each
   edited on its own with its history. The agent adds entries itself when the evidence is
-  certain (formulas of confirmed answers, approved team rules, definitions quoted from your
+  certain (formulas of answers marked Helpful, approved team rules, definitions quoted from your
   documents), marked as written by the agent.
 * **a settings page for admins** (*Settings → Chat settings*): the LLM, including company
   token middleware; the daily learning; knowledge search, memory, documents and sites; the
@@ -73,7 +73,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.2.1-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.2.2-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -230,12 +230,25 @@ agent never writes it again. `superset supagent agent-catalog` runs this pass at
 
 ## Learning from the chats
 
-* **Learned answers**: the final successful query of every answer (SQL, PromQL or chart) is
-  kept with its time and size; *Helpful* confirms it, *Not helpful* rejects it. A similar
-  question of anyone in the team starts from the confirmed ones and those used several times,
-  on the databases the user may query.
-* **Query timings** per kind of query (literals removed) and table or metric: the agent is told
-  which way is fast.
+* **Learned answers** (0.2.2): only an answer marked *Helpful* is learned: its final successful
+  query (SQL, PromQL or chart), with its time and size, under a short generic question the
+  agent writes (no ids, dates or names of one case; the user's own words are not kept). If the
+  agent finds the same question already learned, the answer joins it (one more *Helpful*)
+  instead of making a duplicate. It is listed as *helpful, to review*; an admin confirms or
+  rejects it in *Data dictionary → Learned answers*. *Not helpful* (or taking *Helpful* back)
+  withdraws it, unless an admin confirmed it. A similar question of anyone in the team starts
+  from the confirmed ones first, then the helpful ones, on the databases the user may query.
+  The first answer of a chat names it the same way (a 2-6 word generic title).
+* **Query timings** per kind of query (values replaced by `?`) and table or metric: the agent is
+  told which way is fast. The page shows each query whole, with its last error; admins also
+  see the last one as it ran.
+* **The limits of osagg and promagg**: they are not full SQL engines. The agent is told what
+  each can run (in its instructions, and next to each database it lists): filters and
+  aggregates pushed down, the latest per key with `GROUP BY` + `MAX`, pairs of values as
+  `(A = x AND B = y) OR ...`, no subquery, `WITH`, window function or self-join over raw rows,
+  work in steps with `WHERE key IN (...)`. A query osagg cannot push down may read at most
+  `agent.osagg_max_scan_rows` raw documents (20,000): above, osagg refuses it at once with the
+  reason (it counts before reading), and the refusal tells the agent how to rewrite it.
 * **Answers come from the tools**: the knowledge given with a question is a summary, never an
   answer. An answer written with no tool call, or showing results (a JSON block, a table of
   numbers, "SQL run") that no query returned, goes back to the model once to be done with the
@@ -312,6 +325,8 @@ superset supagent test-llm
 superset supagent learn [--database NAME] [--no-llm] [--minutes N] [--plan]
 superset supagent import-catalog FILE [--replace] | export-catalog
 superset supagent agent-catalog [--no-docs]                              entries the agent is certain of
+superset supagent tidy-learned [--limit N]                               generic questions, duplicates merged
+superset supagent remove-auto-learned                                    answers 0.2.1 saved by themselves
 superset supagent index [--refresh-docs]                                 searchable pieces and vectors
 superset supagent search "words" [--user U]                              what the agent would find
 superset supagent knowledge [--changes DAYS]
@@ -333,10 +348,22 @@ behind your gateway.
 * **Where answers run**: `agent.executor` = `auto` (Celery when a worker answers, else a
   thread of the web server), `celery` or `thread`. An answer with no progress for 35 minutes
   is marked as failed, so a restarted worker never locks a conversation.
-* **Stop**: the chat's Stop button ends the answer before its next step.
+* **Many users at once**: every question runs on its own (a Celery task, or a thread of the web
+  server); there is no one-at-a-time limit in supagent, and a running answer holds no
+  connection of Superset's database pool while it waits for the LLM or a query. What limits
+  answers in parallel is: the LLM server (how many requests it serves at once: llama.cpp
+  `--parallel`, vLLM batches, a gateway's quota per client); the Celery workers'
+  `--concurrency`; without Celery, the web server's workers and threads (gunicorn
+  `-w 4 -k gthread --threads 8`: heavy queries of the agent then share the web server's
+  processes, so give it several workers).
+* **Stop**: the chat's Stop button stops the answer at once: the chat takes the next question
+  right away. A step already running (an LLM call, a query) ends on its own in the
+  background; its result is thrown away and the agent does nothing more for that answer.
 * **Upgrade**: `pip install` the new wheel, `superset supagent init`, then restart. From 0.1:
   `init` adds the new tables and columns and splits the catalog into entries (the former
-  catalog is kept as a backup).
+  catalog is kept as a backup). From 0.2.0 / 0.2.1: learned answers users marked *Helpful*
+  wait for an admin's review; the ones those versions saved by themselves are no longer
+  listed nor used (`init` says how many; `superset supagent remove-auto-learned` deletes them).
 * **Uninstall**: remove the config line and restart. The tables stay until you drop them
   (`supagent_*`).
 * **Logs**: logger `supagent` (answers, learning runs); the runs are also on the settings page.

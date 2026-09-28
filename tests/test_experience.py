@@ -1,5 +1,6 @@
-"""Learning from answers: recipes (auto, confirmed, rejected, shared by database access), query
-timings, compact results for the LLM, the guard against huge raw reads."""
+"""Learning from answers: learned answers (from Helpful only; helpful, confirmed by an admin,
+rejected; shared by database access), query timings, compact results for the LLM, the guard
+against huge raw reads."""
 
 from __future__ import annotations
 
@@ -15,10 +16,10 @@ def _trace(sql: str, database_id: int, seconds: float = 0.8, rows: int = 10, sta
              "args": {"request": {"database_id": database_id, "sql": sql}}, "full": full, "result": full[:200]}]
 
 
-def test_recipes_are_learned_confirmed_and_shared_by_access(world):
+def test_learned_answers_come_from_helpful_and_are_shared_by_access(world):
     from superset.extensions import db, security_manager as sm
 
-    from supagent.knowledge.experience import feedback, learn_from_answer, recipes_for
+    from supagent.knowledge.experience import feedback, learn_from_answer, recipes_for, record_recipe
     from supagent.models import Recipe
     from supagent.security import acting_as
 
@@ -27,28 +28,75 @@ def test_recipes_are_learned_confirmed_and_shared_by_access(world):
     jobs, metrics = world["jobs"].id, world["metrics"].id
     admin = sm.find_user(username="admin").id
     q = "How many jobs failed per application yesterday?"
-    out = learn_from_answer(101, admin, q, _trace(
-        "SELECT APPLICATION, COUNT(*) FROM jobs WHERE STATUS = 'FAILED' AND day = '2026-09-23' GROUP BY 1", jobs))
-    assert out["recipe"] and out["timings"] == 1
-    with acting_as("alice"):
-        assert recipes_for("failed jobs per application last week") == []          # auto, used once: not yet
-    learn_from_answer(102, admin, "failed jobs per application on 2026-09-20", _trace(
-        "SELECT APPLICATION, COUNT(*) FROM jobs WHERE STATUS = 'FAILED' AND day = '2026-09-20' GROUP BY 1", jobs))
-    rec = db.session.query(Recipe).one()
-    assert rec.uses == 2                                     # the same query shape: one recipe, used twice
+    first = _trace("SELECT APPLICATION, COUNT(*) FROM jobs WHERE STATUS = 'FAILED' AND day = '2026-09-23' GROUP BY 1",
+                   jobs)
+    assert learn_from_answer(101, admin, q, first) == {"timings": 1}
+    assert db.session.query(Recipe).count() == 0             # an answer alone teaches nothing: Helpful does
+    rec = record_recipe(101, admin, q, first)                # marked Helpful
+    assert (rec.status, rec.confirmations) == ("helpful", [101])
     with acting_as("alice"):
         found = recipes_for("failed jobs per application last week")
-    assert found and found[0]["tool"] == "execute_sql" and "GROUP BY" in found[0]["query"]
-    feedback(102, -1)                                        # Not helpful: rejected, never proposed again
-    with acting_as("alice"):
-        assert recipes_for("failed jobs per application last week") == []
-    learn_from_answer(103, admin, "cpu busy per node yesterday", _trace(
+    assert found and found[0]["status"] == "helpful" and "GROUP BY" in found[0]["query"]
+    record_recipe(102, admin, "failed jobs per application on 2026-09-20", _trace(
+        "SELECT APPLICATION, COUNT(*) FROM jobs WHERE STATUS = 'FAILED' AND day = '2026-09-20' GROUP BY 1", jobs))
+    rec = db.session.query(Recipe).one()
+    assert rec.uses == 2 and rec.confirmations == [101, 102]   # the same query shape: one, Helpful twice
+    feedback(102, -1)                                        # the second Helpful taken back
+    assert db.session.get(Recipe, rec.id).confirmations == [101]
+    feedback(101, 0)                                         # the first too: nothing left, it goes
+    assert db.session.query(Recipe).count() == 0
+    rec = record_recipe(103, admin, "cpu busy per node yesterday", _trace(
         "SELECT node, AVG(value) FROM node_cpu_seconds_total GROUP BY node", metrics))
-    feedback(103, 1)                                         # confirmed, but on the metrics database
-    with acting_as("alice"):                                 # alice may not query it: not shown to her
+    rec.status = "confirmed"                                 # an admin confirms it
+    db.session.commit()
+    feedback(103, -1)
+    assert db.session.get(Recipe, rec.id).status == "confirmed"   # an admin's decision stays
+    with acting_as("alice"):                                 # alice may not query the metrics database
         assert recipes_for("cpu busy per node today") == []
     with acting_as("admin"):
         assert recipes_for("cpu busy per node today")[0]["status"] == "confirmed"
+    for status in ("rejected", "auto"):                     # rejected, or saved by itself by 0.2.1: never
+        db.session.get(Recipe, rec.id).status = status
+        db.session.commit()
+        with acting_as("admin"):
+            assert recipes_for("cpu busy per node today") == []
+
+
+def test_helpful_makes_a_learned_answer_in_the_background(world, monkeypatch):
+    from superset.extensions import db, security_manager as sm
+
+    from supagent.knowledge import generic
+    from supagent.knowledge.experience import learn_from_helpful
+    from supagent.models import Conversation, Message, Recipe
+
+    db.session.query(Recipe).delete()
+    conv = Conversation(user_id=sm.find_user(username="alice").id, title="failed jobs of BILLING yesterday")
+    db.session.add(conv)
+    db.session.flush()
+    db.session.add(Message(conversation_id=conv.id, role="user", content="failed jobs of BILLING yesterday",
+                           status="done"))
+    sql = "SELECT COUNT(*) AS n FROM jobs WHERE APP = 'BILLING' AND day = '2026-09-23'"
+    m = Message(conversation_id=conv.id, role="assistant", status="done", content="7 jobs failed.", feedback=1,
+                steps=[{"tool": "execute_sql", "status": "done", "seconds": 0.4, "result": "{...",
+                        "args": {"request": {"database_id": world["jobs"].id, "sql": sql}}}],
+                results=[{"tool": "execute_sql", "sql": sql, "columns": ["n"], "rows": [[7]], "row_count": 1}])
+    db.session.add(m)
+    db.session.commit()
+    asked = []
+    monkeypatch.setattr(generic, "generalize", lambda q, earlier, query, tool=None, llm=None, kept=None: asked.append(
+        (q, query)) or {"question": "Failed jobs of a given application on a given day", "title": "Failed jobs",
+                        "reusable": True, "generic": True, "same_as": None})
+    mid = m.id
+    r = db.session.get(Recipe, learn_from_helpful(mid))
+    assert (r.question, r.status, r.rows, r.confirmations) == (
+        "Failed jobs of a given application on a given day", "helpful", 1, [mid])
+    assert asked == [("failed jobs of BILLING yesterday", sql)]
+    assert db.session.get(Recipe, learn_from_helpful(mid)).uses == 1    # the same Helpful counts once
+    db.session.query(Message).filter(Message.id == mid).update({"feedback": -1})
+    db.session.commit()
+    db.session.query(Recipe).delete()
+    db.session.commit()
+    assert learn_from_helpful(mid) is None                    # taken back before the job ran
 
 
 def test_query_timings_and_compact_results(world):
@@ -134,7 +182,7 @@ def test_every_learned_answer_knows_its_database(world):
     query its database, and one whose database is unknown with nobody."""
     from superset.extensions import db, security_manager as sm
 
-    from supagent.knowledge.experience import database_of, learn_from_answer, recipes_for
+    from supagent.knowledge.experience import database_of, recipes_for, record_recipe
     from supagent.knowledge.index import sync
     from supagent.knowledge.search import search
     from supagent.models import Chunk, Recipe
@@ -151,8 +199,8 @@ def test_every_learned_answer_knows_its_database(world):
                   "args": {"expr": "sum by (node) (rate(node_cpu_seconds_total{mode='user'}[5m]))",
                            "database": "metrics"}}]
         admin = sm.find_user(username="admin").id
-        learn_from_answer(201, admin, "cpu user rate per node", trace)
-        learn_from_answer(202, admin, "cpu user rate per node today", trace)
+        record_recipe(201, admin, "cpu user rate per node", trace)          # marked Helpful
+        record_recipe(202, admin, "cpu user rate per node today", trace)
     rec = db.session.query(Recipe).one()
     assert (rec.tool, rec.database_id, rec.uses) == ("promql_query", metrics, 2)
     unknown = Recipe(question="cpu user rate per node", words="cpu node per rate user", tool="promql_query",

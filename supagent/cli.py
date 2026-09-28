@@ -48,6 +48,13 @@ def init() -> None:
 
     before, after = create_or_upgrade()
     click.echo(f"tables: schema version {before} -> {after}")
+    from supagent.models import Recipe
+
+    auto = db.session.query(Recipe).filter(Recipe.status == "auto").count()
+    if auto:
+        click.echo(f"learned answers: {auto} were saved automatically by an older version; they are no longer "
+                   "listed nor used (learned answers now come from Helpful). To delete them: "
+                   "superset supagent remove-auto-learned")
     from supagent.knowledge.catalog import migrate_document
 
     moved = migrate_document()
@@ -77,6 +84,21 @@ def _print_settings() -> None:
     for row in settings.describe():
         value = ("(set)" if row["value"] else "(not set)") if row["secret"] else json.dumps(row["value"])
         click.echo(f"{row['key']:<{width}}  {value}")
+
+
+@supagent.command("remove-auto-learned",
+                  help="Delete the learned answers that versions 0.2.1 and before saved by themselves")
+@with_appcontext
+def remove_auto_learned() -> None:
+    from superset.extensions import db
+
+    from supagent.knowledge.index import sync
+    from supagent.models import Recipe
+
+    n = db.session.query(Recipe).filter(Recipe.status == "auto").delete(synchronize_session=False)
+    db.session.commit()
+    sync(("recipe:",))
+    click.echo(f"{n} learned answers saved automatically deleted (the ones marked Helpful stay)")
 
 
 @supagent.command("settings", help="Show or change settings: --set key=value (repeat), --unset key")
@@ -258,6 +280,16 @@ def agent_catalog(no_docs: bool) -> None:
     from supagent.knowledge.autocatalog import run
 
     click.echo(json.dumps(run(llm_docs=not no_docs), indent=2, default=str))
+
+
+@supagent.command("tidy-learned", help="Rewrite the questions of the learned answers and the chat names that "
+                  "are not generic yet (the LLM; the daily learning does it too), and merge the duplicates")
+@click.option("--limit", default=200, show_default=True, type=int)
+@with_appcontext
+def tidy_learned_cmd(limit: int) -> None:
+    from supagent.knowledge.generic import tidy_learned
+
+    click.echo(json.dumps(tidy_learned(limit=limit), indent=2))
 
 
 @supagent.command(help="Search the knowledge as a user would (what the agent is given)")

@@ -6,6 +6,24 @@
   var $ = function (id) { return document.getElementById(id); };
   var KIND = { metric: "metric", label: "label", family: "family", index: "index", field: "field" };
 
+  /* a "Copy" link; where the browser blocks the clipboard (plain http), the text is selected */
+  function copyLink(label, getText) {
+    return el("button", { type: "button", class: "linkish", text: label, onclick: function (ev) {
+      var btn = ev.currentTarget, text = getText();
+      var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = label; }, 1500); };
+      var fallback = function () {
+        var ta = el("textarea", {});
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        try { if (document.execCommand("copy")) done(); } catch (e) { /* selected: Ctrl+C */ }
+        ta.remove();
+      };
+      if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done, fallback);
+      else fallback();
+    } });
+  }
+
   function summary() {
     return S.dict("GET", "summary").then(function (data) {
       state.admin = !!data.is_admin;
@@ -224,7 +242,7 @@
         var actions = el("td", {});
         if (data.is_admin) {
           [["confirmed", "Confirm"], ["rejected", "Reject"]].forEach(function (a) {
-            if (r.status !== a[0]) actions.appendChild(el("button", { type: "button", class: "linkish", text: a[1], onclick: function () {
+            if (r.status !== a[0] && r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: a[1], onclick: function () {
               S.dict("POST", "recipes/" + r.id, { status: a[0] }).then(learned);
             } }));
           });
@@ -234,18 +252,26 @@
         }
         tb.appendChild(el("tr", {}, [el("td", { text: r.question }), way,
           el("td", { class: "num", text: r.seconds !== null && r.seconds !== undefined ? S.num(r.seconds) + " s" : "" }),
-          el("td", { class: "num", text: S.num(r.uses) }),
-          el("td", { html: '<span class="badge ' + (r.status === "confirmed" ? "ok" : r.status === "rejected" ? "bad" : "") + '">' + S.esc(r.status) + "</span>" }),
+          el("td", { class: "num", text: S.num(r.helpful || r.uses) }),
+          el("td", { html: '<span class="badge ' + (r.status === "confirmed" ? "ok" : r.status === "rejected" ? "bad" : r.status === "helpful" ? "warn" : "") + '">' +
+                           S.esc(r.status === "helpful" ? "helpful, to review" : r.status === "auto" ? "automatic (old)" : r.status) + "</span>" }),
           actions]));
       });
-      if (!(data.recipes || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted", text: "Nothing learned yet: the answers of the chat teach it." })]));
+      if (!(data.recipes || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted",
+        text: "Nothing learned yet: an answer marked Helpful in the chat is learned here, for an admin to confirm or reject." })]));
     });
     S.dict("GET", "timings").then(function (data) {
       var tb = $("timings").querySelector("tbody");
       tb.innerHTML = "";
       (data.timings || []).forEach(function (t) {
+        var q = t.pattern || "";
+        var parts = [el("summary", { text: q.length > 160 ? q.slice(0, 160) + "\u2026" : q }), el("pre", { text: q }),
+                     copyLink("Copy", function () { return q; })];
+        if (t.last_error) parts.push(el("div", { class: "muted", text: "Last error:" }), el("pre", { class: "err", text: t.last_error }));
+        if (t.last_query) parts.push(el("div", { class: "muted", text: "Last one as it ran (admins only):" }), el("pre", { text: t.last_query }),
+                                     copyLink("Copy", function () { return t.last_query; }));
         tb.appendChild(el("tr", {}, [el("td", { class: "nm", text: t.target || "" }),
-          el("td", { class: "nm", text: (t.pattern || "").slice(0, 160) }), el("td", { class: "num", text: S.num(t.calls) }),
+          el("td", { class: "nm" }, [el("details", { class: "query" }, parts)]), el("td", { class: "num", text: S.num(t.calls) }),
           el("td", { class: "num", text: S.num(t.avg_seconds) + " s" }), el("td", { class: "num", text: S.num(t.max_seconds) + " s" }),
           el("td", { class: "num", text: t.errors ? S.num(t.errors) : "" })]));
       });

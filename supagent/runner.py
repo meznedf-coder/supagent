@@ -14,20 +14,25 @@ from typing import Any
 from superset import db
 
 from supagent import settings
+from supagent.agent import Cancelled
 from supagent.models import Conversation, File, Message
 
 log = logging.getLogger(__name__)
 FILE_TOOLS = ("export_excel", "chart_from_sql", "chart_image")
 
 
-def _save(message_id: int, **values: Any) -> None:
-    msg = db.session.get(Message, message_id)
-    if msg is None:
-        return
-    for k, v in values.items():
-        setattr(msg, k, v)
-    msg.updated_at = dt.datetime.utcnow()          # progress: the answer is alive
+LIVE = ("pending", "running")
+
+
+def _save(message_id: int, live: tuple[str, ...] = LIVE, **values: Any) -> bool:
+    """Write the progress or the end of an answer, only while it is being answered: False (and
+    nothing written) once it was stopped. A stopped answer is never written over, even by a
+    step that was already running when Stop was pressed."""
+    values["updated_at"] = dt.datetime.utcnow()          # progress: the answer is alive
+    n = (db.session.query(Message).filter(Message.id == message_id, Message.status.in_(live))
+         .update(values, synchronize_session=False))
     db.session.commit()
+    return bool(n)
 
 
 def _steps_for_page(trace: list[dict]) -> list[dict]:
@@ -132,11 +137,37 @@ def _keep_files(message_id: int, files: list[dict]) -> list[dict]:
     return out
 
 
+def _name_chat(conversation_id: int, question: str, earlier: list, trace: list[dict]) -> str | None:
+    """After the first answer of a chat: a short generic name for it, written by the LLM (one
+    short call, after the answer is saved: the user already has it). A chat renamed by its
+    user is left alone."""
+    from supagent.knowledge.experience import final_query
+    from supagent.knowledge.generic import generalize
+
+    if any(m.role == "assistant" and m.status == "done" for m in earlier):
+        return None
+    conv = db.session.get(Conversation, conversation_id)
+    if conv is None or (conv.title or "") != (question or "")[:120]:
+        return None
+    try:
+        tool, query = final_query(trace)
+        db.session.commit()                              # no metadata connection held during the LLM call
+        title = generalize(question, [], query, tool).get("title")
+        conv = db.session.get(Conversation, conversation_id)
+        if title and conv is not None and (conv.title or "") == (question or "")[:120]:
+            conv.title = title[:255]
+            db.session.commit()
+        return title
+    except Exception:  # pylint: disable=broad-except   (never breaks an answer)
+        db.session.rollback()
+        log.warning("supagent: naming the chat failed", exc_info=True)
+        return None
+
+
 def run_answer(message_id: int) -> None:
     """Compute the answer of an assistant message (status pending -> running -> done / error)."""
     from superset.extensions import security_manager
 
-    from supagent.agent import Agent, Cancelled
     from supagent.security import acting_as
 
     msg = db.session.get(Message, message_id)
@@ -155,14 +186,22 @@ def run_answer(message_id: int) -> None:
     question = next((m.content for m in reversed(earlier) if m.role == "user"), "")
     history = [{"role": m.role, "content": m.content} for m in earlier[:-1]
                if m.status == "done" and m.content]
-    _save(message_id, status="running")
+    if not _save(message_id, status="running"):
+        return                                           # stopped before it started
 
     def on_step(trace: list[dict]) -> None:
-        _save(message_id, steps=_steps_for_page(trace))
+        if not _save(message_id, steps=_steps_for_page(trace)):
+            raise Cancelled("stopped by the user")
 
     def should_stop() -> bool:
-        # a column query reads the row as committed now (no cached object, nothing expired)
-        return db.session.query(Message.status).filter(Message.id == message_id).scalar() in (None, "cancelling")
+        # a column query reads the row as committed now (no cached object, nothing expired);
+        # the commit ends the read's transaction, so that no connection of Superset's pool is
+        # held during the LLM call or the tool that follows (many answers at once)
+        status = db.session.query(Message.status).filter(Message.id == message_id).scalar()
+        db.session.commit()
+        return status != "running"
+
+    from supagent.agent import Agent
 
     agent = None
     trace: list[dict] = []
@@ -173,16 +212,21 @@ def run_answer(message_id: int) -> None:
                 answer, trace = agent.ask(question, history)
             finally:
                 agent.close()
+            if should_stop():
+                raise Cancelled("stopped by the user")
             files = _keep_files(message_id, _files_of(trace))
-            _save(message_id, content=answer, status="done", steps=_steps_for_page(trace), files=files,
-                  results=_results_of(trace), finished_at=dt.datetime.utcnow())
+            if not _save(message_id, content=answer, status="done", steps=_steps_for_page(trace), files=files,
+                         results=_results_of(trace), finished_at=dt.datetime.utcnow()):
+                kept = [f["id"] for f in files if f.get("id")]    # stopped meanwhile: nothing of it stays
+                if kept:
+                    db.session.query(File).filter(File.id.in_(kept)).delete(synchronize_session=False)
+                    db.session.commit()
+                return
             from supagent.knowledge.experience import learn_from_answer
 
-            learn_from_answer(message_id, user_id, question, trace)
+            learn_from_answer(message_id, user_id, question, trace)      # query timings
+            _name_chat(conv.id, question, earlier, trace)
             try:
-                from supagent.knowledge.index import sync
-
-                sync(("recipe:",))
                 from supagent.knowledge.memory import learn_from_message, worth_learning
 
                 if worth_learning(question):      # "always...", "from now on...", "remember..."
@@ -191,7 +235,8 @@ def run_answer(message_id: int) -> None:
                 db.session.rollback()
     except Cancelled:
         db.session.rollback()
-        _save(message_id, status="cancelled", content="(stopped)", finished_at=dt.datetime.utcnow())
+        _save(message_id, live=LIVE + ("cancelling",), status="cancelled", content="(stopped)",
+              finished_at=dt.datetime.utcnow())
     except Exception as ex:  # pylint: disable=broad-except
         db.session.rollback()
         log.exception("supagent: answer %s failed", message_id)

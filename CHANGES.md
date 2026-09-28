@@ -1,5 +1,48 @@
 # Changes
 
+## 0.2.2 (2026-09-28)
+
+* **Stop works at once, and no chat is blocked**: Stop marks the answer stopped immediately and
+  the chat takes the next question right away (it answered "the previous question is still
+  being answered" until the step in progress ended). The run that was in the middle of an LLM
+  call or a query never writes over the stopped answer and learns nothing from it. The chat
+  page kept checking a stopped answer after another chat was opened, which turned *Send* into
+  *Stop* in every chat: fixed.
+* **Many users at once**: a running answer held one connection of Superset's database pool for
+  its whole duration (idle in a transaction while it waited for the LLM); with many answers at
+  once the pool ran out and every page hung. It now holds none while it waits. There is no
+  one-at-a-time limit in supagent: see *Operations* in the README for what sets the number of
+  answers in parallel (the LLM server, Celery's concurrency, the web server's workers).
+* **Learned answers come only from Helpful**: an answer is no longer learned by itself. *Helpful*
+  learns it (in the background: the LLM writes its generic question) as *helpful, to review*;
+  an admin confirms or rejects it; *Not helpful* or taking *Helpful* back withdraws it unless
+  an admin confirmed it. Upgrade (`superset supagent init`): the 0.2.x learned answers users
+  had marked Helpful wait for review, the ones an admin had confirmed stay confirmed (told apart
+  by their Helpful clicks: an admin-confirmed one that users had also marked Helpful goes to
+  review too); the ones saved by themselves are kept but no longer listed nor used, and
+  `superset supagent remove-auto-learned` deletes them.
+* **Learned answers and chats are named by a short generic question** that the agent writes:
+  standalone even when the message only continued or corrected an earlier one, without the
+  ids, dates or names of one case ("Number of failed jobs for a given application on a given
+  day"), in the user's language. Ids, numbers and dates never stay (checked, sent back once,
+  then replaced); names are sent back once. The agent also says whether a question already
+  learned asks the same thing: the answer then joins it instead of making a duplicate. The
+  first answer of a chat gives it a 2-6 word generic name. `superset supagent tidy-learned`
+  rewrites older learned answers and chat names and merges duplicates (the daily learning
+  does it too).
+* **The agent knows the limits of osagg and promagg** (they are not full SQL engines): what each
+  can run is in its instructions and next to each database it lists; refusals come with how to
+  rewrite the query (in steps, or pairs of values as `(A = x AND B = y) OR ...`). A query osagg
+  cannot push down may read at most `agent.osagg_max_scan_rows` raw documents (20,000; the
+  connection's own cap if lower): osagg counts first and refuses at once instead of reading
+  hundreds of thousands of documents for minutes. On the lab, a question that took two refused
+  queries now takes none.
+* **Query timings show the whole query** (values replaced by `?`) with its last error; admins
+  also see the last one as it ran.
+* **The pages follow Superset's theme**: the mode chosen in Superset (light, dark or system),
+  always light when Superset has no dark theme (`THEME_DARK = None`), and Superset's primary
+  color. They followed the operating system only.
+
 ## 0.2.1 (2026-09-28)
 
 * Metadata databases that are not UTF-8 (PostgreSQL created with LATIN1, MySQL without

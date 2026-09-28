@@ -3,7 +3,7 @@
   metric / index   one piece per metric or index (its labels or fields summarised in it; one
                    piece per field would cost hundreds of thousands of embeddings on OTel data)
   rule / note / glossary / formula   the catalog's text entries (notes cut into parts)
-  recipe           the learned ways to an answer (not the rejected ones)
+  recipe           the learned answers (marked Helpful or confirmed by an admin)
   memory           the preferences, rules and facts of a user or of the team (active ones)
   doc              the parts of the documents and sites
 
@@ -109,7 +109,9 @@ def _entry_pieces() -> Iterator[dict[str, Any]]:
 
 
 def _recipe_pieces() -> Iterator[dict[str, Any]]:
-    for r in db.session.query(Recipe).filter(Recipe.status != "rejected"):
+    from supagent.knowledge.experience import USED
+
+    for r in db.session.query(Recipe).filter(Recipe.status.in_(USED)):
         yield {"ref": f"recipe:{r.id}", "kind": "recipe", "database_id": r.database_id or 0,   # unknown: nobody
                "title": f"answered before ({r.status}): {(r.question or '')[:200]}",
                "text": f"{r.question}\n{r.tool}: {(r.query or '')[:2500]}"}

@@ -234,8 +234,11 @@ def _database_name(database_id: int | None) -> str | None:
 
 
 def formulas() -> dict[str, list[str]]:
+    from supagent.knowledge.experience import USED
+
     evidence: dict[str, dict[str, Any]] = {}
-    for r in db.session.query(Recipe).filter(Recipe.tool.in_(SQL_TOOLS)).order_by(Recipe.id):
+    for r in (db.session.query(Recipe).filter(Recipe.tool.in_(SQL_TOOLS), Recipe.status.in_(USED + ("rejected",)))
+              .order_by(Recipe.id)):
         seen_here: set[str] = set()
         for name, expr, tables in named_expressions(r.query or "", r.database_id):
             if not tables:
@@ -251,7 +254,7 @@ def formulas() -> dict[str, list[str]]:
             seen_here.add(origin)
             ev["recipes"].append(r.id)
             ev["uses"] += r.uses or 1
-            if r.status == "confirmed":             # each answer marked Helpful counts
+            if r.status in USED:                    # each answer marked Helpful counts
                 ev["confirmed"] += max(1, len(r.confirmations or []))
                 ev["messages"] += [i for i in (r.confirmations or []) if i not in ev["messages"]]
             elif r.status == "rejected":

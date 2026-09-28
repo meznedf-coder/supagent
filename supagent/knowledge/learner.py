@@ -134,6 +134,14 @@ def run_learning(reason: str = "manual", databases: list[str] | None = None, llm
             from supagent.knowledge.index import index_knowledge
 
             stats["agent_catalog"] = agent_catalog(llm_docs=llm)   # entries the agent is certain of
+            if llm:
+                from supagent.knowledge.generic import tidy_learned
+
+                try:
+                    stats["generic_questions"] = tidy_learned(limit=50)   # older learned answers and chats
+                except Exception as ex:  # pylint: disable=broad-except
+                    db.session.rollback()
+                    stats["generic_questions"] = {"error": str(ex)[:300]}
             stats["index"] = index_knowledge()
     except Exception as ex:  # pylint: disable=broad-except
         db.session.rollback()

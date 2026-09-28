@@ -60,9 +60,25 @@ How to work:
   so and use its last days. data_changes lists what changed in the data (new or gone
   metrics, fields, changed types). Datasets and their ids: list_datasets / get_dataset_info.
 - execute_sql runs SQL on a database id (list_databases). The OpenSearch database uses
-  osagg: DuckDB-style SQL, table = index name, field names are case sensitive and must be
-  double-quoted ("APPLICATION", "@timestamp_date"). GROUP BY / aggregates run inside
-  OpenSearch, so aggregate as much as possible and always add a LIMIT to row lists.
+  osagg, which is not a full SQL engine: OpenSearch runs the filters and the GROUP BY /
+  aggregates, and only their small result is post-processed. Table = index name; field
+  names are case sensitive and double-quoted ("APPLICATION", "@timestamp_date"). Write only
+  queries it can push down:
+  * one index, WHERE filters (=, IN, <, >, BETWEEN, LIKE, IS NULL) on single fields, joined
+    with AND / OR, with a time range; pairs of values: ("A" = 'x' AND "B" = 'y') OR (...),
+    never ("A", "B") IN (...) nor an expression over several fields;
+  * aggregates (COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT), percentiles) with GROUP BY on
+    fields or on DATE_TRUNC of the timestamp; the latest of each key = GROUP BY the key with
+    MAX of the timestamp (not ROW_NUMBER() and not a self-join);
+  * a row list: filtered, with ORDER BY and a LIMIT (at most 1000);
+  * a JOIN only in an aggregating query, on equal fields, each index filtered to at most
+    100,000 documents; ORDER BY, HAVING, window functions, WITH and UNION only on top of
+    aggregated rows.
+  Never put a row list of an index in a subquery, a WITH or a join: osagg would read its
+  documents and refuses above a cap. Work in steps instead: one query for the few keys you
+  need (ids, dates), then one query per index with WHERE key IN (those values), and put the
+  results together in your answer. An error saying the query "could not be fully pushed
+  down" means: rewrite it that way, do not run it again.
 - Business dates: "POSITION_DATE" (yyyymmdd), "POSITION_LABEL" (D, D-1, W-1, Y-1...) and
   "POSITION_TIME" (execution time moved onto the D-1 position date) are columns when the
   index has them. Filter labels with "POSITION_LABEL" IN ('D-1', 'W-1').
@@ -81,6 +97,11 @@ How to work:
   dates, use X = POSITION_TIME and group by POSITION_LABEL, filtered on the labels.
 - Metrics (Prometheus / Mimir) are tables of their own database (promagg): one table per
   metric; columns ts, one column per label, value, and for counters rate / increase.
+  promagg turns SQL into PromQL and is not a full SQL engine either: one metric table per
+  query, no JOIN of metric tables row by row, no WITH, window function or subquery over raw
+  samples, no quantile of raw samples (QUANTILE_OVER_TIME or a histogram), no GROUP BY or
+  WHERE on the sample value (HAVING). Two metrics together: aggregate each one in its own
+  query, or promql_query (arithmetic between metrics, offsets, label_replace).
   Always filter ts on a time range and GROUP BY a time bucket (DATE_TRUNC('hour', ts)).
   Counters: SUM(rate) = per second, SUM(increase) = count; gauges: AVG(value), MIN(value),
   MAX(value); histograms (*_bucket tables): HISTOGRAM_QUANTILE(0.95, SUM(RATE(value)));
@@ -586,7 +607,8 @@ class Agent:
         except Exception:  # pylint: disable=broad-except
             recipes = []
         if recipes:
-            text += ("\n\nWays that answered similar questions before (confirmed = approved by a user). Start "
+            text += ("\n\nWays that answered similar questions before (helpful = marked Helpful by a user, "
+                     "confirmed = also approved by an admin). Start "
                      "from them, adapting dates, filters and names to this question, and run the query again: "
                      "their results are not kept and are not the answer:")
             for r in recipes:
@@ -727,5 +749,7 @@ class Agent:
         if self.on_step is not None:
             try:
                 self.on_step(trace)
+            except Cancelled:
+                raise
             except Exception:  # pylint: disable=broad-except
                 log.exception("supagent: step report failed")

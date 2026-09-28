@@ -7,6 +7,7 @@ from __future__ import annotations
 import datetime as dt
 import decimal
 import math
+import re
 import time
 from typing import Any
 
@@ -25,6 +26,30 @@ def _plain(v: Any) -> Any:
     if isinstance(v, (bytes, bytearray)):
         return v.hex()
     return v
+
+
+# What each connector can run, shown next to its databases (list_databases) and with its refusals
+SQL_RULES = {
+    "osagg": ("Not full SQL: OpenSearch runs the WHERE filters and the GROUP BY / aggregates. One index per query; "
+              "WHERE with =, IN, ranges, LIKE, IS NULL on single fields joined by AND / OR (pairs of values: "
+              "(A = x AND B = y) OR ..., never (A, B) IN ...); "
+              "row lists filtered, with ORDER BY and LIMIT; the latest per key = GROUP BY key with MAX(timestamp); "
+              "JOIN only in aggregating queries on equal fields. No subquery, WITH, window function or self-join "
+              "over raw rows (refused above a few thousand documents): work in steps, WHERE key IN (values found "
+              "by the previous query)."),
+    "promagg": ("Not full SQL: turned into PromQL. One metric table per query, a ts range, GROUP BY a time bucket "
+                "and labels, SUM(rate) / SUM(increase) / AVG(value) / MAX(value) / HISTOGRAM_QUANTILE. No row-by-row "
+                "join of metrics, no WITH, window function or subquery over raw samples, no quantile of raw "
+                "samples, no filter on the value (HAVING): promql_query for arithmetic between metrics."),
+}
+WHERE_HINT = (" Do not send this query again, nor a variant of it: its WHERE has a condition OpenSearch cannot run, "
+              "so every document would be read. Use only =, IN, ranges, LIKE, IS NULL on single fields, joined by "
+              "AND / OR; for pairs of values write (\"A\" = 'x' AND \"B\" = 'y') OR (\"A\" = 'z' AND \"B\" = 'w') "
+              "in one query.")
+STEPS_HINT = (" Do not send this query again, nor a variant of it: rewrite it in steps. 1) One query for the few keys "
+              "you need (ids, dates), filtered, with GROUP BY the key and MAX of the timestamp for the latest one. "
+              "2) One query per index with WHERE key IN (the values found), with a LIMIT. Then put the results "
+              "together in your answer.")
 
 
 class ExecuteSqlRequest(BaseModel):
@@ -51,7 +76,20 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
             refused = guard_sql(database, request.sql)
             if refused:
                 return {"success": False, "error": refused}
-            columns, rows, truncated = _run(database, request.sql, limit, extract=False)
+            backend = database.backend
+            try:
+                columns, rows, truncated = _run(database, request.sql, limit, extract=False)
+            except Exception as ex:  # pylint: disable=broad-except
+                text = f"{type(ex).__name__}: {str(ex)[:1500]}"
+                if backend == "osagg" and "WHERE term evaluated" in text:
+                    text += WHERE_HINT
+                elif backend == "osagg" and re.search(r"pushed down|cannot run in OpenSearch|JoinRefused|safety cap",
+                                                      text):
+                    text += STEPS_HINT
+                elif backend in SQL_RULES and re.search(r"not possible|not supported|unsupported|cannot|refused",
+                                                        text, re.I):
+                    text += " What this database can run: " + SQL_RULES[backend]
+                return {"success": False, "error": text}
             return {"success": True, "database": database.database_name,
                     "columns": [{"name": c} for c in columns],
                     "rows": [{c: _plain(v) for c, v in zip(columns, r)} for r in rows],
@@ -72,9 +110,12 @@ def list_databases() -> dict:
         out = []
         for d in db.session.query(Database).order_by(Database.id):
             if security_manager.can_access_database(d):
-                out.append({"id": d.id, "name": d.database_name, "backend": d.backend,
-                            "kind": {"osagg": "OpenSearch indices", "promagg": "Prometheus / Mimir metrics"}.get(
-                                d.backend, d.backend)})
+                item = {"id": d.id, "name": d.database_name, "backend": d.backend,
+                        "kind": {"osagg": "OpenSearch indices", "promagg": "Prometheus / Mimir metrics"}.get(
+                            d.backend, d.backend)}
+                if d.backend in SQL_RULES:
+                    item["sql"] = SQL_RULES[d.backend]
+                out.append(item)
         return {"databases": out}
 
 

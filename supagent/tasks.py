@@ -43,6 +43,28 @@ def remember_task(message_id: int) -> None:
         db.session.remove()
 
 
+@celery_app.task(name="supagent.helpful", ignore_result=True, soft_time_limit=600, time_limit=660)
+def helpful_task(message_id: int) -> None:
+    from superset import db
+
+    try:
+        learn_helpful(message_id)
+    finally:
+        db.session.remove()
+
+
+def learn_helpful(message_id: int) -> None:
+    """An answer marked Helpful -> a learned answer (the LLM writes its generic question), then
+    the formulas that it may confirm (agent catalog)."""
+    from supagent.knowledge.autocatalog import run as agent_catalog
+    from supagent.knowledge.experience import learn_from_helpful
+    from supagent.knowledge.index import sync
+
+    if learn_from_helpful(message_id) is not None:
+        sync(("recipe:",))
+        agent_catalog(llm_docs=False, parts=("formulas",))
+
+
 @celery_app.task(name="supagent.catalog", ignore_result=True, soft_time_limit=600, time_limit=660)
 def catalog_task() -> None:
     from superset import db
@@ -199,6 +221,10 @@ def dispatch_memory(message_id: int) -> str:
     from supagent.knowledge.memory import learn_from_message
 
     return _dispatch(remember_task, learn_from_message, message_id)
+
+
+def dispatch_helpful(message_id: int) -> str:
+    return _dispatch(helpful_task, learn_helpful, message_id)
 
 
 def dispatch_catalog() -> str:

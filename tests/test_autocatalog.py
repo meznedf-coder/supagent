@@ -21,7 +21,7 @@ def _recipe(world, sql, status="confirmed", uses=1, database="jobs", message_id=
     r = Recipe(question="failure rate per node", words="failure node rate", tool="execute_sql",
                database_id=world[database].id, target="jobs", query=sql, signature=str(abs(hash(sql)))[:60],
                status=status, uses=uses, message_id=message_id,
-               confirmations=[message_id] if status == "confirmed" and message_id else None)
+               confirmations=[message_id] if status in ("helpful", "confirmed") and message_id else None)
     db.session.add(r)
     db.session.commit()
     return r
@@ -75,7 +75,7 @@ def test_formula_needs_confirmed_answers_and_one_expression(clean_knowledge):
     assert formulas() == {"added": [], "updated": [], "withdrawn": []}  # nothing new: no new version
     assert e.version == 1
 
-    other = _recipe(world, OTHER_RATE, status="auto")                  # the same name, another calculation
+    other = _recipe(world, OTHER_RATE, status="helpful")               # the same name, another calculation
     assert len(formulas()["withdrawn"]) == 1
     db.session.refresh(e)
     assert e.deleted_at is not None and "another expression" in e.evidence["withdrawn"]
@@ -95,14 +95,15 @@ def test_two_answers_confirming_the_same_query_count_twice(clean_knowledge):
     from supagent.knowledge.autocatalog import formulas
     from supagent.knowledge.experience import feedback
 
-    r = _recipe(clean_knowledge, RATE.format(day="2026-09-23"), status="auto", message_id=31)
-    feedback(31, 1)
-    assert formulas()["added"] == []                                  # confirmed once, used once
-    r.uses, r.message_id = 2, 32                                      # the second question used it
-    feedback(32, 1)
-    assert r.confirmations == [31, 32] and len(formulas()["added"]) == 1
+    from superset.extensions import db
+
+    r = _recipe(clean_knowledge, RATE.format(day="2026-09-23"), status="helpful", message_id=31)
+    assert formulas()["added"] == []                                  # marked Helpful once, used once
+    r.uses, r.confirmations = 2, [31, 32]                             # a second answer marked Helpful joined it
+    db.session.commit()
+    assert len(formulas()["added"]) == 1
     feedback(32, 0)                                                    # the second Helpful taken back
-    assert r.status == "confirmed" and r.confirmations == [31]
+    assert r.status == "helpful" and r.confirmations == [31]
     assert len(formulas()["withdrawn"]) == 1
 
 

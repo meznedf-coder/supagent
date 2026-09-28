@@ -97,6 +97,11 @@ pre { background: var(--code-bg); border: 1px solid var(--line-2); border-radius
 .badge.backend { background: var(--line-2); color: var(--ink-2); }
 .badge.gone { background: #fbe9e7; color: var(--bad); }
 .badge.ok { color: var(--ok); }
+.badge.warn { color: var(--warn); }
+details.query summary { cursor: pointer; }
+details.query pre { white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; margin: 6px 0 2px;
+  font-size: 12px; }
+details.query pre.err { color: var(--bad); }
 .badge.bad { color: var(--bad); }
 
 /* chat */

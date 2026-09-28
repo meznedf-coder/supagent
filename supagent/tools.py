@@ -177,14 +177,18 @@ def _db_connection(database: Any, extract: bool, max_rows: int = 0) -> Iterator[
         with database.get_raw_connection(catalog=None, schema=None) as conn:
             yield conn
         return
-    conn = _connection(database, extract, max_rows)
+    conn = _connection(database, extract, max_rows, agent_query=not extract)
     try:
         yield conn
     finally:
         conn.close()
 
 
-def _connection(database: Any, extract: bool, max_rows: int = 0) -> Any:
+def _connection(database: Any, extract: bool, max_rows: int = 0, agent_query: bool = False) -> Any:
+    """osagg DB-API connection of a Superset database. An agent's query (`agent_query`) that
+    cannot be pushed down may read at most agent.osagg_max_scan_rows raw documents (or the
+    connection's own cap if lower): osagg counts them first and refuses at once, with the reason,
+    instead of reading them for minutes."""
     import osagg
     from osagg.sqla import OpenSearchAggDialect
     from sqlalchemy.engine.url import make_url
@@ -195,15 +199,22 @@ def _connection(database: Any, extract: bool, max_rows: int = 0) -> Any:
     if extract:
         kwargs.update(lookup_joins=True, max_rows=0,
                       max_scan_rows=max(int(kwargs.get("max_scan_rows", 500_000)), max_rows + 1))
+    elif agent_query:
+        from supagent import settings
+
+        cap = int(settings.get("agent.osagg_max_scan_rows") or 0)
+        if cap > 0:
+            kwargs["max_scan_rows"] = min(int(kwargs.get("max_scan_rows", 500_000)), cap)
     return osagg.connect(**kwargs)
 
 
 def _run(database: Any, sql: str, max_rows: int, extract: bool) -> tuple[list[str], list[tuple], bool]:
-    from superset.extensions import security_manager
+    from superset.extensions import db, security_manager
 
     limited, _ = _check_select(sql, max_rows)
     security_manager.raise_for_access(database=database, sql=limited, schema="default")
     with _db_connection(database, extract, max_rows) as conn:
+        db.session.commit()        # no connection of Superset's own pool is held while the query runs
         cur = conn.cursor()
         cur.execute(limited)
         columns = [d[0] for d in cur.description or []]
@@ -1054,6 +1065,9 @@ def promql_query(expr: str, start: str | None = None, end: str | None = None, st
             conn = _promagg_connection(db_obj)
             try:
                 from promagg.timegrid import duration, parse_duration
+                from superset.extensions import db as meta
+
+                meta.session.commit()    # no connection of Superset's own pool is held while the query runs
 
                 if len(expr) > 4000:
                     raise ToolError("expression too long (4000 characters max)")
