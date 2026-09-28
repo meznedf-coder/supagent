@@ -83,3 +83,12 @@ def test_execute_sql_gives_the_hint_with_an_empty_result(world, monkeypatch):
             database_id=world["jobs"].id, sql='SELECT "NODE" FROM "jobs" WHERE "STATUS" = \'FAILED\''))
     assert out["success"] and out["row_count"] == 0 and "'Failed' is written 'FAILED'" in out["hint"]
     assert "hint" not in full
+
+
+def test_the_same_value_written_otherwise_is_recognised():
+    from supagent.knowledge.empty import _value_hint
+
+    stats = {"cardinality": 3, "values": ["srv-amer-001", "srv-amer-002", "srv-emea-010"]}
+    assert "'srv-amer-2' is written 'srv-amer-002'" in _value_hint("node", ["srv-amer-2"], stats, "promagg")
+    assert "'SRV_EMEA_10' is written 'srv-emea-010'" in _value_hint("node", ["SRV_EMEA_10"], stats, "promagg")
+    assert _value_hint("node", ["srv-amer-001"], stats, "promagg") is None

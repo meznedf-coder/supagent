@@ -86,18 +86,25 @@ def _values(stats: dict) -> tuple[list[str] | None, bool]:
     return [str(v) for v in vals], complete
 
 
+def _loose(v: str) -> str:
+    """A value without case, separators and leading zeros: srv_AMER_2 ~ srv-amer-002."""
+    return re.sub(r"\d+", lambda m: str(int(m.group())), re.sub(r"[\s_.\-/]+", "-", v.strip().lower()))
+
+
 def _value_hint(column: str, wanted: list[str], stats: dict, backend: str) -> str | None:
     known, complete = _values(stats)
     if not known:
         return None
     lower = {k.lower(): k for k in known}
+    loose = {_loose(k): k for k in known}
     missing = [w for w in dict.fromkeys(wanted) if w not in known]
     if not missing:
         return None
     parts = []
     for w in missing[:4]:
-        if w.lower() in lower:
-            parts.append(f"'{w}' is written '{lower[w.lower()]}'")
+        same = lower.get(w.lower()) or loose.get(_loose(w))
+        if same:
+            parts.append(f"'{w}' is written '{same}'")
             continue
         close = difflib.get_close_matches(w, known, n=3, cutoff=0.6)
         if close:
