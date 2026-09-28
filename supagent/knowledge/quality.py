@@ -90,6 +90,10 @@ def _question_of(m: Any) -> str:
     return (q[0] if q else "") or ""
 
 
+DATA_TOOLS = ("execute_sql", "promql_query", "describe_data", "search_knowledge", "export_excel", "check_health",
+              "compare_to_usual")
+
+
 def gaps(days: int = 30, limit: int = 50) -> dict[str, list[str]]:
     """What the agent did not answer well in the last `days`, and the learned answers about data
     that no longer exists."""
@@ -112,8 +116,11 @@ def gaps(days: int = 30, limit: int = 50) -> dict[str, list[str]]:
             out["not_helpful"].append(f"{when} {q[:160]}")
         elif m.status == "error" and len(out["failed"]) < limit:
             out["failed"].append(f"{when} {q[:160]} -> {(m.content or '')[:120]}")
-        if len(out["no_data_found"]) < limit and len(seen) <= 300 and terms(q) and not resolve(q):
-            out["no_data_found"].append(f"{when} {q[:160]} (words: {', '.join(terms(q)[:8])})")
+        data_question = any((st or {}).get("tool") in DATA_TOOLS for st in (m.steps or []))
+        words = terms(q)
+        if len(out["no_data_found"]) < limit and len(seen) <= 300 and data_question and len(words) >= 2 \
+                and not resolve(q):                  # the agent needed data and was not told where it was
+            out["no_data_found"].append(f"{when} {q[:160]} (words: {', '.join(words[:8])})")
     for r in db.session.query(Recipe).filter(Recipe.status.in_(USED)).limit(5000):
         if mentions_gone(r.query) and len(out["learned_on_gone_data"]) < limit:
             out["learned_on_gone_data"].append(f"#{r.id} {(r.question or '')[:120]}")

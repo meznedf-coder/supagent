@@ -70,8 +70,11 @@ def test_gaps_list_what_was_not_answered_well(live):
     db.session.commit()
     _chat("How many jobs failed on the grid?", feedback=-1)
     _chat("CPU of the elasticsearch nodes?", status="error", content="The agent could not answer: timeout")
-    _chat("What is the weather in Lisbon?")
-    _chat("CPU of the elasticsearch cluster now")
+    looked = [{"tool": "execute_sql", "status": "done", "seconds": 0.1}]
+    _chat("What is the weather in Lisbon?", steps=looked)
+    _chat("CPU of the elasticsearch cluster now", steps=looked)
+    _chat("hello there, who are you?")                                  # no data needed: not a gap
+    _chat("and the day before?", steps=looked)                          # a follow-up: too few words
     _recipe("Seconds of CPU", live["metrics"].id, 'SELECT SUM(rate) FROM "node_cpu_seconds_total"')
     db.session.query(KObject).filter_by(kind="metric", name="node_cpu_seconds_total").one().gone_at = db.func.now()
     db.session.commit()
@@ -82,6 +85,7 @@ def test_gaps_list_what_was_not_answered_well(live):
     assert out["failed"][0].endswith("-> The agent could not answer: timeout")
     assert any("weather in Lisbon" in x and "weather" in x.split("words:")[1] for x in out["no_data_found"])
     assert not any("elasticsearch cluster now" in x for x in out["no_data_found"])
+    assert len(out["no_data_found"]) == 1                              # not "hello", not the follow-up
     assert out["learned_on_gone_data"] and out["learned_on_gone_data"][0].endswith("Seconds of CPU")
 
 
