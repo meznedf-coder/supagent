@@ -301,13 +301,16 @@ class LLM:
                                                        flags=re.S).strip())}
         except LLMError as ex:
             out["thinking"] = {"error": str(ex)[:200]}
-        tool = {"type": "function", "function": {"name": "get_time", "description": "The current time",
-                                                  "parameters": {"type": "object", "properties": {}}}}
+        tool = {"type": "function", "function": {
+            "name": "ticket_status", "description": "The status of a support ticket, by its number",
+            "parameters": {"type": "object", "required": ["number"], "properties": {"number": {"type": "string"}}}}}
         try:
-            data, sec = self._raw({"messages": [{"role": "user", "content": "What time is it? Use the tool."}],
-                                   "tools": [tool], "tool_choice": "auto", "max_tokens": 200, **no_think})
+            data, sec = self._raw({"messages": [
+                {"role": "system", "content": "Answer only from the tools: you know nothing about the tickets."},
+                {"role": "user", "content": "What is the status of ticket 4711?"}],
+                "tools": [tool], "tool_choice": "auto", "max_tokens": 200, **no_think})
             calls = ((data.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
-            out["tool_calls"] = {"seconds": sec, "works": any((c.get("function") or {}).get("name") == "get_time"
+            out["tool_calls"] = {"seconds": sec, "works": any((c.get("function") or {}).get("name") == "ticket_status"
                                                               for c in calls)}
         except LLMError as ex:
             out["tool_calls"] = {"error": str(ex)[:200]}

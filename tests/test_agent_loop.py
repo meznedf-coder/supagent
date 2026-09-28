@@ -309,7 +309,7 @@ def test_only_answers_being_computed_are_waited_for(app):
 
 def test_the_llm_profile_says_what_the_server_does(monkeypatch):
     """superset supagent test-llm --profile: thinking, tool calls and the prompt cache."""
-    tool_call = [{"id": "1", "function": {"name": "get_time", "arguments": "{}"}}]
+    tool_call = [{"id": "1", "function": {"name": "ticket_status", "arguments": "{\"number\": \"4711\"}"}}]
     bodies = [_reply("OK"), _reply("<think>x</think>OK", usage={"prompt_tokens": 20, "completion_tokens": 300}),
               _reply("", tool_calls=tool_call),
               _reply("t7", usage={"prompt_tokens": 3000, "completion_tokens": 1}, timings={"prompt_n": 3000}),
