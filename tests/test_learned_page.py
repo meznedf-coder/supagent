@@ -134,3 +134,56 @@ def test_the_agent_knows_the_limits_of_osagg_and_promagg(world, monkeypatch):
         out = tools_superset.execute_sql(tools_superset.ExecuteSqlRequest(
             database_id=world["jobs"].id, sql="SELECT * FROM jobs"))
     assert out["success"] is False and "safety cap" in out["error"] and "rewrite it in steps" in out["error"]
+
+
+def test_an_extract_cut_by_its_own_limit_says_so(world, monkeypatch, tmp_path):
+    """The agent copied a LIMIT into an extract and told the user it held every row: the tool
+    now says when the SQL's own LIMIT was reached, so the agent runs it again without it."""
+    from supagent import tools
+
+    rows = [(i, "FAILED") for i in range(50)]
+    monkeypatch.setattr(tools, "_export_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(tools, "_database", lambda ref, backend=None, sql=None: world["jobs"])
+    monkeypatch.setattr(tools, "_run", lambda d, sql, cap, extract: (["ID", "STATUS"], rows, False))
+    cut = tools._export('SELECT "ID", "STATUS" FROM "batch-jobs" ORDER BY 1 LIMIT 50', None, "x", None, None, None)
+    assert cut["limited_by_sql"] == 50 and "without the LIMIT" in cut["note"] and cut["rows"] == 50
+    whole = tools._export('SELECT "ID", "STATUS" FROM "batch-jobs" ORDER BY 1', None, "y", None, None, None)
+    first = tools._export('SELECT "ID", "STATUS" FROM "batch-jobs" ORDER BY 1 LIMIT 80', None, "z", None, None, None)
+    assert "note" not in whole and "note" not in first            # no LIMIT / a LIMIT not reached
+
+
+class _Tables:
+    """An osagg / promagg connection that knows a few tables."""
+
+    names = ["batch-jobs", "batch-apps", "node_cpu_seconds_total"]
+
+    def table_meta(self, name):
+        return object() if name in self.names else None
+
+    def list_tables(self):
+        return list(self.names)
+
+    def close(self):
+        pass
+
+
+def test_a_name_that_is_no_index_is_named_with_the_closest_ones(world, monkeypatch):
+    from supagent import tools, tools_superset
+    from supagent.security import acting_as
+
+    monkeypatch.setattr(tools, "_connection", lambda database, extract, max_rows=0, agent_query=False: _Tables())
+    sql = 'SELECT a."ID", b."TEAM" FROM "batch-jobs" a JOIN "apps" b ON a."APP" = b."APP"'
+    hint = tools.unknown_tables(world["jobs"], sql)
+    assert '"apps" (closest: "batch-apps")' in hint and "batch-jobs" not in hint.split("closest")[0]
+    assert tools.unknown_tables(world["jobs"], 'SELECT COUNT(*) FROM "batch-jobs"') == ""
+
+    class Refused(Exception):
+        pass
+
+    def refuse(database, sql, limit, extract):
+        raise Refused("JOIN on an OpenSearch table is not supported: aggregate or filter each side in a subquery")
+
+    monkeypatch.setattr(tools_superset, "_run", refuse)
+    with acting_as("admin"):
+        out = tools_superset.execute_sql(tools_superset.ExecuteSqlRequest(database_id=world["jobs"].id, sql=sql))
+    assert out["success"] is False and out["error"].startswith('No table "apps" (closest: "batch-apps")')

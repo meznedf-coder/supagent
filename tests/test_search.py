@@ -141,6 +141,31 @@ def test_memory_signals_approval_and_prompt(clean_knowledge):
     assert "durations" not in prompt_block(sm.find_user(username="bob").id)
 
 
+def test_memories_given_with_every_question_have_a_budget(clean_knowledge):
+    """Statements are learned at once for their author: the block stays within memory.prompt_chars,
+    rules and preferences before facts (facts left out are still found by the search)."""
+    from superset.extensions import security_manager as sm
+
+    from supagent import settings
+    from supagent.knowledge.memory import add, prompt_block
+
+    alice = sm.find_user(username="alice").id
+    for i in range(12):
+        assert add(alice, f"Fact {i}: " + " ".join(f"word{i}x{j}" for j in range(40)), kind="fact") is not None
+    add(alice, "Always give durations in minutes", kind="rule")
+    add(alice, "I prefer tables sorted by the largest value", kind="preference")
+    block = prompt_block(alice)
+    lines = block.strip().splitlines()[1:]
+    assert sum(len(x) for x in lines) <= settings.get("memory.prompt_chars") == 2000
+    assert "durations in minutes" in lines[0] and "sorted by the largest" in lines[1]    # rules, preferences first
+    assert 2 < len(lines) < 14                                                          # some facts, not all
+    settings.set_value("memory.prompt_chars", 0)                                        # 0: no budget
+    try:
+        assert len(prompt_block(alice).strip().splitlines()) == 15
+    finally:
+        settings.set_value("memory.prompt_chars", 2000)
+
+
 def test_documents_are_read_safely(clean_knowledge, monkeypatch):
     from supagent import settings
     from supagent.knowledge import docs as D

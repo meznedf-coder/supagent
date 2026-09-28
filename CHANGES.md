@@ -32,6 +32,16 @@ only the tools the question needs, and learns where the data was from its own an
 * **Statements are knowledge**: a message that tells something ("STATUS_INFO = KO means the job
   failed", "this metric is the CPU of the cluster nodes") is read for durable facts and rules
   (team ones wait for an admin's approval, `memory.team_approval`).
+* **Memories within a budget** (`memory.prompt_chars`, 2,000 characters): the memories given with
+  every question are the rules, then the preferences, then the facts; the facts left out are
+  still found by the knowledge search when a question is about them. Statements are learned
+  now, so the block no longer grows with them.
+* **Extracts hold every row**: an Excel extract gets no LIMIT unless the user asks for the first
+  N, and when the SQL's own LIMIT is reached the tool says so (the agent runs it again without
+  it). Before, an extract could stop at the LIMIT of the tool's example while the answer said
+  "all the rows".
+* A table name that is no index or metric (in a JOIN too) is named in the error, with the
+  closest names, instead of "JOIN not supported" or "Did you mean pg_prepared_statements".
 * The knowledge search is updated during a learning run (every 500 metrics, and after each
   database), not only at its end. `describe_data` no longer shows unknown time ranges.
 * Run `superset supagent init` (one new table).

@@ -122,8 +122,9 @@ latency, licences with from-to and worst value), 3) answer with the problems tha
 say what was not found. list_alerts shows the alerts firing now.""",
     "files": """
 
-Files, e-mails and reports (asked here): a file or Excel extract -> export_excel (only there a row list may
-join the big index with small ones, e.g. jobs with their application's TEAM); an e-mail now -> send_email
+Files, e-mails and reports (asked here): a file or Excel extract -> export_excel (every matching row: no
+LIMIT unless the user asks for the first N; only there a row list may join the big index with small ones,
+e.g. jobs with their application's TEAM); an e-mail now -> send_email
 (body_markdown, sql for a table, chart_sqls or image_paths for images, excel_sql or attach_paths for the
 Excel file); a recurring e-mail -> create_report. JSON asked -> answer with the rows as a ```json block
 only.""",

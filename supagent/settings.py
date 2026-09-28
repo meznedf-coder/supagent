@@ -124,6 +124,8 @@ SPECS: list[Spec] = [
     Spec("memory.enabled", True, "bool", "Learn preferences, rules and facts from the chats"),
     Spec("memory.team_approval", True, "bool", "Team memories need an admin's approval before they are used "
          "(personal ones are used at once)"),
+    Spec("memory.prompt_chars", 2000, "int", "Characters of memories given with every question at most (rules, "
+         "then preferences, then facts; the facts left out are still found by the knowledge search)"),
     # ---- other agents (MCP server mode)
     Spec("mcp.user", "", "str", "Superset user the MCP server mode (`superset supagent mcp`, for other agents) "
          "acts as; empty: MCP_DEV_USERNAME of superset_config.py"),

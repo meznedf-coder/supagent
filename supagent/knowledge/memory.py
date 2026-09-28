@@ -148,12 +148,26 @@ def memories_for(user_id: int | None, limit: int = 15) -> list[Memory]:
     return mine + team
 
 
+KIND_ORDER = {"rule": 0, "preference": 1, "fact": 2}
+ENTRY_CHARS = 400
+
+
 def prompt_block(user_id: int | None) -> str:
+    """The memories given with every question, within memory.prompt_chars: rules, then
+    preferences, then facts (the user's own first, the newest first). Facts left out are still
+    found by the knowledge search when a question is about them."""
     items = memories_for(user_id)
     if not items:
         return ""
+    budget = int(settings.get("memory.prompt_chars") or 0) or 10 ** 9
     lines = ["\n\nWhat this user and the team asked to remember (follow it unless the question says otherwise):"]
-    for m in items:
+    used = 0
+    for m in sorted(items, key=lambda m: KIND_ORDER.get(m.kind, 3)):     # stable: mine, then the team's
         who = "team" if m.scope == "team" else "this user"
-        lines.append(f"- ({who}, {m.kind}) {m.text}")
-    return "\n".join(lines)
+        text = " ".join((m.text or "").split())
+        line = f"- ({who}, {m.kind}) {text[:ENTRY_CHARS]}{'...' if len(text) > ENTRY_CHARS else ''}"
+        if used + len(line) > budget:
+            continue
+        lines.append(line)
+        used += len(line)
+    return "\n".join(lines) if len(lines) > 1 else ""

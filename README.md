@@ -307,9 +307,11 @@ every query result as a table and a chart: the agent runs the query, it does not
 * **Memory**: when a question says *always*, *from now on*, *remember*, *by default*,
   *toujours*, *désormais*, *retiens*... or an answer is marked *Helpful*, the LLM extracts the
   durable points: a user's preferences (used at once, in that user's answers only) and the
-  team's rules and facts (used after an admin approves them, `memory.team_approval`). Users
-  see and delete theirs with the chat's *Memory* button; admins review the team's on the
-  settings page.
+  team's rules and facts (used after an admin approves them, `memory.team_approval`). A message
+  that tells something ("STATUS_INFO = KO means the job failed") is read the same way. Every
+  question gets at most `memory.prompt_chars` characters of them (rules, then preferences, then
+  facts); the facts left out are still found by the knowledge search. Users see and delete
+  theirs with the chat's *Memory* button; admins review the team's on the settings page.
 
 ## Knowledge search
 

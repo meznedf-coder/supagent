@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from supagent.tools import _as_user, _run, agent_databases, mcp
+from supagent.tools import TABLE_ERROR, _as_user, _run, agent_databases, mcp, unknown_tables
 
 
 def _plain(v: Any) -> Any:
@@ -82,6 +82,9 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
                 columns, rows, truncated = _run(database, request.sql, limit, extract=False)
             except Exception as ex:  # pylint: disable=broad-except
                 text = f"{type(ex).__name__}: {str(ex)[:1500]}"
+                hint = unknown_tables(database, request.sql) if TABLE_ERROR.search(text) else ""
+                if hint:                               # the real cause: a name that is no index or metric
+                    return {"success": False, "error": f"{hint} ({text[:300]})"}
                 if backend == "osagg" and "WHERE term evaluated" in text:
                     text += WHERE_HINT
                 elif backend == "osagg" and re.search(r"pushed down|cannot run in OpenSearch|JoinRefused|safety cap",

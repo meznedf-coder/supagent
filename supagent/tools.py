@@ -262,6 +262,48 @@ def _connection(database: Any, extract: bool, max_rows: int = 0, agent_query: bo
     return osagg.connect(**kwargs)
 
 
+TABLE_ERROR = re.compile(r'Table "[^"]*" does not exist|metric "[^"]*" does not exist|JOIN on an OpenSearch table|'
+                         r"JOIN with a raw OpenSearch table|is not an OpenSearch index|Catalog Error: Table with name")
+
+
+def unknown_tables(database: Any, sql: str) -> str:
+    """After a failed OpenSearch (osagg) or Prometheus (promagg) query: the tables of the SQL that
+    this database does not have, with the closest names ("" when they all exist, or when it
+    cannot be told). A JOIN with a name that is no index fails with "JOIN not supported", and a
+    wrong name with "does not exist": this says which name to fix, and with what."""
+    import difflib
+
+    import sqlglot
+    from sqlglot import exp
+
+    if getattr(database, "backend", None) not in ("osagg", "promagg"):
+        return ""
+    try:
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        ctes = {c.alias_or_name for c in tree.find_all(exp.CTE)}
+        names = list(dict.fromkeys(t.name for t in tree.find_all(exp.Table) if t.name and t.name not in ctes))
+        if not names:
+            return ""
+        conn = _connection(database, extract=False) if database.backend == "osagg" else _promagg_connection(database)
+        try:
+            missing = [n for n in names if conn.table_meta(n) is None]
+            known = [str(k) for k in conn.list_tables()] if missing else []
+        finally:
+            conn.close()
+    except Exception:  # pylint: disable=broad-except   (a hint only)
+        return ""
+    parts = []
+    for name in missing:
+        low = name.lower()
+        close = [k for k in known if low in k.lower()][:3]
+        close += [k for k in difflib.get_close_matches(name, known, n=3, cutoff=0.6) if k not in close]
+        parts.append(f'"{name}"' + (" (closest: " + ", ".join(f'"{k}"' for k in close[:3]) + ")" if close else ""))
+    if not parts:
+        return ""
+    return (f"No table {', '.join(parts)} in database {database.database_name!r}: use the exact index or metric "
+            "names (describe_data lists them).")
+
+
 def _run(database: Any, sql: str, max_rows: int, extract: bool) -> tuple[list[str], list[tuple], bool]:
     from superset.extensions import db, security_manager
 
@@ -356,17 +398,34 @@ def _export(sql: str, database: str | int | None, file_name: str | None, title: 
     cap = min(max_rows or limit, limit)
     db_obj = _database(database, sql=sql)
     t0 = time.time()
-    columns, rows, truncated = _run(db_obj, sql, cap, extract=True)
+    try:
+        columns, rows, truncated = _run(db_obj, sql, cap, extract=True)
+    except ToolError:
+        raise
+    except Exception as ex:  # pylint: disable=broad-except
+        hint = unknown_tables(db_obj, sql) if TABLE_ERROR.search(str(ex)) else ""
+        if not hint:
+            raise
+        raise ToolError(f"{hint} ({type(ex).__name__}: {str(ex)[:300]})") from ex
+    own = _check_select(sql, cap)[1]
+    by_sql = 0 < own <= cap and len(rows) == own          # the SQL's own LIMIT was reached: more rows may match
     _cleanup()
     path = os.path.join(_export_dir(), _file_name(file_name, "extract", "xlsx"))
     _write_xlsx(path, columns, rows, {
         "title": title or "", "generated": f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}",
         "by": getattr(user, "username", ""), "database": db_obj.database_name, "rows": len(rows),
-        "truncated": f"yes: first {cap:,} rows only" if truncated else "no", "SQL": sql})
-    return {"id": _file_id(path), "path": path, "url": _public(path), "rows": len(rows),
-            "columns": columns, "truncated": truncated, "bytes": os.path.getsize(path),
-            "seconds": round(time.time() - t0, 1),
-            "to_email_it": f'send_email(..., attach_paths=["{_file_id(path)}"])'}
+        "truncated": f"yes: first {cap:,} rows only" if truncated else
+                     (f"maybe: the LIMIT {own:,} of the SQL was reached" if by_sql else "no"), "SQL": sql})
+    res = {"id": _file_id(path), "path": path, "url": _public(path), "rows": len(rows),
+           "columns": columns, "truncated": truncated, "bytes": os.path.getsize(path),
+           "seconds": round(time.time() - t0, 1),
+           "to_email_it": f'send_email(..., attach_paths=["{_file_id(path)}"])'}
+    if by_sql:
+        res["limited_by_sql"] = own
+        res["note"] = (f"The SQL's own LIMIT {own:,} stopped this extract at {own:,} rows: more rows may match. "
+                       f"Unless the user asked for the first {own:,} rows, run export_excel again without the "
+                       f"LIMIT (an extract holds up to {cap:,} rows and says when it is cut).")
+    return res
 
 
 @mcp.tool
@@ -375,12 +434,14 @@ def export_excel(sql: str, database: str | int | None = None, file_name: str | N
                  email_to: list[str] | None = None) -> dict:
     """Extract the rows of a SELECT to an Excel file (.xlsx) on the server; optionally e-mail it.
 
-    For extracts only, a row list may join ONE big index with small ones (each at most
-    join_max_keys matching documents), e.g. failed jobs with their application's TEAM:
-    SELECT a."@timestamp_date", a."APPLICATION", b."TEAM" FROM "jobs" a JOIN "apps" b
-    ON a."APPLICATION" = b."APPLICATION" WHERE ... ORDER BY 1 DESC LIMIT 10000.
-    Put the conditions and the time range in WHERE; give a LIMIT. Returns the file path,
-    row count and whether the rows were cut at max_rows (EXPORT_MAX_ROWS)."""
+    An extract holds every matching row: no LIMIT unless the user asks for the first N (the
+    file stops at max_rows, EXPORT_MAX_ROWS, and says so). For extracts only, a row list may
+    join ONE big index with small ones (each at most join_max_keys matching documents), e.g.
+    failed jobs with their application's TEAM, with the exact index names:
+    SELECT a."@timestamp_date", a."APPLICATION", b."TEAM" FROM "<jobs index>" a
+    JOIN "<applications index>" b ON a."APPLICATION" = b."APPLICATION" WHERE ... ORDER BY 1 DESC.
+    Put the conditions and the time range in WHERE. Returns the file path, the row count and
+    whether the rows were cut."""
     try:
         with _as_user() as (app, user):
             res = _export(sql, database, file_name, title, max_rows, user)
@@ -826,7 +887,7 @@ def send_email(to: list[str], subject: str, body_markdown: str = "", sql: str | 
             elif excel_sql:
                 res = _export(excel_sql, database, excel_name, excel_name, None, user)
                 attachments.append(res["path"])
-                info["excel"] = {k: res[k] for k in ("path", "rows", "truncated")}
+                info["excel"] = {k: res[k] for k in ("path", "rows", "truncated", "note") if k in res}
             info.update(_send(app, to, subject, "".join(parts), images, attachments))
             return info
     except ToolError as ex:
