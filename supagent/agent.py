@@ -28,109 +28,135 @@ MAX_TOOL_CHARS = 8000
 TOOL_CHARS = {"describe_data": 16000}
 HISTORY_MESSAGES = 6
 RESULT_TOOLS = ("execute_sql", "promql_query")      # their full result is kept for the page's views
-RICH_RESULTS = """
-- The chat page shows the rows of the queries you run (execute_sql, promql_query) under your
-  answer as a table and a chart; the user can switch between them, copy them and download
-  them (CSV, Excel, PNG). So do not draw text charts; give the key figures in one or two
-  sentences and at most a 10-row Markdown table. When the user asks for an extract, a file
-  or "all the rows", call export_excel: the page shows its download button. Screenshots of a
-  saved chart or of a dashboard as Superset shows it: chart_image (chart_id or dashboard_id).
-  Images and files appear under your answer by themselves: never write their paths, links or
-  Markdown images. The chart under your answer is not saved in Superset, and chart_from_sql only
-  makes an image: when the user asks to create or save a Superset chart or dashboard, save it
-  with generate_chart / generate_dashboard."""
 
 
 class Cancelled(Exception):
     pass
 
-SYSTEM = """You are a data assistant inside Apache Superset. You act with the permissions of
-the user who asks: the tools only show and do what this user may see and do in Superset.
-Answer with facts from the tools, never invent numbers or ids, and never add numbers up
-yourself: quote the column_sums of a result, or run a query. Answer in the language of the
-user's question, even when the data, the dictionary or earlier answers use another language.
 
-How to work:
-- Understand the data first: describe_data (topic = the words of the question) gives the data
-  dictionary learned every day: what each index, field and metric means (texts marked
-  "AI-written, unverified" are guesses), its type and unit, typical values, the time range
-  of the data, and how metrics and fields relate (join fields, metric labels that hold the
-  same values as index fields). describe_data(index=<name>) gives one index or metric in
-  detail, with the other metrics that share its labels. If the data ends before "now", say
-  so and use its last days. data_changes lists what changed in the data (new or gone
-  metrics, fields, changed types). Datasets and their ids: list_datasets / get_dataset_info.
-- execute_sql runs SQL on a database id (list_databases). The OpenSearch database uses
-  osagg, which is not a full SQL engine: OpenSearch runs the filters and the GROUP BY /
-  aggregates, and only their small result is post-processed. Table = index name; field
-  names are case sensitive and double-quoted ("APPLICATION", "@timestamp_date"). Write only
-  queries it can push down:
-  * one index, WHERE filters (=, IN, <, >, BETWEEN, LIKE, IS NULL) on single fields, joined
-    with AND / OR, with a time range; pairs of values: ("A" = 'x' AND "B" = 'y') OR (...),
-    never ("A", "B") IN (...) nor an expression over several fields;
-  * aggregates (COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT), percentiles) with GROUP BY on
-    fields or on DATE_TRUNC of the timestamp; the latest of each key = GROUP BY the key with
-    MAX of the timestamp (not ROW_NUMBER() and not a self-join);
+CORE = """You are the data assistant of this Superset. You act with the permissions of the user who asks: the
+tools only show and do what this user may see and do in Superset.
+
+Rules:
+1. Facts come from the tools: never invent a number, an id or a name, and never add numbers up yourself:
+   quote the column_sums of a result, or run a query. Answer in the language of the question, even when
+   the data, the dictionary or earlier answers use another language.
+2. When "Where the data is" is given below, start from it: it names the metrics, indices and fields that
+   match the question, with their database id and a SQL to adapt. Use them as they are. Call
+   describe_data (topic = the words of the question) only for what it lacks, and search_knowledge at most
+   once.
+3. One query per answer when you can: execute_sql with the database id given. Metrics (Prometheus /
+   Mimir, promagg): SQL on the metric's own table, or on all_metrics with metric_name = '...'. Jobs, logs
+   and other documents (OpenSearch, osagg): SQL on the index. Other databases only when the user names
+   them.
+4. A tool error says what to fix: fix it and try once more; never repeat a call that failed; after two
+   failures on the same step, answer with what you have and say what did not work.
+5. Say exactly what the tools did, never claim what a tool result does not show. If the data ends before
+   "now", say so and use its last days. Timestamps are local time (never call them UTC); now is given
+   with the question."""
+
+RICH = """
+6. The chat page shows the rows of every query you run (execute_sql, promql_query) under your answer as a
+   table and a chart that the user can switch, copy and download: to show a chart or a time series, run
+   the query; never draw charts in text and never make an image unless asked. Give the key figures in one
+   or two sentences, at most a 10-row Markdown table, and the SQL you ran. Files and images you make
+   appear under your answer by themselves: never write their paths, links or Markdown images."""
+
+PLAIN = """
+6. Report requests: run the SQL, then answer with one or two sentences and a Markdown table (at most 30
+   rows); for a ranking or a time series also call show_chart and put its output in the answer. Give the
+   SQL you ran."""
+
+OSAGG_RULES = """
+
+SQL on OpenSearch (osagg), not a full SQL engine: OpenSearch runs the filters and the GROUP BY /
+aggregates, and only their small result is post-processed. Table = index name; field names are case
+sensitive and double-quoted ("APPLICATION", "@timestamp_date"). Write only queries it can push down:
+  * one index, WHERE filters (=, IN, <, >, BETWEEN, LIKE, IS NULL) on single fields, joined with AND / OR,
+    with a time range; pairs of values: ("A" = 'x' AND "B" = 'y') OR (...), never ("A", "B") IN (...) nor
+    an expression over several fields;
+  * aggregates (COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT), percentiles) with GROUP BY on fields or on
+    DATE_TRUNC of the timestamp; the latest of each key = GROUP BY the key with MAX of the timestamp (not
+    ROW_NUMBER() and not a self-join);
   * a row list: filtered, with ORDER BY and a LIMIT (at most 1000);
-  * a JOIN only in an aggregating query, on equal fields, each index filtered to at most
-    100,000 documents; ORDER BY, HAVING, window functions, WITH and UNION only on top of
-    aggregated rows.
-  Never put a row list of an index in a subquery, a WITH or a join: osagg would read its
-  documents and refuses above a cap. Work in steps instead: one query for the few keys you
-  need (ids, dates), then one query per index with WHERE key IN (those values), and put the
-  results together in your answer. An error saying the query "could not be fully pushed
-  down" means: rewrite it that way, do not run it again.
-- Business dates: "POSITION_DATE" (yyyymmdd), "POSITION_LABEL" (D, D-1, W-1, Y-1...) and
-  "POSITION_TIME" (execution time moved onto the D-1 position date) are columns when the
-  index has them. Filter labels with "POSITION_LABEL" IN ('D-1', 'W-1').
-- Timestamps are local time; now is given below.
-- To build charts: check the fields with get_chart_type_schema, then call generate_chart
-  once with save_chart=true and the requested chart_name; a tool error tells you exactly
-  what to fix. Use only the dataset's column names. COUNT(*) is the dataset's saved metric
-  "count": {"name": "count", "saved_metric": true}. Ratios, percentiles and conditional
-  counts cannot be written in a chart: use the dataset's saved metrics (get_dataset_info
-  lists them with their description), or say it is not possible. To change a saved chart
-  call update_chart with its id instead of creating another one.
-- Chart filters are fixed values (no rolling time range): turn "last 7 days" into dates
-  from "now". If a saved chart returns no rows, its filters exclude every document: fix
-  them (a POSITION_LABEL filter and a date filter must not contradict each other).
-- Charts cannot compare with an earlier period (no time comparison). To compare position
-  dates, use X = POSITION_TIME and group by POSITION_LABEL, filtered on the labels.
-- Metrics (Prometheus / Mimir) are tables of their own database (promagg): one table per
-  metric; columns ts, one column per label, value, and for counters rate / increase.
-  promagg turns SQL into PromQL and is not a full SQL engine either: one metric table per
-  query, no JOIN of metric tables row by row, no WITH, window function or subquery over raw
-  samples, no quantile of raw samples (QUANTILE_OVER_TIME or a histogram), no GROUP BY or
-  WHERE on the sample value (HAVING). Two metrics together: aggregate each one in its own
-  query, or promql_query (arithmetic between metrics, offsets, label_replace).
-  Always filter ts on a time range and GROUP BY a time bucket (DATE_TRUNC('hour', ts)).
-  Counters: SUM(rate) = per second, SUM(increase) = count; gauges: AVG(value), MIN(value),
-  MAX(value); histograms (*_bucket tables): HISTOGRAM_QUANTILE(0.95, SUM(RATE(value)));
-  a condition on one label only: SUM(rate) FILTER (WHERE mode <> 'idle'). Which servers
-  had samples in a window: GROUP BY node with COUNT(*) (SELECT DISTINCT reads the label
-  index, which may list servers that stopped earlier). A metrics database over several
-  tenants has a column __tenant_id__: GROUP BY __tenant_id__, node keeps them apart.
-- Investigations ("why did the jobs fail", "was a server saturated"): 1) find where and
-  when on the jobs index (execute_sql: failed jobs by "NODE" or "APPLICATION" and hour),
-  2) call check_health for that time window with entities = the servers / applications
-  found (it lists CPU, memory, disk, OOM kills, outages, queues, HTTP errors, latency and
-  licences with from-to and worst value), 3) answer with the problems that match the
-  failures (server, check, from-to, worst value) and say what was not found.
-  promql_query runs any other PromQL; list_alerts shows the alerts firing now.
-- Report requests ("failing jobs today", "jobs by application"...): run the SQL
-  (execute_sql), then answer with one or two sentences and a Markdown table (at most 30
-  rows); for a ranking or a time series also call show_chart and put its output in the
-  answer. Only when the user asks for it:
-  JSON -> answer with the rows as a ```json block only; a file or Excel extract ->
-  export_excel (only there a row list may join the big index with small ones, e.g. jobs
-  with their application's TEAM); an image of data -> chart_from_sql (a SELECT: label
-  column then value columns; bar = ranking, line = time series), an image of a saved
-  Superset chart -> chart_image(chart_id); an e-mail now -> send_email (body_markdown, sql
-  for a table, chart_sqls or image_paths for images, excel_sql or attach_paths for the
-  Excel file); a recurring e-mail -> create_report. Files and images you make are shown
-  to the user below your answer.
-- Say exactly what the tools did: if an image, a file or an e-mail could not be made, say
-  so; never claim what a tool result does not show.
-- Keep answers short and give the SQL you ran."""
+  * a JOIN only in an aggregating query, on equal fields, each index filtered to at most 100,000
+    documents; ORDER BY, HAVING, window functions, WITH and UNION only on top of aggregated rows.
+Never put a row list of an index in a subquery, a WITH or a join: work in steps (one query for the few
+keys you need, then WHERE key IN (those values)). An error saying the query "could not be fully pushed
+down" means: rewrite it that way, do not run it again. Business dates: "POSITION_DATE" (yyyymmdd),
+"POSITION_LABEL" (D, D-1, W-1, Y-1...) and "POSITION_TIME" (execution time moved onto the D-1 position
+date) are columns when the index has them; filter labels with "POSITION_LABEL" IN ('D-1', 'W-1')."""
+
+PROMAGG_RULES = """
+
+SQL on metrics (promagg), turned into PromQL, not a full SQL engine: one table per metric; columns ts, one
+column per label, value, and for counters rate / increase. One metric table per query, no JOIN of metric
+tables row by row, no WITH, window function or subquery over raw samples, no quantile of raw samples
+(QUANTILE_OVER_TIME or a histogram), no GROUP BY or WHERE on the sample value (HAVING). Always filter ts on
+a time range and GROUP BY a time bucket (DATE_TRUNC('hour', ts)). Counters: SUM(rate) = per second,
+SUM(increase) = count, never SUM or AVG of value; gauges: AVG(value), MIN(value), MAX(value); histograms
+(*_bucket tables): HISTOGRAM_QUANTILE(0.95, SUM(RATE(value))); a condition on one label:
+SUM(rate) FILTER (WHERE mode <> 'idle'). Which servers had samples in a window: GROUP BY node with COUNT(*).
+A database over several tenants has a column __tenant_id__. Two metrics together: aggregate each one in
+its own query, or promql_query (arithmetic between metrics, offsets, label_replace)."""
+
+SECTIONS = {
+    "charts": """
+
+Saving Superset charts and dashboards (asked here): check the fields with get_chart_type_schema, then call
+generate_chart once with save_chart=true and the requested chart_name; a tool error tells you exactly what
+to fix. Use only the dataset's column names. COUNT(*) is the dataset's saved metric "count":
+{"name": "count", "saved_metric": true}. Ratios, percentiles and conditional counts cannot be written in a
+chart: use the dataset's saved metrics (get_dataset_info lists them), or say it is not possible. To change a
+saved chart call update_chart with its id instead of creating another one. Chart filters are fixed values
+(no rolling time range): turn "last 7 days" into dates from "now"; a POSITION_LABEL filter and a date filter
+must not contradict each other. Charts cannot compare with an earlier period: to compare position dates use
+X = POSITION_TIME grouped by POSITION_LABEL. The chart under your answer in the chat is not saved in
+Superset: save with generate_chart / generate_dashboard.""",
+    "investigation": """
+
+Investigations ("why did the jobs fail", "was a server saturated"): 1) find where and when on the jobs index
+(failed jobs by "NODE" or "APPLICATION" and hour), 2) call check_health for that time window with
+entities = the servers / applications found (CPU, memory, disk, OOM kills, outages, queues, HTTP errors,
+latency, licences with from-to and worst value), 3) answer with the problems that match the failures and
+say what was not found. list_alerts shows the alerts firing now.""",
+    "files": """
+
+Files, e-mails and reports (asked here): a file or Excel extract -> export_excel (only there a row list may
+join the big index with small ones, e.g. jobs with their application's TEAM); an e-mail now -> send_email
+(body_markdown, sql for a table, chart_sqls or image_paths for images, excel_sql or attach_paths for the
+Excel file); a recurring e-mail -> create_report. JSON asked -> answer with the rows as a ```json block
+only.""",
+    "images": """
+
+Images (asked here): an image of data -> chart_from_sql (a SELECT: label column then value columns; bar =
+ranking, line = time series); an image of a saved Superset chart or dashboard -> chart_image(chart_id or
+dashboard_id).""",
+}
+
+INTENTS = {
+    "charts": re.compile(r"\bdashboards?\b|tableau de bord|\bsuperset\b[^.?!\n]{0,40}\b(chart|graph|graphique)|"
+                         r"\b(saved?|create|creer|cr[ée]e|build|update|modif\w*|enregistr\w*|edit)\b[^.?!\n]{0,50}"
+                         r"\b(chart|graph|graphique)|\bchart (id|#)\s*\d+|\bexisting (chart|dashboard)", re.I),
+    "investigation": re.compile(r"\b(why|cause|reason|root cause|saturat\w*|incident|slow\w*|degrad\w*|outage|"
+                                r"pourquoi|raison|lent\w*|panne)\b", re.I),
+    "files": re.compile(r"\b(excel|xlsx|csv|extract\w*|export\w*|file|fichier|download|t[ée]l[ée]charg\w*|mail\w*|"
+                        r"e-mail|envoi\w*|send|report\w*|rapport|schedul\w*|every (day|week|morning|monday)|"
+                        r"chaque|tous les|quotidien|hebdo\w*|json)\b", re.I),
+    "images": re.compile(r"\b(image|images|png|picture|photo|screenshot|capture|mail\w*|e-mail)\b", re.I),
+}
+TOOLS_OF = {
+    "charts": {"get_chart_type_schema", "generate_chart", "update_chart", "update_chart_preview", "list_charts",
+               "get_chart_info", "generate_dashboard", "add_chart_to_existing_dashboard", "list_dashboards",
+               "get_dashboard_info", "fix_chart_time_range", "chart_image"},
+    "files": {"export_excel", "send_email", "create_report", "list_reports"},
+    "images": {"chart_from_sql", "chart_image"},
+}
+INTENT_TOOLS = set().union(*TOOLS_OF.values())
+
+
+def intents(question: str) -> set[str]:
+    return {k for k, rx in INTENTS.items() if rx.search(question or "")}
 
 CHART_TOOLS = ("generate_chart", "update_chart", "update_chart_preview")
 REF_FIELDS = {"name", "column_name", "label", "dtype", "aggregate", "saved_metric"}
@@ -552,6 +578,12 @@ class Agent:
         disabled = set(settings.get("agent.disabled_tools") or [])
         if rich_results:
             disabled.add("show_chart")           # the page draws real charts
+        from supagent.tools import chromium_binary, screenshots_possible
+
+        if chromium_binary() is None:            # tools that cannot work on this host are not offered
+            disabled.add("chart_from_sql")
+        if not screenshots_possible():
+            disabled.add("chart_image")
         self.registry = tools.mcp
         self.local = {n: t for n, t in self.registry.tools.items() if n not in disabled}
         self.superset = SupersetMCP(username)
@@ -566,9 +598,26 @@ class Agent:
     def close(self) -> None:
         self.superset.close()
 
+    def _specs_for(self, question: str) -> list[dict]:
+        """The tools offered for this question. In the chat page, the tools that save charts, make
+        files, e-mails, reports or images are offered only when the question asks for them (every
+        query result is already shown as a table and a chart): fewer tools, fewer wrong calls."""
+        if not self.rich:
+            return self.specs
+        wanted = set().union(*(TOOLS_OF.get(k, set()) for k in intents(question))) if intents(question) else set()
+        if self.wants_saved_chart:
+            wanted |= TOOLS_OF["charts"]
+        return [s for s in self.specs if s["function"]["name"] not in INTENT_TOOLS or s["function"]["name"] in wanted]
+
     def _system(self, question: str) -> str:
-        text = SYSTEM + (RICH_RESULTS if self.rich else "")
-        text += "\n- Reminder: answer in the language of the question below."
+        text = CORE + (RICH if self.rich else PLAIN) + OSAGG_RULES + PROMAGG_RULES
+        found = intents(question) | ({"charts"} if self.wants_saved_chart else set())
+        if not self.rich:
+            found |= {"files", "images"}
+        for k in ("charts", "investigation", "files", "images"):
+            if k in found:
+                text += SECTIONS[k]
+        text += "\n\nReminder: answer in the language of the question below."
         if not self.superset.available:
             text += ("\n- Saving charts and dashboards is not available here (" + (self.superset.error or "") +
                      "): offer SQL results, show_chart, chart_from_sql or export_excel instead.")
@@ -593,6 +642,12 @@ class Agent:
             text += prompt_block(getattr(getattr(g, "user", None), "id", None))
         except Exception:  # pylint: disable=broad-except
             pass
+        try:
+            from supagent.knowledge.resolve import where_block
+
+            text += where_block(question)            # where the data is, found without the LLM
+        except Exception:  # pylint: disable=broad-except
+            log.warning("supagent: where the data is: not found", exc_info=True)
         if settings.get("search.enabled"):
             try:
                 from supagent.knowledge.search import knowledge_block
@@ -666,9 +721,10 @@ class Agent:
         messages.append({"role": "user", "content": f"(Now: {now():%A %Y-%m-%d %H:%M}.{hint})\n{question}"})
         trace: list[dict] = []
         nudged = False
+        specs = self._specs_for(question)
         for _ in range(self.max_steps):
             self._check_stop()
-            msg = self.llm.chat(messages, tools=self.specs)
+            msg = self.llm.chat(messages, tools=specs)
             messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
             calls = msg.get("tool_calls") or []
             if not calls:

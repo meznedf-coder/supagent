@@ -164,9 +164,10 @@ def _indices(src: Source, database: Any, ws: set[str], only: str | None,
                + (f"; Superset dataset id {ds.id} (charts: dataset_id={ds.id})" if ds else "")]
         if st.get("docs") is not None:
             rng = st.get("time_range") or [None, None]
-            out.append(f"  {_num(st['docs'])} documents" + (f"; time field {st.get('time_field')} from {rng[0]} to "
-                                                            f"{rng[1]}" if st.get("time_field") else "")
-                       + (f" ({st['timezone']} time, as SQL shows it)" if st.get("timezone") else ""))
+            span = f" from {rng[0]} to {rng[1]}" if rng[0] and rng[1] else ""
+            out.append(f"  {_num(st['docs'])} documents" + (f"; time field {st.get('time_field')}{span}"
+                                                            if st.get("time_field") else "")
+                       + (f" ({st['timezone']} time, as SQL shows it)" if st.get("timezone") and span else ""))
         fs = fields.get(ix.name, [])
         try:
             from supagent.knowledge.experience import timing_hints
@@ -487,6 +488,18 @@ def describe(topic: str | None = None, name: str | None = None) -> str | None:
             break
         out.append(text)
         budget -= len(text) + 1
+    if topic and not name:                     # metrics the dictionary does not have yet: the live list
+        try:
+            from supagent.knowledge.resolve import where_block
+
+            live = [ln for ln in where_block(topic).splitlines()[2:] if ln.startswith("- metric ")]
+            shown = "\n".join(x for x in out if x)
+            live = [ln for ln in live if ln.split('"')[1] not in shown]
+            if live:
+                out.append("\nMatching metrics by name (live list; the dictionary does not describe them yet):")
+                out += live[:4]
+        except Exception:  # pylint: disable=broad-except
+            db.session.rollback()
     learned = [s.last_learned_at for s, _d in sources if s.last_learned_at]
     if learned:
         out.append(f"\n(learned {max(learned):%Y-%m-%d %H:%M} UTC; describe_data(index=<name>) gives one index or "

@@ -123,6 +123,12 @@ def run_learning(reason: str = "manual", databases: list[str] | None = None, llm
                 stats["databases"][database.database_name] = res
                 if not res.get("complete", True) or res.get("error") or res.get("errors"):
                     status = "partial"
+                try:                                  # the search finds this database now, not at the end of the run
+                    from supagent.knowledge.index import sync
+
+                    sync(("object:",))
+                except Exception:  # pylint: disable=broad-except
+                    db.session.rollback()
             stats["relations"] = learn_relations()
             stats["catalog"] = apply_catalog()
             stats["categories"] = infer_categories()

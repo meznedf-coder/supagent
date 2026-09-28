@@ -79,9 +79,51 @@ BACKEND_NAMES = {"osagg": "osagg", "opensearch": "osagg", "promagg": "promagg", 
                  "mimir": "promagg", "metrics": "promagg"}
 
 
-def _sql_backend(sql: str | None) -> str | None:
-    """promagg when the SELECT reads a table that is a metric of the promagg database (or
-    promql()), else None (the default database)."""
+def agent_databases(rows: list[Any]) -> list[Any]:
+    """The databases the agent may use: setting agent.databases (names or ids), by default the
+    OpenSearch (osagg) and Prometheus / Mimir (promagg) ones. Superset's access rules still apply."""
+    from supagent import settings
+
+    try:
+        wanted = [str(x).strip() for x in settings.get("agent.databases") or [] if str(x).strip()]
+    except Exception:  # pylint: disable=broad-except
+        wanted = []
+    if not wanted:
+        return [d for d in rows if d.backend in ("osagg", "promagg")]
+    low = {w.lower() for w in wanted}
+    return [d for d in rows if str(d.id) in wanted or (d.database_name or "").lower() in low]
+
+
+def _match_databases(ref: str | int, rows: list[Any]) -> list[Any]:
+    """A database by id (int or digits), exact name, name in any case, the only name containing it,
+    or the only close name (a name the LLM got slightly wrong)."""
+    import difflib
+
+    s = str(ref).strip()
+    for test in (lambda d: str(d.id) == s, lambda d: d.database_name == s,
+                 lambda d: (d.database_name or "").lower() == s.lower()):
+        found = [d for d in rows if test(d)]
+        if found:
+            return found
+    low = s.lower()
+    inside = [d for d in rows if low and (low in (d.database_name or "").lower())]
+    if len(inside) == 1:
+        return inside
+    names = {(d.database_name or "").lower(): d for d in rows}
+    close = difflib.get_close_matches(low, list(names), n=2, cutoff=0.85)
+    if len(close) == 1 or (len(close) == 2 and difflib.SequenceMatcher(None, low, close[0]).ratio() -
+                           difflib.SequenceMatcher(None, low, close[1]).ratio() > 0.05):
+        return [names[close[0]]]
+    return []
+
+
+def _all_metrics_name(conn: Any) -> str:
+    return getattr(conn, "all_metrics", None) or ""
+
+
+def _sql_database(sql: str | None, rows: list[Any]) -> Any | None:
+    """The metrics database whose tables the SELECT reads (a metric, the all_metrics table or
+    promql()), among the given ones; None when it reads no metric (the default database)."""
     if not sql:
         return None
     try:
@@ -91,39 +133,53 @@ def _sql_backend(sql: str | None) -> str | None:
         tree = sqlglot.parse_one(sql.replace("\\n", "\n").replace('\\"', '"'), read="duckdb")
     except Exception:  # pylint: disable=broad-except
         return None
-    names = set()
+    names, promql = set(), False
     for t in tree.find_all(exp.Table):
         if isinstance(t.this, exp.Anonymous) and t.this.name.lower() == "promql":
-            return "promagg"
-        names.add(t.name)
+            promql = True
+        elif t.name:
+            names.add(t.name)
+    promaggs = [d for d in rows if d.backend == "promagg"]
     try:
-        spec = (_catalog().get("metrics") or {})
-        database = _database(spec.get("database"), backend="promagg")
-        conn = _promagg_connection(database)
-        try:
-            metrics = set(conn.list_tables())
-        finally:
-            conn.close()
+        preferred = (_catalog().get("metrics") or {}).get("database")
     except Exception:  # pylint: disable=broad-except
-        return None
-    return "promagg" if names & metrics else None
+        preferred = None
+    promaggs.sort(key=lambda d: (d.database_name != preferred, d.id))
+    if promql and promaggs:
+        return promaggs[0]
+    for d in promaggs:
+        try:
+            conn = _promagg_connection(d)
+            try:
+                if names & (set(conn.list_tables()) | {_all_metrics_name(conn)}):
+                    return d
+            finally:
+                conn.close()
+        except Exception:  # pylint: disable=broad-except
+            continue
+    return None
 
 
 def _database(ref: str | int | None, backend: str | None = None, sql: str | None = None) -> Any:
-    """The database a tool reads, among those the user may query (Superset's database access)."""
+    """The database a tool reads, among those the agent may use (agent.databases) and the user
+    may query (Superset's database access): by id or name (see _match_databases), else the one
+    whose tables the SQL reads, else the first of the backend (osagg by default)."""
     from superset.extensions import db
     from superset.models.core import Database
 
     from supagent.security import can_use_database
 
     allowed = {x.strip() for x in os.environ.get("EXPORT_DATABASES", "").split(",") if x.strip()}
-    rows = [d for d in db.session.query(Database).all() if can_use_database(d)]
+    rows = agent_databases([d for d in db.session.query(Database).all() if can_use_database(d)])
+    if allowed:
+        rows = [d for d in rows if d.database_name in allowed or str(d.id) in allowed]
     if ref is not None and str(ref).strip().lower() in BACKEND_NAMES and \
             not any(d.database_name == str(ref) for d in rows):
         backend, ref = BACKEND_NAMES[str(ref).strip().lower()], None
-    if (ref is None or str(ref).strip() == "") and backend is None and sql:
-        backend = _sql_backend(sql)
     if ref is None or str(ref).strip() == "":
+        by_sql = _sql_database(sql, rows) if backend in (None, "promagg") else None
+        if by_sql is not None:
+            return by_sql
         found = [d for d in rows if d.backend == backend] if backend else \
             ([d for d in rows if d.backend == "osagg"] or rows)
         if backend == "promagg" and len(found) > 1:     # several metrics databases: the catalog's first
@@ -133,13 +189,11 @@ def _database(ref: str | int | None, backend: str | None = None, sql: str | None
                 preferred = None
             found.sort(key=lambda d: (d.database_name != preferred, d.id))
     else:
-        found = [d for d in rows if str(d.id) == str(ref) or d.database_name == str(ref)]
-    if allowed:
-        found = [d for d in found if d.database_name in allowed or str(d.id) in allowed]
+        found = _match_databases(ref, rows)
     if not found:
-        names = ", ".join(f"{d.id}: {d.database_name}" for d in rows
-                          if not allowed or d.database_name in allowed or str(d.id) in allowed)
-        raise ToolError(f"database {ref!r} not found or not allowed (databases: {names})")
+        names = ", ".join(f"{d.id}: {d.database_name} ({d.backend})" for d in rows)
+        raise ToolError(f"database {ref!r} not found or not allowed; give its id or its exact name "
+                        f"(databases: {names})")
     return found[0]
 
 
@@ -316,7 +370,7 @@ def _export(sql: str, database: str | int | None, file_name: str | None, title: 
 
 
 @mcp.tool
-def export_excel(sql: str, database: str | None = None, file_name: str | None = None,
+def export_excel(sql: str, database: str | int | None = None, file_name: str | None = None,
                  title: str | None = None, max_rows: int | None = None,
                  email_to: list[str] | None = None) -> dict:
     """Extract the rows of a SELECT to an Excel file (.xlsx) on the server; optionally e-mail it.
@@ -542,13 +596,26 @@ def _svg(kind: str, title: str, columns: list[str], rows: list[tuple], unit: str
     return "".join(out)
 
 
-def _png(svg: str, width: int, height: int) -> bytes:
+def chromium_binary() -> str | None:
+    """The headless Chromium chart images are drawn with (CHROMIUM_BIN, else the PATH)."""
     import shutil
+
+    return os.environ.get("CHROMIUM_BIN") or next(
+        (b for b in (shutil.which(n) for n in ("chromium", "chromium-browser", "google-chrome")) if b), None)
+
+
+def screenshots_possible() -> bool:
+    """Superset's webdriver for screenshots of saved charts and dashboards: a driver on the PATH."""
+    import shutil
+
+    return bool(shutil.which("chromedriver") or shutil.which("geckodriver"))
+
+
+def _png(svg: str, width: int, height: int) -> bytes:
     import subprocess
     import tempfile
 
-    binary = os.environ.get("CHROMIUM_BIN") or next(
-        (b for b in (shutil.which(n) for n in ("chromium", "chromium-browser", "google-chrome")) if b), None)
+    binary = chromium_binary()
     if binary is None:
         raise ToolError("no Chromium on this host (CHROMIUM_BIN or PATH): needed for chart images")
     with tempfile.TemporaryDirectory() as tmp:
@@ -577,7 +644,7 @@ def _chart_png(spec: dict[str, Any], database: str | int | None) -> tuple[bytes,
 
 @mcp.tool
 def chart_from_sql(sql: str, kind: Literal["bar", "line"] = "bar", title: str = "", unit: str = "",
-                   database: str | None = None) -> dict:
+                   database: str | int | None = None) -> dict:
     """An IMAGE (PNG) drawn from the result of a SELECT: it does NOT create a chart in Superset (for
     a saved Superset chart use generate_chart). First column: the
     labels (categories, or times for a line); each next column: one series of numbers; a
@@ -716,7 +783,7 @@ def _send(app: Any, to: list[str], subject: str, body_html: str, images: dict[st
 
 @mcp.tool
 def send_email(to: list[str], subject: str, body_markdown: str = "", sql: str | None = None,
-               database: str | None = None, max_table_rows: int = 100,
+               database: str | int | None = None, max_table_rows: int = 100,
                chart_sqls: list[dict] | None = None, image_paths: list[str] | None = None,
                chart_ids: list[int] | None = None, explore_urls: list[str] | None = None,
                excel_sql: str | None = None, excel_name: str | None = None,
@@ -1053,7 +1120,7 @@ def _series_summary(conn: Any, series: list, max_points: int) -> list[dict]:
 
 @mcp.tool
 def promql_query(expr: str, start: str | None = None, end: str | None = None, step: str | None = None,
-                 database: str | None = None, max_series: int = 50) -> dict:
+                 database: str | int | None = None, max_series: int = 50) -> dict:
     """Run a PromQL expression on the metrics database and return each series (labels,
     min / max / avg / last and up to 60 points). `start` / `end`: local times like
     "2026-09-24 02:00" or "now-6h" (end alone or start == end: one instant). `step` like "5m"
@@ -1156,7 +1223,7 @@ def _per_tenant(expr: str) -> str:
 
 @mcp.tool
 def check_health(start: str, end: str, entities: list[str] | None = None, checks: list[str] | None = None,
-                 database: str | None = None) -> dict:
+                 database: str | int | None = None) -> dict:
     """Evaluate the health checks of the data dictionary (CPU saturation, memory pressure, disk
     full, OOM kills, servers down, queue backlog, HTTP errors, latency, licences...) over a time
     window and list every breach: check, server / application, from, to, minutes, worst value.
@@ -1237,7 +1304,7 @@ def check_health(start: str, end: str, entities: list[str] | None = None, checks
 
 
 @mcp.tool
-def list_alerts(database: str | None = None) -> dict:
+def list_alerts(database: str | int | None = None) -> dict:
     """Alerts firing or pending now in the metrics backend (Mimir ruler / Prometheus) and the
     alerting rules defined there."""
     try:

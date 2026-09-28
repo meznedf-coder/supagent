@@ -73,7 +73,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.2.5-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.3.0-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -252,6 +252,23 @@ helpful*, another expression, the document removed), the agent takes its entry b
 person edits an agent entry it is theirs**: the agent never changes it again; delete it and the
 agent never writes it again. `superset supagent agent-catalog` runs this pass at once.
 
+## How the agent finds the data (0.3)
+
+Before the LLM starts, supagent looks for **where the data of the question is**: the metrics,
+indices and fields whose names (split on `_ : . -`), HELP texts, descriptions and synonyms share
+words with the question (built-in synonyms such as cpu / processor, mem / memory,
+es / elasticsearch, and French words), and the ones earlier answers read for the same words. The
+best ones are given to the agent with their database id, type, unit, labels and a SQL to adapt,
+so that a question like "the CPU of the Elasticsearch cluster over the last 12 hours" goes
+straight to the right metric. The live list of metric names is used (cached five minutes): it
+works while the dictionary is empty or still learning. Only the databases the agent may use
+(`agent.databases`, by default the osagg and promagg ones) and the user may query are searched.
+
+The instructions are short and strict (the rules every answer needs; the sections on saving
+charts, investigations, files / e-mails / reports and images only when the question asks for
+them), and in the chat only the tools the question needs are offered. In the chat the page draws
+every query result as a table and a chart: the agent runs the query, it does not make images.
+
 ## Learning from the chats
 
 * **Learned answers** (0.2.2): only an answer marked *Helpful* is learned: its final successful
@@ -263,6 +280,12 @@ agent never writes it again. `superset supagent agent-catalog` runs this pass at
   withdraws it, unless an admin confirmed it. A similar question of anyone in the team starts
   from the confirmed ones first, then the helpful ones, on the databases the user may query.
   The first answer of a chat names it the same way (a 2-6 word generic title).
+* **Where the data was** (0.3, `learn.associations`): after each answer, the words of the
+  question and the metrics or indices its successful queries read; the next questions with those
+  words find them first. *Not helpful* takes them back. They are not listed with the learned
+  answers; `learn.associations = false` switches this off.
+* **What users state**: a message that tells something about the data ("KO means failed") is read
+  for durable facts and rules like the explicit ones below (team ones wait for an admin).
 * **Query timings** per kind of query (values replaced by `?`) and table or metric: the agent is
   told which way is fast. The page shows each query whole, with its last error; admins also
   see the last one as it ran.

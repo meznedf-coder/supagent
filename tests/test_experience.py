@@ -30,7 +30,7 @@ def test_learned_answers_come_from_helpful_and_are_shared_by_access(world):
     q = "How many jobs failed per application yesterday?"
     first = _trace("SELECT APPLICATION, COUNT(*) FROM jobs WHERE STATUS = 'FAILED' AND day = '2026-09-23' GROUP BY 1",
                    jobs)
-    assert learn_from_answer(101, admin, q, first) == {"timings": 1}
+    assert learn_from_answer(101, admin, q, first)["timings"] == 1
     assert db.session.query(Recipe).count() == 0             # an answer alone teaches nothing: Helpful does
     rec = record_recipe(101, admin, q, first)                # marked Helpful
     assert (rec.status, rec.confirmations) == ("helpful", [101])

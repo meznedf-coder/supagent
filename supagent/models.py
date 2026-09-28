@@ -249,6 +249,23 @@ class Recipe(db.Model):  # type: ignore[name-defined]
     last_used_at = sa.Column(sa.DateTime, default=_now)
 
 
+class Association(db.Model):  # type: ignore[name-defined]
+    """A word of the questions and the table (metric or index) that successful answers to them
+    read: how the agent learns where the data is from its own answers (learn.associations)."""
+
+    __tablename__ = "supagent_association"
+    __table_args__ = (sa.UniqueConstraint("word", "database_id", "kind", "parent", "name", name="uq_supagent_association"),)
+    id = sa.Column(sa.Integer, primary_key=True)
+    word = sa.Column(SafeString(64), nullable=False, index=True)
+    database_id = sa.Column(sa.Integer, nullable=False)
+    kind = sa.Column(SafeString(16), nullable=False)       # metric | index
+    parent = sa.Column(SafeString(512), nullable=False, default="")
+    name = sa.Column(SafeString(512), nullable=False)
+    uses = sa.Column(sa.Integer, default=1)
+    messages = sa.Column(sa.JSON)                          # the answers it comes from (the last 50)
+    updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
+
+
 class QueryStat(db.Model):  # type: ignore[name-defined]
     """How long each kind of query takes (literals removed), per database and table / metric."""
 
@@ -346,7 +363,7 @@ class Document(db.Model):  # type: ignore[name-defined]
 
 
 TABLES = [Meta, Setting, Source, KObject, Relation, Run, Change, Conversation, Message, File, Example, Document,
-          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk]
+          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association]
 
 
 def _add_missing_columns(engine: sa.engine.Engine) -> list[str]:

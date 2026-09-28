@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from supagent.tools import _as_user, _run, mcp
+from supagent.tools import _as_user, _run, agent_databases, mcp
 
 
 def _plain(v: Any) -> Any:
@@ -68,8 +68,9 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
             from superset.models.core import Database
 
             database = db.session.get(Database, int(request.database_id))
-            if database is None:
-                return {"success": False, "error": f"database {request.database_id} not found (list_databases)"}
+            if database is None or not agent_databases([database]):
+                return {"success": False, "error": f"database {request.database_id} not found or not one the agent "
+                                                   "may use (list_databases)"}
             limit = max(1, min(int(request.limit or 1000), 10000))
             from supagent.knowledge.experience import guard_sql
 
@@ -108,7 +109,7 @@ def list_databases() -> dict:
         from superset.models.core import Database
 
         out = []
-        for d in db.session.query(Database).order_by(Database.id):
+        for d in agent_databases(list(db.session.query(Database).order_by(Database.id))):
             if security_manager.can_access_database(d):
                 item = {"id": d.id, "name": d.database_name, "backend": d.backend,
                         "kind": {"osagg": "OpenSearch indices", "promagg": "Prometheus / Mimir metrics"}.get(
@@ -133,7 +134,10 @@ def list_datasets(request: ListDatasetsRequest | None = None) -> dict:
         from superset.connectors.sqla.models import SqlaTable
         from superset.extensions import db, security_manager
 
-        q = db.session.query(SqlaTable).order_by(SqlaTable.id)
+        from superset.models.core import Database
+
+        usable = [d.id for d in agent_databases(db.session.query(Database).all())] or [-1]
+        q = db.session.query(SqlaTable).filter(SqlaTable.database_id.in_(usable)).order_by(SqlaTable.id)
         if request.database_id is not None:
             q = q.filter(SqlaTable.database_id == int(request.database_id))
         if request.search:
@@ -161,7 +165,7 @@ def get_dataset_info(request: DatasetInfoRequest) -> dict:
         from superset.extensions import db, security_manager
 
         ds = db.session.get(SqlaTable, int(request.identifier))
-        if ds is None or not security_manager.can_access_datasource(ds):
+        if ds is None or not security_manager.can_access_datasource(ds) or not agent_databases([ds.database]):
             return {"error": f"dataset {request.identifier} not found or not allowed"}
         return {"id": ds.id, "table_name": ds.table_name, "database_id": ds.database_id,
                 "database": ds.database.database_name, "main_dttm_col": ds.main_dttm_col,

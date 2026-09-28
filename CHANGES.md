@@ -1,5 +1,41 @@
 # Changes
 
+## 0.3.0 (2026-09-28)
+
+Faster, surer answers: the agent is told where the data is, gets short strict instructions and
+only the tools the question needs, and learns where the data was from its own answers.
+
+* **Where the data is, before the LLM starts**: the metrics, indices and fields whose names
+  (split on `_ : . -`), HELP texts, descriptions and synonyms match the words of the question,
+  with built-in synonyms (cpu / processor, mem / memory, es / elasticsearch, disk / fs, French
+  words...), are given to the agent with their database id, type, unit, labels and a SQL to
+  adapt. It uses the live list of metric names, so it works while the dictionary is empty or
+  still learning (10,000 names: well under a second), and only the databases the agent may use
+  and the user may query.
+* **Learning where the data is from the answers** (`learn.associations`, on by default): the
+  words of a question and the metrics or indices its successful queries read; the next
+  questions with those words find them first. *Not helpful* takes them back. These are not
+  learned answers (that list still only holds what users marked *Helpful*); switch it off with
+  `learn.associations = false`.
+* **Short, strict instructions**: the rules every answer needs (about 40% shorter), then only
+  the sections the question asks for (saving charts, investigations, files / e-mails / reports,
+  images); in the chat, the tools that save charts, make files, e-mails, reports or images are
+  offered only when the question asks for them. One query when possible; a failing call is
+  fixed once, never repeated, and after two failures the agent answers with what it has.
+* **The chat draws the charts**: to "see a chart", the agent runs the query (the page shows it
+  as a table and a chart); `chart_from_sql` (images) is not offered without Chromium on the
+  host, nor `chart_image` without a webdriver.
+* **Databases**: every tool takes a database id or name (in any case, or with a letter wrong);
+  a SQL on a metric or on `all_metrics` goes to the metrics database; the agent uses only the
+  OpenSearch (osagg) and Prometheus / Mimir (promagg) databases unless `agent.databases`
+  lists others.
+* **Statements are knowledge**: a message that tells something ("STATUS_INFO = KO means the job
+  failed", "this metric is the CPU of the cluster nodes") is read for durable facts and rules
+  (team ones wait for an admin's approval, `memory.team_approval`).
+* The knowledge search is updated during a learning run (every 500 metrics, and after each
+  database), not only at its end. `describe_data` no longer shows unknown time ranges.
+* Run `superset supagent init` (one new table).
+
 ## 0.2.5 (2026-09-28)
 
 * **Learning again from scratch**: `superset supagent forget-learned` shows, per database, what

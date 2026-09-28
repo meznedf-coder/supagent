@@ -402,6 +402,10 @@ class ChatView(BaseView):
             if recipes:
                 _sync_chunks("recipe:")
                 dispatch_catalog()                   # a formula no longer certain
+            if value == -1:
+                from supagent.knowledge.experience import forget_associations
+
+                forget_associations(m.id)            # nor where its data was
         return _json({"feedback": m.feedback, "example_kept": kept, "recipes": recipes})
 
     @expose("/api/files/<int:fid>", methods=("GET",))

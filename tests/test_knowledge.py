@@ -384,3 +384,40 @@ def test_what_the_catalog_gives_is_not_peoples_work(world, monkeypatch):
     assert not _people(status, catalog)                        # from the catalog: applied again
     status.description = "The status of the run, as an admin explained it"
     assert _people(status, catalog)                            # written in the dictionary page
+
+
+def test_a_database_is_found_by_id_name_or_a_close_name(world):
+    """The LLM passes ids, names in another case, or a name with a letter missing: the tools find
+    the database, and a SQL on a metric (or the all_metrics table) goes to the metrics database."""
+    from supagent.security import acting_as
+    from supagent.tools import _database, _match_databases
+
+    with acting_as("admin"):
+        metrics = world["metrics"]
+        assert _database(metrics.id).id == metrics.id and _database(str(metrics.id)).id == metrics.id
+        assert _database("METRICS").id == metrics.id
+        rows = [world["jobs"], metrics]
+        assert _match_databases("metric", rows) == [metrics]                 # the only name containing it
+        assert _match_databases("metrcs", rows) == [metrics]                 # a letter missing
+        assert _match_databases("sales", rows) == []
+
+
+def test_sql_on_metrics_goes_to_the_metrics_database(world, monkeypatch):
+    from supagent import tools
+    from supagent.security import acting_as
+
+    class Conn:
+        all_metrics = "all_metrics"
+
+        def list_tables(self):
+            return ["node_cpu_seconds_total", "node_load1"]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tools, "_promagg_connection", lambda database: Conn())
+    with acting_as("admin"):
+        for sql in ("SELECT AVG(value) FROM node_load1", "SELECT AVG(value) FROM all_metrics WHERE metric_name = 'x'",
+                    "SELECT * FROM promql('up')"):
+            assert tools._database(None, sql=sql).id == world["metrics"].id, sql
+        assert tools._database(None, sql="SELECT COUNT(*) FROM jobs").id == world["jobs"].id

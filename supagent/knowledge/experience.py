@@ -346,10 +346,87 @@ def learn_from_helpful(message_id: int, llm: Any = None) -> int | None:
         return r.id if r is not None else None
 
 
+METRIC_FILTER = re.compile(r"metric_name\s*(?:=\s*'([^']+)'|IN\s*\(([^)]*)\))", re.I)
+
+
+def _tables_read(trace: list[dict]) -> set[tuple[int, str, str]]:
+    """(database id, metric | index, name) of what the successful queries of an answer read."""
+    from superset.models.core import Database
+
+    out: set[tuple[int, str, str]] = set()
+    backends: dict[int, str] = {}
+    for t in trace:
+        tool = t.get("called") or t["tool"]
+        if tool not in ("execute_sql", "export_excel", "promql_query") or t.get("status") != "done":
+            continue
+        query, database_id = _query_of(tool, t.get("args") or {})
+        if not query or not database_id:
+            continue
+        if database_id not in backends:
+            d = db.session.get(Database, database_id)
+            backends[database_id] = d.backend if d is not None else ""
+        kind = "metric" if backends[database_id] == "promagg" else "index"
+        _p, names = promql_pattern(query) if tool == "promql_query" else sql_pattern(query)
+        for name in names:
+            if name == "all_metrics":                    # the metrics it filtered
+                for m in METRIC_FILTER.finditer(query):
+                    for n in re.findall(r"'([^']+)'", m.group(0)):
+                        out.add((database_id, "metric", n))
+                continue
+            out.add((database_id, kind, name))
+    return out
+
+
+def record_associations(message_id: int, question: str, trace: list[dict]) -> int:
+    """The words of the question and the metrics or indices its successful queries read: where the
+    data of such words is, for the next questions (learn.associations; knowledge/resolve.py)."""
+    from supagent import settings
+    from supagent.knowledge.resolve import terms
+    from supagent.models import Association
+
+    if not settings.get("learn.associations"):
+        return 0
+    words = terms(question)[:12]
+    last = final_step(trace)                       # the query that answered, not the tries before it
+    tables = _tables_read([last]) if last is not None else set()
+    n = 0
+    for database_id, kind, name in tables:
+        for w in words:
+            a = (db.session.query(Association).filter_by(word=w[:64], database_id=database_id, kind=kind, parent="",
+                                                         name=name[:512]).one_or_none())
+            if a is None:
+                a = Association(word=w[:64], database_id=database_id, kind=kind, parent="", name=name[:512], uses=0,
+                                messages=[])
+                db.session.add(a)
+            a.uses = (a.uses or 0) + 1
+            a.messages = (list(a.messages or []) + [message_id])[-50:]
+            n += 1
+    db.session.commit()
+    return n
+
+
+def forget_associations(message_id: int) -> int:
+    """Not helpful: what this answer taught about where the data is goes."""
+    from supagent.models import Association
+
+    n = 0
+    for a in db.session.query(Association).all():
+        if message_id not in (a.messages or []):
+            continue
+        a.messages = [i for i in a.messages if i != message_id]
+        a.uses = (a.uses or 1) - 1
+        if a.uses <= 0:
+            db.session.delete(a)
+        n += 1
+    db.session.commit()
+    return n
+
+
 def learn_from_answer(message_id: int, user_id: int, question: str, trace: list[dict]) -> dict[str, Any]:
-    """After every answer: the timings of its queries (a learned answer needs Helpful)."""
+    """After every answer: the timings of its queries, where its data was (associations); a
+    learned answer needs Helpful."""
     try:
-        return {"timings": record_timings(trace)}
+        return {"timings": record_timings(trace), "associations": record_associations(message_id, question, trace)}
     except Exception as ex:  # pylint: disable=broad-except   (learning never breaks an answer)
         db.session.rollback()
         return {"error": str(ex)[:300]}

@@ -51,6 +51,8 @@ SPECS: list[Spec] = [
     Spec("llm.extra_headers", {}, "json", "More HTTP headers for the LLM calls (JSON object)"),
     # ---- the agent
     Spec("agent.max_steps", 16, "int", "Tool calls per question at most"),
+    Spec("agent.databases", [], "list", "Databases the agent may use (names or ids); empty: the OpenSearch "
+         "(osagg) and Prometheus / Mimir (promagg) ones. Superset's database access still applies"),
     Spec("agent.osagg_max_scan_rows", 20000, "int", "OpenSearch (osagg): raw documents one query of the agent may "
          "read when it cannot be pushed down (the connection's own cap applies if lower); above, the query is "
          "refused at once with the reason instead of running for minutes. 0: the connection's cap"),
@@ -87,6 +89,9 @@ SPECS: list[Spec] = [
          "requests)"),
     Spec("learn.group_rollover", True, "bool", "Learn dated or rolled-over indices (logs-2026.09.27, "
          "...-000123) as one family, through its latest member"),
+    Spec("learn.associations", True, "bool", "Learn where the data is from the answers: the words of a question and "
+         "the metrics or indices its successful queries read (used to find them for the next questions; Not helpful "
+         "takes them back). Not listed with the learned answers"),
     Spec("learn.llm_descriptions", True, "bool", "Ask the LLM to describe what has no description (marked unverified)"),
     Spec("learn.llm_per_run", 60, "int", "LLM descriptions written per run at most"),
     Spec("learn.agent_catalog", True, "bool", "The agent adds catalog entries when the evidence is certain: "

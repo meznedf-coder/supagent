@@ -72,8 +72,27 @@ def add(user_id: int, text: str, scope: str = "user", kind: str = "preference", 
     return m
 
 
+QUESTION_START = re.compile(
+    r"^\s*(what|which|who|whom|whose|when|where|why|how|is|are|do|does|did|can|could|would|will|should|show|give|"
+    r"list|find|get|tell|display|draw|plot|compare|count|calculate|compute|explain|send|export|create|make|save|"
+    r"need|i need|i want|i would|please|quel|quelle|quels|quelles|qui|quand|o[uù]|pourquoi|comment|combien|"
+    r"est-ce|peux|pouvez|peut|donne|montre|affiche|liste|trouve|calcule|compare|envoie|exporte|cr[ée]e|fais|"
+    r"j'ai besoin|je veux|je voudrais)\b", re.I)
+DECLARATIVE = re.compile(r"\b(is|are|means|mean|equals|stands for|refers to|corresponds to|contains|holds|represents|"
+                         r"est|sont|signifie|veut dire|correspond|contient|d[ée]signe|repr[ée]sente)\b|=", re.I)
+
+
+def is_statement(text: str) -> bool:
+    """A message that tells something (the field X means Y, KO = failed), not a question: what it
+    says about the data is worth keeping (the LLM extracts it; team facts wait for an admin)."""
+    t = (text or "").strip()
+    if not t or "?" in t or len(t) > 1500 or QUESTION_START.search(t):
+        return False
+    return bool(DECLARATIVE.search(t))
+
+
 def worth_learning(question: str) -> bool:
-    return bool(SIGNALS.search(question or ""))
+    return bool(SIGNALS.search(question or "")) or is_statement(question)
 
 
 def learn_from_message(message_id: int, llm: Any = None) -> list[int]:

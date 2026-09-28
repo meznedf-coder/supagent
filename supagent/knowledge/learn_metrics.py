@@ -48,6 +48,16 @@ HISTORY_REFRESH_DAYS = 30
 BATCH = 50                        # metrics per request: live series counts, label samples of small metrics
 SMALL_SERIES = 200                # a metric with at most this many series shares a series request
 DAY_MS = 86_400_000
+SYNC_EVERY = 500                  # profiled metrics between two updates of the knowledge search
+
+
+def _sync_search() -> None:
+    try:
+        from supagent.knowledge.index import sync
+
+        sync(("object:",))
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
 
 
 def _iso(ms: int | None, conn: Any = None) -> str | None:
@@ -470,6 +480,9 @@ def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> d
                 stats["labels"] = sorted(k for k in labels if not k.startswith("__error"))
                 obj = upsert(run, source, "metric", "", name, {**facts, "stats": stats})
                 out["profiled"] += 1
+                if out["profiled"] % SYNC_EVERY == 0:      # a long first pass: searchable as it goes
+                    db.session.commit()
+                    _sync_search()
                 for label, lstats in labels.items():
                     if label.startswith("__error"):
                         continue
