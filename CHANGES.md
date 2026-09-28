@@ -1,5 +1,16 @@
 # Changes
 
+## 0.2.1 (2026-09-28)
+
+* Metadata databases that are not UTF-8 (PostgreSQL created with LATIN1, MySQL without
+  `?charset=utf8mb4`): answers and learning runs failed with "'latin-1' codec can't encode
+  character '\u2013'" as soon as a text held a character the database cannot store (LLMs
+  write – — ‑ ’ “ ” … all the time). supagent now finds the encoding of the connection once
+  and folds what it writes: – → -, ’ → ', … → ..., blocks → #, letters outside the encoding
+  lose their accent, the rest becomes ?; accents the encoding has (é, à, ç) are kept. Nothing
+  changes on a UTF-8 database. Names the agent saves in Superset (charts, dashboards, reports)
+  are folded the same way, and downloads keep any file name.
+
 ## 0.2.0 (2026-09-28)
 
 Built for millions of index rows and billions of metric samples, and for learning from the team.

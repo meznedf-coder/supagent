@@ -73,7 +73,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.2.0-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.2.1-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -340,3 +340,7 @@ behind your gateway.
 * **Uninstall**: remove the config line and restart. The tables stay until you drop them
   (`supagent_*`).
 * **Logs**: logger `supagent` (answers, learning runs); the runs are also on the settings page.
+* **Metadata database not UTF-8** (PostgreSQL created with LATIN1, MySQL without
+  `?charset=utf8mb4`): supagent stores what the database can hold (– becomes -, ’ becomes ',
+  accents of the encoding are kept) and logs it once at start. For full Unicode, the metadata
+  database has to be UTF-8.

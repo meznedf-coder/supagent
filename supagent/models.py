@@ -14,6 +14,8 @@ import sqlalchemy as sa
 from superset import db
 from superset.extensions import encrypted_field_factory
 
+from supagent.textsafe import SafeString, SafeText
+
 SCHEMA_VERSION = 2
 
 
@@ -23,8 +25,8 @@ def _now() -> dt.datetime:
 
 class Meta(db.Model):  # type: ignore[name-defined]
     __tablename__ = "supagent_meta"
-    key = sa.Column(sa.String(64), primary_key=True)
-    value = sa.Column(sa.Text)
+    key = sa.Column(SafeString(64), primary_key=True)
+    value = sa.Column(SafeText)
 
 
 class Setting(db.Model):  # type: ignore[name-defined]
@@ -32,11 +34,11 @@ class Setting(db.Model):  # type: ignore[name-defined]
     consumer secrets) are encrypted with Superset's key (SECRET_KEY)."""
 
     __tablename__ = "supagent_setting"
-    key = sa.Column(sa.String(128), primary_key=True)
+    key = sa.Column(SafeString(128), primary_key=True)
     value = sa.Column(sa.JSON)
     secret = sa.Column(encrypted_field_factory.create(sa.Text))   # encrypted with Superset's SECRET_KEY
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
-    updated_by = sa.Column(sa.String(255))
+    updated_by = sa.Column(SafeString(255))
 
 
 class Source(db.Model):  # type: ignore[name-defined]
@@ -45,8 +47,8 @@ class Source(db.Model):  # type: ignore[name-defined]
     __tablename__ = "supagent_source"
     id = sa.Column(sa.Integer, primary_key=True)
     database_id = sa.Column(sa.Integer, nullable=False, unique=True)
-    database_name = sa.Column(sa.String(255))
-    backend = sa.Column(sa.String(32))        # promagg | osagg
+    database_name = sa.Column(SafeString(255))
+    backend = sa.Column(SafeString(32))        # promagg | osagg
     last_learned_at = sa.Column(sa.DateTime)
     stats = sa.Column(sa.JSON)
 
@@ -58,24 +60,24 @@ class KObject(db.Model):  # type: ignore[name-defined]
     __table_args__ = (sa.UniqueConstraint("source_id", "kind", "parent", "name", name="uq_supagent_object"),)
     id = sa.Column(sa.Integer, primary_key=True)
     source_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_source.id", ondelete="CASCADE"), index=True)
-    kind = sa.Column(sa.String(16), nullable=False)          # index | field | metric | label | family
-    parent = sa.Column(sa.String(512), nullable=False, default="")   # index of a field, metric of a label
-    name = sa.Column(sa.String(512), nullable=False)
-    data_type = sa.Column(sa.String(64))       # field: keyword, long, date...; label: string
-    metric_type = sa.Column(sa.String(32))     # counter, gauge, histogram, summary, info, unknown
-    unit = sa.Column(sa.String(64))
-    backend_help = sa.Column(sa.Text)          # HELP text of the exporter, mapping meta
-    description = sa.Column(sa.Text)
-    description_source = sa.Column(sa.String(16))   # curated | backend | llm | inferred
+    kind = sa.Column(SafeString(16), nullable=False)          # index | field | metric | label | family
+    parent = sa.Column(SafeString(512), nullable=False, default="")   # index of a field, metric of a label
+    name = sa.Column(SafeString(512), nullable=False)
+    data_type = sa.Column(SafeString(64))       # field: keyword, long, date...; label: string
+    metric_type = sa.Column(SafeString(32))     # counter, gauge, histogram, summary, info, unknown
+    unit = sa.Column(SafeString(64))
+    backend_help = sa.Column(SafeText)          # HELP text of the exporter, mapping meta
+    description = sa.Column(SafeText)
+    description_source = sa.Column(SafeString(16))   # curated | backend | llm | inferred
     verified = sa.Column(sa.Boolean, default=False)  # a person wrote or approved the description
-    category = sa.Column(sa.String(64))
+    category = sa.Column(SafeString(64))
     synonyms = sa.Column(sa.JSON)
     stats = sa.Column(sa.JSON)                 # cardinality, top values, value range, series, time range...
     first_seen = sa.Column(sa.DateTime, default=_now)
     last_seen = sa.Column(sa.DateTime, default=_now)
     gone_at = sa.Column(sa.DateTime)           # not seen by the last run
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
-    fingerprint = sa.Column(sa.String(64))     # of the learned facts: unchanged objects are skipped
+    fingerprint = sa.Column(SafeString(64))     # of the learned facts: unchanged objects are skipped
 
 
 class Relation(db.Model):  # type: ignore[name-defined]
@@ -87,23 +89,23 @@ class Relation(db.Model):  # type: ignore[name-defined]
     id = sa.Column(sa.Integer, primary_key=True)
     a_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_object.id", ondelete="CASCADE"), index=True)
     b_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_object.id", ondelete="CASCADE"), index=True)
-    relation = sa.Column(sa.String(32))        # same_values | shares_label | histogram_parts | curated
+    relation = sa.Column(SafeString(32))        # same_values | shares_label | histogram_parts | curated
     evidence = sa.Column(sa.JSON)              # {"a_values": n, "b_values": m, "common": k, "coverage": ...}
     confidence = sa.Column(sa.Float)
-    origin = sa.Column(sa.String(16))          # learned | curated
+    origin = sa.Column(SafeString(16))          # learned | curated
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
 
 
 class Run(db.Model):  # type: ignore[name-defined]
     __tablename__ = "supagent_run"
     id = sa.Column(sa.Integer, primary_key=True)
-    kind = sa.Column(sa.String(16), default="learn")
-    reason = sa.Column(sa.String(64))          # schedule | manual | cli
+    kind = sa.Column(SafeString(16), default="learn")
+    reason = sa.Column(SafeString(64))          # schedule | manual | cli
     started_at = sa.Column(sa.DateTime, default=_now)
     finished_at = sa.Column(sa.DateTime)
-    status = sa.Column(sa.String(16), default="running")     # running | done | partial | error
+    status = sa.Column(SafeString(16), default="running")     # running | done | partial | error
     stats = sa.Column(sa.JSON)
-    error = sa.Column(sa.Text)
+    error = sa.Column(SafeText)
 
 
 class Change(db.Model):  # type: ignore[name-defined]
@@ -113,7 +115,7 @@ class Change(db.Model):  # type: ignore[name-defined]
     id = sa.Column(sa.Integer, primary_key=True)
     run_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_run.id", ondelete="CASCADE"), index=True)
     object_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_object.id", ondelete="CASCADE"), index=True)
-    change = sa.Column(sa.String(32))          # new | gone | back | type | unit | cardinality | range
+    change = sa.Column(SafeString(32))          # new | gone | back | type | unit | cardinality | range
     detail = sa.Column(sa.JSON)
     at = sa.Column(sa.DateTime, default=_now)
 
@@ -122,7 +124,7 @@ class Conversation(db.Model):  # type: ignore[name-defined]
     __tablename__ = "supagent_conversation"
     id = sa.Column(sa.Integer, primary_key=True)
     user_id = sa.Column(sa.Integer, index=True, nullable=False)   # ab_user.id, no foreign key
-    title = sa.Column(sa.String(255))
+    title = sa.Column(SafeString(255))
     created_at = sa.Column(sa.DateTime, default=_now)
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
 
@@ -132,14 +134,14 @@ class Message(db.Model):  # type: ignore[name-defined]
     id = sa.Column(sa.Integer, primary_key=True)
     conversation_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_conversation.id", ondelete="CASCADE"),
                                 index=True)
-    role = sa.Column(sa.String(16))            # user | assistant
-    content = sa.Column(sa.Text)               # question, or the answer (Markdown)
-    status = sa.Column(sa.String(16), default="done")   # pending | running | done | error | cancelling | cancelled
+    role = sa.Column(SafeString(16))            # user | assistant
+    content = sa.Column(SafeText)               # question, or the answer (Markdown)
+    status = sa.Column(SafeString(16), default="done")   # pending | running | done | error | cancelling | cancelled
     steps = sa.Column(sa.JSON)                 # tools called so far: name, arguments, seconds, result head
     files = sa.Column(sa.JSON)                 # files the answer made (images, Excel), by id
     results = sa.Column(sa.JSON)               # rows of the queries it ran (table / chart views of the page)
     feedback = sa.Column(sa.Integer)           # +1 / -1
-    task_id = sa.Column(sa.String(64))
+    task_id = sa.Column(SafeString(64))
     created_at = sa.Column(sa.DateTime, default=_now)
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)   # last progress (steps saved)
     finished_at = sa.Column(sa.DateTime)
@@ -153,8 +155,8 @@ class File(db.Model):  # type: ignore[name-defined]
     __tablename__ = "supagent_file"
     id = sa.Column(sa.Integer, primary_key=True)
     message_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_message.id", ondelete="CASCADE"), index=True)
-    name = sa.Column(sa.String(255))
-    mime = sa.Column(sa.String(128))
+    name = sa.Column(SafeString(255))
+    mime = sa.Column(SafeString(128))
     size = sa.Column(sa.Integer)
     data = sa.Column(sa.LargeBinary)
     created_at = sa.Column(sa.DateTime, default=_now)
@@ -166,8 +168,8 @@ class Example(db.Model):  # type: ignore[name-defined]
 
     __tablename__ = "supagent_example"
     id = sa.Column(sa.Integer, primary_key=True)
-    question = sa.Column(sa.Text)
-    sql = sa.Column(sa.Text)
+    question = sa.Column(SafeText)
+    sql = sa.Column(SafeText)
     database_id = sa.Column(sa.Integer)
     tools = sa.Column(sa.JSON)
     message_id = sa.Column(sa.Integer)
@@ -181,20 +183,20 @@ class Entry(db.Model):  # type: ignore[name-defined]
 
     __tablename__ = "supagent_entry"
     id = sa.Column(sa.Integer, primary_key=True)
-    title = sa.Column(sa.String(255), nullable=False)
-    classification = sa.Column(sa.String(32), nullable=False)    # glossary | index | metrics | relationships |
+    title = sa.Column(SafeString(255), nullable=False)
+    classification = sa.Column(SafeString(32), nullable=False)    # glossary | index | metrics | relationships |
     #                                                              checks | rule | note
-    category = sa.Column(sa.String(128))
-    fmt = sa.Column(sa.String(16), default="yaml")               # yaml | text | markdown
-    content = sa.Column(sa.Text)
+    category = sa.Column(SafeString(128))
+    fmt = sa.Column(SafeString(16), default="yaml")               # yaml | text | markdown
+    content = sa.Column(SafeText)
     enabled = sa.Column(sa.Boolean, default=True)
     version = sa.Column(sa.Integer, default=1)
     deleted_at = sa.Column(sa.DateTime)
     created_at = sa.Column(sa.DateTime, default=_now)
-    created_by = sa.Column(sa.String(255))
+    created_by = sa.Column(SafeString(255))
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
-    updated_by = sa.Column(sa.String(255))
-    origin = sa.Column(sa.String(255))        # written by the agent: what it came from (formula:..., memory:<id>,
+    updated_by = sa.Column(SafeString(255))
+    origin = sa.Column(SafeString(255))        # written by the agent: what it came from (formula:..., memory:<id>,
     #                                           doc:<id>); the agent changes it only while it made the last change
     evidence = sa.Column(sa.JSON)             # the agent's evidence (answers, approval, quoted document)
 
@@ -204,15 +206,15 @@ class EntryVersion(db.Model):  # type: ignore[name-defined]
     id = sa.Column(sa.Integer, primary_key=True)
     entry_id = sa.Column(sa.Integer, sa.ForeignKey("supagent_entry.id", ondelete="CASCADE"), index=True)
     version = sa.Column(sa.Integer)
-    title = sa.Column(sa.String(255))
-    classification = sa.Column(sa.String(32))
-    category = sa.Column(sa.String(128))
-    fmt = sa.Column(sa.String(16))
-    content = sa.Column(sa.Text)
+    title = sa.Column(SafeString(255))
+    classification = sa.Column(SafeString(32))
+    category = sa.Column(SafeString(128))
+    fmt = sa.Column(SafeString(16))
+    content = sa.Column(SafeText)
     enabled = sa.Column(sa.Boolean)
     deleted = sa.Column(sa.Boolean, default=False)
     changed_at = sa.Column(sa.DateTime, default=_now)
-    changed_by = sa.Column(sa.String(255))
+    changed_by = sa.Column(SafeString(255))
 
 
 class Recipe(db.Model):  # type: ignore[name-defined]
@@ -222,18 +224,18 @@ class Recipe(db.Model):  # type: ignore[name-defined]
 
     __tablename__ = "supagent_recipe"
     id = sa.Column(sa.Integer, primary_key=True)
-    question = sa.Column(sa.Text)
-    words = sa.Column(sa.Text)                  # the question's words, for matching
-    tool = sa.Column(sa.String(64))             # execute_sql | promql_query | generate_chart | export_excel
+    question = sa.Column(SafeText)
+    words = sa.Column(SafeText)                  # the question's words, for matching
+    tool = sa.Column(SafeString(64))             # execute_sql | promql_query | generate_chart | export_excel
     database_id = sa.Column(sa.Integer, index=True)
-    target = sa.Column(sa.String(512))          # table / metric / index
-    query = sa.Column(sa.Text)
-    signature = sa.Column(sa.String(64), index=True)
+    target = sa.Column(SafeString(512))          # table / metric / index
+    query = sa.Column(SafeText)
+    signature = sa.Column(SafeString(64), index=True)
     args = sa.Column(sa.JSON)
     seconds = sa.Column(sa.Float)
     rows = sa.Column(sa.Integer)
     steps = sa.Column(sa.Integer)               # tool calls the answer needed
-    status = sa.Column(sa.String(16), default="auto")    # auto | confirmed | rejected
+    status = sa.Column(SafeString(16), default="auto")    # auto | confirmed | rejected
     confirmations = sa.Column(sa.JSON)          # ids of the answers marked Helpful that used it
     uses = sa.Column(sa.Integer, default=1)
     user_id = sa.Column(sa.Integer)
@@ -249,15 +251,15 @@ class QueryStat(db.Model):  # type: ignore[name-defined]
     __table_args__ = (sa.UniqueConstraint("database_id", "signature", name="uq_supagent_query_stat"),)
     id = sa.Column(sa.Integer, primary_key=True)
     database_id = sa.Column(sa.Integer, index=True)
-    target = sa.Column(sa.String(512), index=True)
-    signature = sa.Column(sa.String(64))
-    pattern = sa.Column(sa.Text)                # the query with its literals replaced by ?
+    target = sa.Column(SafeString(512), index=True)
+    signature = sa.Column(SafeString(64))
+    pattern = sa.Column(SafeText)                # the query with its literals replaced by ?
     calls = sa.Column(sa.Integer, default=0)
     errors = sa.Column(sa.Integer, default=0)
     total_seconds = sa.Column(sa.Float, default=0.0)
     max_seconds = sa.Column(sa.Float, default=0.0)
     total_rows = sa.Column(sa.Integer, default=0)
-    last_error = sa.Column(sa.Text)
+    last_error = sa.Column(SafeText)
     last_at = sa.Column(sa.DateTime, default=_now)
 
 
@@ -268,18 +270,18 @@ class Memory(db.Model):  # type: ignore[name-defined]
 
     __tablename__ = "supagent_memory"
     id = sa.Column(sa.Integer, primary_key=True)
-    scope = sa.Column(sa.String(8), default="user")          # user | team
+    scope = sa.Column(SafeString(8), default="user")          # user | team
     user_id = sa.Column(sa.Integer, index=True)               # the author
-    kind = sa.Column(sa.String(16), default="preference")     # preference | rule | fact
-    text = sa.Column(sa.Text, nullable=False)
-    category = sa.Column(sa.String(128))
-    status = sa.Column(sa.String(16), default="active")       # active | proposed | disabled | catalog (moved
+    kind = sa.Column(SafeString(16), default="preference")     # preference | rule | fact
+    text = sa.Column(SafeText, nullable=False)
+    category = sa.Column(SafeString(128))
+    status = sa.Column(SafeString(16), default="active")       # active | proposed | disabled | catalog (moved
     #                                                           into a catalog entry by the agent)
-    source = sa.Column(sa.String(16), default="chat")         # chat | manual
+    source = sa.Column(SafeString(16), default="chat")         # chat | manual
     message_id = sa.Column(sa.Integer)
     created_at = sa.Column(sa.DateTime, default=_now)
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
-    approved_by = sa.Column(sa.String(255))
+    approved_by = sa.Column(SafeString(255))
 
 
 class Doc(db.Model):  # type: ignore[name-defined]
@@ -288,22 +290,22 @@ class Doc(db.Model):  # type: ignore[name-defined]
 
     __tablename__ = "supagent_doc"
     id = sa.Column(sa.Integer, primary_key=True)
-    kind = sa.Column(sa.String(8), default="upload")         # upload | url
-    title = sa.Column(sa.String(255))
-    url = sa.Column(sa.String(2000))
-    category = sa.Column(sa.String(128))
-    content = sa.Column(sa.Text)                             # the text (pages joined)
+    kind = sa.Column(SafeString(8), default="upload")         # upload | url
+    title = sa.Column(SafeString(255))
+    url = sa.Column(SafeString(2000))
+    category = sa.Column(SafeString(128))
+    content = sa.Column(SafeText)                             # the text (pages joined)
     pages = sa.Column(sa.JSON)                               # [{url, title, chars}]
     max_pages = sa.Column(sa.Integer, default=1)
     refresh_days = sa.Column(sa.Integer, default=7)
     enabled = sa.Column(sa.Boolean, default=True)
-    status = sa.Column(sa.String(16), default="new")         # new | ok | error
-    error = sa.Column(sa.Text)
-    content_hash = sa.Column(sa.String(64))
+    status = sa.Column(SafeString(16), default="new")         # new | ok | error
+    error = sa.Column(SafeText)
+    content_hash = sa.Column(SafeString(64))
     fetched_at = sa.Column(sa.DateTime)
     created_at = sa.Column(sa.DateTime, default=_now)
-    created_by = sa.Column(sa.String(255))
-    learned_hash = sa.Column(sa.String(64))                  # the content the agent read definitions from
+    created_by = sa.Column(SafeString(255))
+    learned_hash = sa.Column(SafeString(64))                  # the content the agent read definitions from
 
 
 class Chunk(db.Model):  # type: ignore[name-defined]
@@ -313,16 +315,16 @@ class Chunk(db.Model):  # type: ignore[name-defined]
 
     __tablename__ = "supagent_chunk"
     id = sa.Column(sa.Integer, primary_key=True)
-    ref = sa.Column(sa.String(128), unique=True, nullable=False)     # object:12, entry:3, doc:4#2...
-    kind = sa.Column(sa.String(16), index=True)      # metric | index | note | rule | glossary | recipe | memory | doc
+    ref = sa.Column(SafeString(128), unique=True, nullable=False)     # object:12, entry:3, doc:4#2...
+    kind = sa.Column(SafeString(16), index=True)      # metric | index | note | rule | glossary | recipe | memory | doc
     source_id = sa.Column(sa.Integer, index=True)     # the learned database it is about (permission filter)
     database_id = sa.Column(sa.Integer, index=True)   # a recipe's database (permission filter)
-    scope = sa.Column(sa.String(8), default="team")   # team | user
+    scope = sa.Column(SafeString(8), default="team")   # team | user
     user_id = sa.Column(sa.Integer, index=True)       # for scope user
-    title = sa.Column(sa.String(512))
-    text = sa.Column(sa.Text)
-    content_hash = sa.Column(sa.String(64))
-    embed_model = sa.Column(sa.String(128))
+    title = sa.Column(SafeString(512))
+    text = sa.Column(SafeText)
+    content_hash = sa.Column(SafeString(64))
+    embed_model = sa.Column(SafeString(128))
     vector = sa.Column(sa.LargeBinary)                # float16, embed dimension
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
 
@@ -331,10 +333,10 @@ class Document(db.Model):  # type: ignore[name-defined]
     """Curated knowledge written by people (the catalog: descriptions, checks, glossary)."""
 
     __tablename__ = "supagent_document"
-    key = sa.Column(sa.String(64), primary_key=True)          # catalog
-    content = sa.Column(sa.Text)
+    key = sa.Column(SafeString(64), primary_key=True)          # catalog
+    content = sa.Column(SafeText)
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
-    updated_by = sa.Column(sa.String(255))
+    updated_by = sa.Column(SafeString(255))
 
 
 TABLES = [Meta, Setting, Source, KObject, Relation, Run, Change, Conversation, Message, File, Example, Document,

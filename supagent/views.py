@@ -410,7 +410,9 @@ class ChatView(BaseView):
             abort(404)
         self._conversation(m.conversation_id)
         inline = (f.mime or "").startswith("image/") and not request.args.get("download")
-        headers = {"Content-Disposition": f"{'inline' if inline else 'attachment'}; filename=\"{f.name}\"",
+        from supagent.textsafe import content_disposition
+
+        headers = {"Content-Disposition": content_disposition("inline" if inline else "attachment", f.name or "file"),
                    "Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"}
         return Response(f.data, mimetype=f.mime or "application/octet-stream", headers=headers)
 

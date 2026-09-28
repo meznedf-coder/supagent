@@ -22,7 +22,7 @@ import logging
 import os
 from typing import Any, Callable
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))

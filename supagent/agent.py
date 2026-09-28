@@ -504,6 +504,10 @@ def unsupported_note(answer: str, trace: list[dict]) -> str:
     return ""
 
 
+SAVING_TOOLS = {"generate_chart", "update_chart", "generate_dashboard", "add_chart_to_existing_dashboard",
+                "save_sql_query", "create_virtual_dataset", "create_report", "update_chart_preview"}
+
+
 def rule_line(rule: dict[str, str]) -> str:
     """A catalog rule for the prompt; its title is not repeated when the text begins with it."""
     body = rule["text"][:600]
@@ -594,6 +598,10 @@ class Agent:
 
     def _call(self, name: str, args: dict) -> tuple[str, str]:
         """(tool really called, its result text)."""
+        if name in SAVING_TOOLS:                  # names and texts saved in Superset's own tables
+            from supagent.textsafe import db_codec, fold_all
+
+            args = fold_all(args, db_codec())
         if name == "chart_from_sql" and self.wants_saved_chart and not self.redirected_chart \
                 and "generate_chart" in self.names:
             self.redirected_chart = True
