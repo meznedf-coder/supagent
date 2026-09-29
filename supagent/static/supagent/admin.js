@@ -151,7 +151,7 @@
           if (x.history_pending) bits.push(S.num(x.history_pending) + " history lookups left for the next runs");
           if (x.skipped_unchanged) bits.push(S.num(x.skipped_unchanged) + " unchanged today");
           if (x.error) bits.push("error: " + x.error);
-          if (x.llm) bits.push(S.num(x.llm.written || 0) + " AI descriptions" + (x.llm.left ? " (" + S.num(x.llm.left) + " left)" : ""));
+          if (x.llm && (x.llm.written || x.llm.left)) bits.push(S.num(x.llm.written || 0) + " AI descriptions" + (x.llm.left ? " (" + S.num(x.llm.left) + " left)" : ""));
           parts.push(name + ": " + (bits.join(", ") || "nothing"));
         });
         Object.keys(st.skipped || {}).forEach(function (name) { parts.push(name + ": not learned: " + st.skipped[name]); });
