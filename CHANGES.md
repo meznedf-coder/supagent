@@ -1,5 +1,10 @@
 # Changes
 
+## 0.4.6 (2026-09-29)
+
+* The same code as 0.4.5, published under a new version number (a package mirror that
+  had kept 0.4.5 as not found fetches 0.4.6 as new). Everything below 0.4.5 applies.
+
 ## 0.4.5 (2026-09-29)
 
 * **Celery workers without Redis, several web servers and workers**: the workers can use
