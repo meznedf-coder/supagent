@@ -1,5 +1,6 @@
 <!doctype html>
-<html lang="en" data-theme="light" data-superset-dark="{{ 'yes' if nav.theme.dark else 'no' }}"
+{% set embed = request.args.get('embed') == '1' %}
+<html lang="en" data-theme="light" data-superset-dark="{{ 'yes' if nav.theme.dark else 'no' }}"{% if embed %} class="embed"{% endif %}
       data-primary="{{ nav.theme.primary or '' }}" data-primary-dark="{{ nav.theme.primary_dark or '' }}">
 <head>
 <meta charset="utf-8">
@@ -8,12 +9,14 @@
 <meta name="csrf-token" content="{{ csrf_token() if csrf_token is defined else '' }}">
 <title>{% block title %}Chat{% endblock %} · Superset</title>
 <link rel="stylesheet" href="{{ supagent_static('supagent.css') }}">
+{% if embed %}<base target="_top">{% endif %}
 </head>
-<body data-page="{{ nav.active }}" data-admin="{{ 'yes' if nav.is_admin else 'no' }}"
+<body data-page="{{ nav.active }}" data-admin="{{ 'yes' if nav.is_admin else 'no' }}"{% if embed %} data-embed="yes"{% endif %}
       data-chat-api="{{ url_for('ChatView.index') }}api/"
       data-dictionary-api="{{ url_for('KnowledgeView.index') }}api/"
       data-admin-api="{{ url_for('AdminView.index') }}api/"
       data-dictionary-url="{{ url_for('KnowledgeView.index') }}">
+{% if not embed %}
 <header class="topbar">
   <a class="brand" href="/" title="Back to Superset">Superset</a>
   <span class="sep" aria-hidden="true"></span>
@@ -25,6 +28,7 @@
   <span class="grow"></span>
   <span class="who" title="The agent acts with this account's permissions">{{ nav.user }}</span>
 </header>
+{% endif %}
 <main class="page page-{{ nav.active }}">
 {% block content %}{% endblock %}
 </main>

@@ -24,7 +24,7 @@ import logging
 import os
 from typing import Any, Callable
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +53,60 @@ def static_url(filename: str) -> str:
     return url_for(f"{_STATIC}.static", filename=filename, v=_file_hash(filename))
 
 
+# Superset's pages include tail_js_custom_extra.html, the place meant for custom page scripts:
+# the chat panel is added in front of what the deployment may have put there (kept as it is)
+DOCK_TEMPLATE = "tail_js_custom_extra.html"
+DOCK_SNIPPET = (
+    "{% if supagent_dock is defined and entry != 'embedded' and not standalone_mode %}"
+    "{% set supagent_chat = supagent_dock() %}{% if supagent_chat %}"
+    '<link rel="stylesheet" href="{{ supagent_static(\'dock.css\') }}">'
+    '<script src="{{ supagent_static(\'dock.js\') }}" data-chat="{{ supagent_chat }}"'
+    '{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>'
+    "{% endif %}{% endif %}\n")
+
+
+def dock_url() -> str:
+    """The chat page's URL when the Superset page being drawn may show the chat panel: a user
+    who is logged in and may use the chat; else ""."""
+    try:
+        from flask import g, url_for
+        from superset.extensions import security_manager
+
+        user = getattr(g, "user", None)
+        if user is None or not getattr(user, "is_authenticated", False):
+            return ""
+        if not security_manager.can_access("can_read", "AIAgent"):
+            return ""
+        return url_for("ChatView.index")
+    except Exception:  # pylint: disable=broad-except   (a page is never broken by the panel)
+        return ""
+
+
+def _dock_loader(inner: Any) -> Any:
+    """The app's template loader, with the chat panel added to tail_js_custom_extra.html."""
+    from jinja2 import BaseLoader, TemplateNotFound
+
+    class DockLoader(BaseLoader):
+        def __init__(self, wrapped: Any) -> None:
+            self.wrapped = wrapped
+
+        def get_source(self, environment: Any, template: str) -> Any:
+            if template != DOCK_TEMPLATE:
+                return self.wrapped.get_source(environment, template)
+            try:
+                source, filename, uptodate = self.wrapped.get_source(environment, template)
+            except TemplateNotFound:
+                source, filename, uptodate = "", None, None
+            return DOCK_SNIPPET + source, filename, uptodate
+
+        def list_templates(self) -> list[str]:
+            return self.wrapped.list_templates()
+
+    if type(inner).__name__ == "DockLoader":
+        return inner
+    return DockLoader(inner)
+
+
 def init_app(app: Any) -> None:
     """Superset's FLASK_APP_MUTATOR: views, API, Celery tasks, the daily schedule."""
     from flask import Blueprint
@@ -69,6 +123,8 @@ def init_app(app: Any) -> None:
         app.register_blueprint(Blueprint(_STATIC, __name__, static_folder=os.path.join(HERE, "static", "supagent"),
                                          static_url_path="/supagent-static"))
     app.jinja_env.globals["supagent_static"] = static_url
+    app.jinja_env.globals["supagent_dock"] = dock_url
+    app.jinja_env.loader = _dock_loader(app.jinja_env.loader)      # the chat panel on Superset's pages
     # `superset init` gives every new view to Gamma unless it is admin-only: the agent's views
     # are admin-only there, and `superset supagent init` gives the chat and the dictionary to
     # the role "AI Agent" (the settings stay with the admins)

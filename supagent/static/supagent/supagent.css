@@ -319,3 +319,16 @@ details.sql summary { cursor: pointer; color: var(--ink-2); }
 .k-results { display: grid; gap: 8px; }
 .k-hit { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 12px; }
 .k-text { color: var(--ink-2); font-size: 13px; white-space: pre-wrap; margin-top: 4px; }
+
+/* the chat in the panel docked on Superset's pages (?embed=1): one column, the conversations
+   behind a button, no top bar */
+#toggle-convs { display: none; }
+.embed .page { height: 100vh; }
+.embed .chat { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: 100%; }
+.embed .convs { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border-right: 0;
+  border-bottom: 1px solid var(--line); max-height: none; }
+.embed .convs .btn.wide { width: auto; flex: 1 1 auto; }
+.embed #toggle-convs { display: inline-flex; justify-content: center; }
+.embed .conv-list { display: none; flex-basis: 100%; max-height: 40vh; overflow: auto; margin: 0; }
+.embed .convs.open .conv-list { display: block; }
+.embed .msg.user .bubble { max-width: 92%; }

@@ -199,7 +199,8 @@
     bar.appendChild(copyButton("Copy", function () { return V.csvText(res, "\t"); }, "Table"));
     bar.appendChild(el("button", { type: "button", class: "linkish", text: "CSV", title: "Download the rows as CSV",
       onclick: function () { V.download(new Blob(["﻿" + V.csvText(res, ",")], { type: "text/csv;charset=utf-8" }), "result-" + m.id + "-" + (n + 1) + ".csv"); } }));
-    bar.appendChild(el("a", { class: "linkish", href: "api/messages/" + m.id + "/results/" + n + ".xlsx", text: "Excel", title: "Download the rows as an Excel file" }));
+    bar.appendChild(el("a", { class: "linkish", href: "api/messages/" + m.id + "/results/" + n + ".xlsx", text: "Excel",
+      download: "result-" + m.id + "-" + (n + 1) + ".xlsx", title: "Download the rows as an Excel file" }));
     var bPng = el("button", { type: "button", class: "linkish", text: "PNG", title: "Download the chart as an image",
       onclick: function () {
         var node = body.querySelector("svg.viz-svg");
@@ -458,5 +459,23 @@
     if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing && !running) { ev.preventDefault(); submit(); }
   });
   document.getElementById("new-chat").addEventListener("click", welcome);
+
+  // in the panel docked on Superset's pages: the conversations behind a button; Superset's pages
+  // open in the main page (base target _top), other sites in a new tab
+  if (document.body.dataset.embed === "yes") {
+    input.placeholder = "Ask about your data (Enter: send, Shift+Enter: new line)";
+    var convs = document.querySelector(".convs"), toggle = document.getElementById("toggle-convs");
+    var fold = function (open) { convs.classList.toggle("open", open); toggle.setAttribute("aria-expanded", open ? "true" : "false"); };
+    toggle.addEventListener("click", function () { fold(!convs.classList.contains("open")); });
+    list.addEventListener("click", function (ev) { if (ev.target.closest("a")) fold(false); });
+    document.getElementById("new-chat").addEventListener("click", function () { fold(false); });
+    document.addEventListener("click", function (ev) {
+      var a = ev.target.closest && ev.target.closest("a[href]");
+      if (!a || a.target || a.hasAttribute("download")) return;
+      var url;
+      try { url = new URL(a.getAttribute("href"), location.href); } catch (e) { return; }
+      if (url.origin !== location.origin) a.target = "_blank";
+    }, true);
+  }
   loadConversations(remembered() || undefined);
 })();

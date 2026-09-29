@@ -1,5 +1,17 @@
 # Changes
 
+## 0.4.1 (2026-09-29)
+
+* **The chat beside Superset's pages**: the Chat tab of the top bar no longer leaves the page: it
+  opens the chat as a panel on the right, and the dashboard, chart, dataset or SQL Lab page stays
+  usable beside it (it narrows to make room). A link to Superset in an answer (a chart, a
+  dashboard) opens in the page while the chat stays open; other sites open in a new tab. The
+  panel stays open from page to page in the browser tab, can be resized by dragging its left
+  edge, and follows Superset's light or dark theme. Ctrl+click on the tab, or the panel's ⤢
+  button, still opens the full chat page. Only for the users who may chat; never on embedded or
+  standalone dashboards. Added through Superset's own place for custom page scripts
+  (`tail_js_custom_extra.html`, kept as the deployment has it): nothing to configure.
+
 ## 0.4.0 (2026-09-29)
 
 Faster answers, fewer wasted calls, learning runs that never block, and commands to measure it.

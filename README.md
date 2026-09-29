@@ -3,7 +3,10 @@
 supagent is a Python package that you install in Superset's virtualenv, like a database driver.
 It adds:
 
-* **a chat page** (the **Chat** tab of Superset's top bar). A user asks a question in plain words; the agent
+* **a chat** (the **Chat** tab of Superset's top bar opens it as a panel on the right of the page:
+  the dashboard, chart, dataset or SQL Lab page stays beside it, and a link in an answer opens
+  there while the chat stays open; Ctrl+click, or the panel's ⤢ button, opens it as a full page).
+  A user asks a question in plain words; the agent
   works with **that user's Superset permissions**, runs the queries, and answers with the key
   figures. Every query result is shown under the answer as a **table and a chart** (bars for
   rankings, lines over time, figures for a single row). The user can switch between them,
@@ -73,7 +76,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.4.0-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.4.1-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -462,6 +465,12 @@ behind your gateway.
   call), so that the LLM serves the people waiting first.
 * **Old chats**: `chats.keep_days` (0, the default: keep every chat) deletes the chats nobody
   used for that many days, with their messages and files; what they taught stays.
+* **The chat panel** on Superset's pages is added through Superset's own place for custom page
+  scripts (`tail_js_custom_extra.html`; what a deployment put there is kept), only for the users
+  who may chat, never on embedded or standalone dashboards. It shows the chat page in a frame of
+  the same site: Talisman's default `frame_options` (SAMEORIGIN) allows it; with DENY the panel
+  says so and offers the full page. Drag its left edge to resize it; it stays open from page to
+  page in the browser tab.
 * **Stop**: the chat's Stop button stops the answer at once: the chat takes the next question
   right away. A step already running (an LLM call, a query) ends on its own in the
   background; its result is thrown away and the agent does nothing more for that answer.
