@@ -63,10 +63,13 @@ def learn_relations() -> dict[str, int]:
     """Recompute the value-overlap relations over every source: the objects are read in steps,
     one label per database and name stands for all the metrics that have it, and the relations
     are written BATCH at a time against the ones already known (read once)."""
+    from supagent.knowledge.stopping import check
+
     # one representative label per (source, label name), with the values of all its metrics
     rep: dict[tuple[int, str], int] = {}
     label_values: dict[tuple[int, str], set[str]] = defaultdict(set)
     for oid, sid, name, _parent, vals in _stream("label"):
+        check()                                   # an admin's Stop (every few seconds at most)
         key = (sid, name)
         rep.setdefault(key, oid)
         label_values[key] |= vals
@@ -80,6 +83,7 @@ def learn_relations() -> dict[str, int]:
             index[v].append(i)
     common: dict[tuple[int, int], int] = defaultdict(int)
     for members in index.values():
+        check()
         if len(members) > 50:                     # a value everybody has says nothing
             continue
         for x in range(len(members)):
@@ -90,6 +94,7 @@ def learn_relations() -> dict[str, int]:
     kept: set[int] = set()
     made = skipped = pending = 0
     for (i, j), n in common.items():
+        check()
         a, b = cands[i], cands[j]
         if a[1] == b[1] == "label" and a[3] == b[3]:
             continue                              # the same label in two databases

@@ -78,7 +78,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.4.6-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.4.7-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -274,8 +274,11 @@ where it stopped), lets the agent write the **catalog entries it is certain of**
 updates the knowledge search.
 
 **Stopping a run**: *Stop learning* on the settings page (or `superset supagent learn --stop`)
-stops the running run at its next step (a few seconds, or the LLM request in progress); it keeps
-what it learned, and *Learn now* starts a new one as soon as it stopped.
+marks the running run **stopped at once** (also a run whose process died, e.g. a restart during
+the run); it keeps what it learned, and *Learn now* starts a new one right away. The run's own
+work ends at its next check, every few seconds at most, also while it waits (for the last
+descriptions, or for the people's answers first); a request to a database or an LLM call already
+in progress finishes in the background.
 
 **Starting again**: `superset supagent forget-learned` shows what the learning learned, per
 database (without `--yes` nothing changes); `--yes` forgets it: the indices, fields, metrics,
@@ -339,6 +342,26 @@ answers, the approval, the document). When the evidence breaks (an answer marked
 helpful*, another expression, the document removed), the agent takes its entry back. **Once a
 person edits an agent entry it is theirs**: the agent never changes it again; delete it and the
 agent never writes it again. `superset supagent agent-catalog` runs this pass at once.
+
+## Questions about an earlier answer
+
+"Create the chart in Superset of that finding", "the same for srv-emea-001", "enregistre ce
+graphique": with the new question, the agent is given what the last two answers of the chat were
+computed from: the queries that produced the rows they showed (the tool, the database, the exact
+SQL or PromQL, the time window and the columns), each under the question it answered, marked as
+the queries that ran (a query only written in an answer's text did not). The earlier answers
+themselves are given as they were. When the question refers back ("that", "this finding", "the same", "ce
+résultat"...), "where the data is" (below) is looked for with the question it refers to, not only
+with its own few words.
+
+A finding that is a calculation (a percentage such as the CPU busy %, a ratio, PromQL
+arithmetic) is not a column or saved metric of the metric's dataset: the agent saves its query as
+a Superset **virtual dataset** (`create_virtual_dataset`: a PromQL finding as
+`SELECT ts, <labels>, value FROM promql('<the PromQL>')` on its promagg database), then saves the
+chart on that dataset with the finding's time range. Creating a dataset needs Superset's
+*Dataset write* permission (Alpha, Admin; not Gamma), and `promql()` needs access to the whole
+database; Superset's own check of the SQL's tables applies. The same name and query give back the
+same dataset (no copies when the agent tries again).
 
 ## How the agent finds the data (0.3)
 

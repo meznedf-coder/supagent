@@ -965,14 +965,14 @@ class AdminView(BaseView):
     @expose("/api/learn/stop", methods=("POST",))
     @has_access_api
     def stop_learning(self) -> Response:
-        """Stop the running learning run: it ends at its next step (a few seconds, or the LLM
-        request in progress), keeping what it learned; then a new run can start."""
+        """Stop the running learning run, at once: it keeps what it learned, and a new run can
+        start right away (the request or LLM call in progress ends in the background)."""
         from supagent.knowledge.stopping import request_stop
 
         run_id = request_stop()
         if run_id is None:
             return _json({"error": "no learning run is running"}, 409)
-        return _json({"stopping": run_id})
+        return _json({"stopped": run_id})
 
     @expose("/api/runs", methods=("GET",))
     @has_access_api

@@ -1,5 +1,26 @@
 # Changes
 
+## 0.4.7 (2026-09-29)
+
+* **Questions about an earlier answer**: "create the chart in Superset of that finding" was
+  answered from the question's own few words (the agent looked for other data, and saved a chart
+  of something else). Now the agent is given, with the new question, what the last two answers
+  were computed from: the queries that gave their rows (tool, database, SQL or PromQL, time window,
+  columns; a query only written in an answer's text is marked as not run), and a question that
+  refers back looks for the data of the question it refers to.
+* **CPU usage** hints give the busy % (`100 * SUM(rate) FILTER (WHERE mode <> 'idle') / SUM(rate)`)
+  for CPU-seconds metrics with a `mode` label: the sum of every mode is the number of cores, which
+  an answer about "CPU usage" could show as a flat 4.00.
+* **Charts of a calculated finding**: a percentage, a ratio or PromQL is saved as a Superset
+  virtual dataset (`create_virtual_dataset`, only offered when a chart is asked; PromQL through
+  promagg's `promql()`), then charted with the finding's time range. The tool checks the Dataset
+  write permission (and database access for `promql()`), lets Superset check the SQL's tables, and
+  gives back the same dataset when asked again. A chart field that does not exist now points to it.
+* **Stop learning is immediate**: the run is marked stopped at once (also one whose process
+  died), and *Learn now* starts a new one right away (before: "stopping" until its next step, which
+  could be the end of a long LLM call, and a new run waited). The run also stops while it waits for
+  the last descriptions or for the people's answers.
+
 ## 0.4.6 (2026-09-29)
 
 * The same code as 0.4.5, published under a new version number (a package mirror that

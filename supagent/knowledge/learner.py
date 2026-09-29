@@ -219,7 +219,7 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
     def descriptions_so_far() -> dict[str, Any]:
         if describer is None:
             return {}
-        return describer.finish(timeout=float(settings.get("llm.timeout") or 900) + 60)
+        return describer.finish(timeout=float(settings.get("llm.timeout") or 900) + 60, watch=True)
 
     try:
         with watching(run_id):
@@ -322,7 +322,7 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
         status, error = "error", "".join(traceback.format_exception_only(type(ex), ex))[-2000:]
     finally:
         if describer is not None and describer.is_alive():
-            describer.finish(timeout=60)          # a stop or a failure: the thread ends too
+            describer.finish(timeout=5)           # a stop or a failure: the thread ends after its LLM call
     if describer is not None and "llm" not in stats and describer.out.get("written"):
         stats["llm"] = {"written": describer.out["written"], "requests": describer.out["requests"]}
     stats["seconds"] = round(time.time() - t0, 1)

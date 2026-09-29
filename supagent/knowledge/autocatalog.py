@@ -434,7 +434,10 @@ def definitions_from_docs(llm: Any = None) -> dict[str, Any]:
             if d.enabled and d.status == "ok" and d.content and d.content_hash != d.learned_hash]
     client = None
     human = _human_terms()
+    from supagent.knowledge.stopping import check
+
     for d in todo[:DOCS_PER_RUN]:
+        check()                                       # inside a learning run: an admin's Stop
         lines = candidate_lines(d.content or "")
         items: list[dict[str, Any]] | None = []
         if lines:
@@ -499,9 +502,12 @@ def _run(llm_docs: bool, parts: tuple[str, ...]) -> dict[str, Any]:
     if llm_docs and settings.get("learn.agent_catalog_docs"):
         jobs.append(("documents", definitions_from_docs))
     changed = False
+    from supagent.knowledge.stopping import check
+
     for name, fn in jobs:
         if name not in parts:
             continue
+        check()                                  # inside a learning run: an admin's Stop
         try:
             res = fn()
             out[name] = res

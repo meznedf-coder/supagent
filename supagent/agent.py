@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 MAX_TOOL_CHARS = 8000
 TOOL_CHARS = {"describe_data": 16000}
 HISTORY_MESSAGES = 6
+HISTORY_CHARS = 3000      # of one earlier message given with the question
 RESULT_TOOLS = ("execute_sql", "promql_query")      # their full result is kept for the page's views
 
 
@@ -96,7 +97,8 @@ tables row by row, no WITH, window function or subquery over raw samples, no qua
 a time range and GROUP BY a time bucket (DATE_TRUNC('hour', ts)). Counters: SUM(rate) = per second,
 SUM(increase) = count, never SUM or AVG of value; gauges: AVG(value), MIN(value), MAX(value); histograms
 (*_bucket tables): HISTOGRAM_QUANTILE(0.95, SUM(RATE(value))); a condition on one label:
-SUM(rate) FILTER (WHERE mode <> 'idle'). Which servers had samples in a window: GROUP BY node with COUNT(*).
+SUM(rate) FILTER (WHERE mode <> 'idle'); CPU usage = busy %: 100 * SUM(rate) FILTER (WHERE mode <> 'idle') /
+SUM(rate) (SUM(rate) of every mode is the number of cores). Which servers had samples: GROUP BY node, COUNT(*).
 A database over several tenants has a column __tenant_id__. Two metrics together: aggregate each one in
 its own query, or promql_query (arithmetic between metrics, offsets, label_replace)."""
 
@@ -107,12 +109,16 @@ Saving Superset charts and dashboards (asked here): check the fields with get_ch
 generate_chart once with save_chart=true and the requested chart_name; a tool error tells you exactly what
 to fix. Use only the dataset's column names. COUNT(*) is the dataset's saved metric "count":
 {"name": "count", "saved_metric": true}. Ratios, percentiles and conditional counts cannot be written in a
-chart: use the dataset's saved metrics (get_dataset_info lists them), or say it is not possible. To change a
-saved chart call update_chart with its id instead of creating another one. Chart filters are fixed values
-(no rolling time range): turn "last 7 days" into dates from "now"; a POSITION_LABEL filter and a date filter
-must not contradict each other. Charts cannot compare with an earlier period: to compare position dates use
-X = POSITION_TIME grouped by POSITION_LABEL. The chart under your answer in the chat is not saved in
-Superset: save with generate_chart / generate_dashboard.""",
+chart's fields: use the dataset's saved metrics (get_dataset_info lists them), or save the query that
+computed the value as a dataset with create_virtual_dataset (a PromQL finding, on its promagg database:
+SELECT ts, <its labels>, value FROM promql('<the PromQL>') WHERE ts >= TIMESTAMP '<start>' AND ts <
+TIMESTAMP '<end>') and chart that dataset: x = its time column, y = AVG of its value column, group_by its
+labels. The dates are in the dataset's SQL: a chart config has no time_range field. A chart of an earlier
+finding uses the queries listed for that answer, with their time window. To change a saved chart call update_chart with its id instead of
+creating another one. Chart filters are fixed values (no rolling time range): turn "last 7 days" into dates
+from "now"; a POSITION_LABEL filter and a date filter must not contradict each other. Charts cannot compare
+with an earlier period: to compare position dates use X = POSITION_TIME grouped by POSITION_LABEL. The chart
+under your answer in the chat is not saved in Superset: save with generate_chart / generate_dashboard.""",
     "investigation": """
 
 Investigations ("why did the jobs fail", "was a server saturated"): 1) find where and when on the jobs index
@@ -157,7 +163,7 @@ INTENTS = {
 TOOLS_OF = {
     "charts": {"get_chart_type_schema", "generate_chart", "update_chart", "update_chart_preview", "list_charts",
                "get_chart_info", "generate_dashboard", "add_chart_to_existing_dashboard", "list_dashboards",
-               "get_dashboard_info", "fix_chart_time_range", "chart_image"},
+               "get_dashboard_info", "fix_chart_time_range", "chart_image", "create_virtual_dataset"},
     "files": {"export_excel", "send_email", "create_report", "list_reports"},
     "images": {"chart_from_sql", "chart_image"},
     "usual": {"compare_to_usual"},
@@ -168,6 +174,53 @@ INTENT_TOOLS = set().union(*TOOLS_OF.values())
 
 def intents(question: str) -> set[str]:
     return {k for k, rx in INTENTS.items() if rx.search(question or "")}
+
+
+# "that finding", "the same", "ce résultat": the question is about an earlier answer
+REFERS_BACK = re.compile(
+    r"\b(that|these|those|it|them|same|above|previous|earlier|findings?|results?)\b|"
+    r"\bthis\b(?!\s+(week|month|year|morning|afternoon|evening|night|quarter)\b)|"
+    r"\b(cela|ça|celui|celle|ceux|m[êe]mes?|pr[ée]c[ée]dente?s?|ci-dessus|r[ée]sultats?|trouvailles?)\b|"
+    r"\b(cet|cette|ces)\b(?!\s+(semaine|ann[ée]e|matin|nuit|apr[èe]s-midi)\b)|"
+    r"\bce\s+(graphique|chiffre|r[ée]sultat|tableau|calcul|constat)", re.I)
+
+
+def refers_back(question: str) -> bool:
+    return bool(REFERS_BACK.search(question or ""))
+
+
+def queries_note(history: list[dict] | None) -> str:
+    """What the last answers of the chat were computed from: the queries that ran and gave their
+    rows, with their database and time window (runner.queries_of), each under the question it
+    answered. Given with the new question (never inside the earlier answers: the LLM would copy
+    it into its own). A query only written in an answer's text did not run."""
+    lines = []
+    asked = ""
+    for h in history or []:
+        if h.get("role") == "user":
+            asked = " ".join(str(h.get("content") or "").split())[:160]
+        elif h.get("queries"):
+            lines.append(f'- the answer to "{asked}":')
+            lines += ["  " + line for line in _query_lines(h["queries"])]
+    if not lines:
+        return ""
+    return ("What the last answers of this chat were computed from (for a question about them; a query only "
+            "written in an answer's text did not run; do not repeat this list):\n" + "\n".join(lines))
+
+
+def _query_lines(queries: list[dict]) -> list[str]:
+    lines = []
+    for q in queries or []:
+        where = f" on database {q['database']!r}" if q.get("database") else ""
+        if q.get("database_id"):
+            where += f" (id {q['database_id']})"
+        window = f", from {q['start']} to {q['end']}" if q.get("start") and q.get("end") else ""
+        if window and q.get("step"):
+            window += f", step {q['step']}"
+        cols = f" -> columns {', '.join(map(str, q.get('columns') or []))}" if q.get("columns") else ""
+        lines.append(f"{q.get('tool')}{where}{window}: {q.get('query')}{cols}")
+    return lines
+
 
 CHART_TOOLS = ("generate_chart", "update_chart", "update_chart_preview")
 REF_FIELDS = {"name", "column_name", "label", "dtype", "aggregate", "saved_metric"}
@@ -340,6 +393,10 @@ class ChartGuard:
                 config["time_grain"] = "PT1H"      # metrics (promagg): time buckets, never raw samples
             if not errors:
                 errors += self._check(config, *(known or (None, None)))
+            if errors and "create_virtual_dataset" in self.agent.names and any(
+                    k in e for e in errors for k in ("unknown column", "is not a saved metric", "cannot run")):
+                errors.append("a calculation (a percentage, a ratio, PromQL) is not a field of this dataset: save "
+                              "the query of the finding with create_virtual_dataset, then chart the new dataset")
             if errors:
                 return name, args, json.dumps({"success": False, "error": "invalid chart config: fix these points "
                                                "and call the tool again", "details": errors}, ensure_ascii=False)
@@ -810,12 +867,19 @@ class Agent:
         charts: list[str] = []
         emailed: list[str] = []
         messages: list[dict] = [{"role": "system", "content": self._system(question)}]
-        for h in (history or [])[-HISTORY_MESSAGES:]:
+        recent = (history or [])[-HISTORY_MESSAGES:]
+        for h in recent:
             if h.get("content"):
-                messages.append({"role": h["role"], "content": str(h["content"])[:3000]})
+                messages.append({"role": h["role"], "content": str(h["content"])[:HISTORY_CHARS]})
         lang = question_language(question)
         hint = f" {ANSWER_IN[lang]}" if lang else ""
-        blocks = self._question_blocks(question)
+        previous = next((str(h["content"]) for h in reversed(history or [])
+                         if h.get("role") == "user" and h.get("content")), "")
+        # "create a chart of that finding": where the data is, from the question it refers to
+        blocks = self._question_blocks(f"{previous}\n{question}" if previous and refers_back(question) else question)
+        behind = queries_note(recent)                   # what "that finding" was computed from
+        if behind:
+            blocks = f"{blocks}\n\n{behind}" if blocks else behind
         messages.append({"role": "user", "content": (blocks + "\n\n" if blocks else "") +
                          f"(Now: {now():%A %Y-%m-%d %H:%M}.{hint})\n{question}"})
         trace: list[dict] = []

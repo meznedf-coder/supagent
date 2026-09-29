@@ -388,6 +388,9 @@ def _sql(c: dict[str, Any]) -> str:
     where = "WHERE ts >= TIMESTAMP '<start>' AND ts < TIMESTAMP '<end>'"
     if name.endswith("_bucket"):
         value = "HISTOGRAM_QUANTILE(0.95, SUM(RATE(value))) AS p95"
+    elif "cpu" in name.lower() and "mode" in {str(x).lower() for x in c.get("labels") or []}:
+        # CPU seconds per mode: the busy share (SUM(rate) of every mode is the number of cores)
+        value = "100 * SUM(rate) FILTER (WHERE mode <> 'idle') / SUM(rate) AS busy_pct"
     elif kind in ("counter", "histogram", "summary") or name.endswith(("_total", "_count", "_sum")):
         value = "SUM(rate) AS per_second"
     else:

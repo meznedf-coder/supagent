@@ -184,3 +184,125 @@ def get_dataset_info(request: DatasetInfoRequest) -> dict:
                              "description": c.description or ""} for c in ds.columns],
                 "metrics": [{"metric_name": m.metric_name, "expression": m.expression,
                              "description": m.description or ""} for m in ds.metrics]}
+
+
+TIME_NAMES = ("ts", "time", "timestamp", "@timestamp", "datetime", "date", "t", "bucket", "hour", "day")
+PROMQL_CALL = re.compile(r"\bpromql\s*\(", re.I)
+TS_WINDOW = re.compile(r'(\bts\b|"ts")\s*(>=|>|<=|<|between\b)', re.I)
+
+
+class VirtualDatasetRequest(BaseModel):
+    database_id: int = Field(description="The database the query runs on")
+    sql: str = Field(description="The query as it ran for the finding (a PromQL finding, on a promagg database: "
+                                 "SELECT ts, <its labels>, value FROM promql('<the PromQL>') WHERE ts >= "
+                                 "TIMESTAMP '<start>' AND ts < TIMESTAMP '<end>')")
+    name: str = Field(description="A short name for the new dataset, e.g. 'CPU busy % srv-amer-002'")
+
+
+def _virtual_out(ds: Any, reused: bool = False) -> dict:
+    time_col = ds.main_dttm_col
+    return {"dataset_id": ds.id, "name": ds.table_name, "database_id": ds.database_id, "reused": reused,
+            "columns": [{"name": c.column_name, "type": c.type, "is_dttm": bool(c.is_dttm)} for c in ds.columns],
+            "time_column": time_col,
+            "next": f"generate_chart with dataset_id {ds.id}" + (f", x = {time_col}" if time_col else "") +
+                    ", y = AVG of the value column, the finding's time range, save_chart=true"}
+
+
+@mcp.tool
+def create_virtual_dataset(request: VirtualDatasetRequest) -> dict:
+    """Save a query as a Superset dataset (a virtual dataset), to chart a finding that is a
+    calculation (a percentage, a ratio, PromQL); then call generate_chart with the dataset_id it
+    returns. The same name and query give back the same dataset."""
+    sql = (request.sql or "").strip().rstrip(";").strip()
+    name = re.sub(r"\s+", " ", request.name or "").strip()[:200]
+    if not sql or not name:
+        return {"error": "give the query (sql) and a name"}
+    with _as_user() as (_app, user):
+        from superset.commands.dataset.create import CreateDatasetCommand
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.extensions import db, security_manager
+        from superset.models.core import Database
+
+        database = db.session.get(Database, int(request.database_id))
+        if database is None or not agent_databases([database]):
+            return {"error": f"database {request.database_id} not found or not allowed"}
+        # what Superset's REST API checks before its command: the right to create datasets
+        if not security_manager.can_access("can_write", "Dataset"):
+            return {"error": "you may not create datasets in Superset (the Dataset write permission): chart an "
+                             "existing dataset, or ask an admin"}
+        if PROMQL_CALL.search(sql) and not security_manager.can_access_database(database):
+            return {"error": "promql() reads the whole database: it needs access to the database in Superset"}
+        if PROMQL_CALL.search(sql) and not TS_WINDOW.search(sql):   # else a chart grouped by a label fails
+            return {"error": "a promql() dataset needs the finding's time window in its SQL: add WHERE ts >= "
+                             "TIMESTAMP '<start>' AND ts < TIMESTAMP '<end>' after promql(...)"}
+        same = (db.session.query(SqlaTable)
+                .filter(SqlaTable.database_id == database.id, SqlaTable.table_name.like(name + "%")).all())
+        for ds in same:                                  # asked again (a retry): the same dataset
+            if (ds.sql or "").strip().rstrip(";").strip() == sql and user.id in {o.id for o in ds.owners or []}:
+                return _virtual_out(ds, reused=True)
+        taken, final, n = {ds.table_name for ds in same}, name, 2
+        while final in taken:
+            final, n = f"{name} ({n})", n + 1
+        try:
+            ds = CreateDatasetCommand({"database": database.id, "table_name": final, "sql": sql,
+                                       "owners": [user.id]}).run()      # Superset checks the SQL's access
+        except Exception as ex:  # pylint: disable=broad-except
+            db.session.rollback()
+            detail = ex.normalized_messages() if hasattr(ex, "normalized_messages") else None
+            cause = f" ({ex.__cause__})" if ex.__cause__ else ""
+            return {"error": f"the dataset was not created: {detail or ex}{cause}"[:1500]}
+        cols = list(ds.columns)
+        if not any(c.is_dttm for c in cols):            # the time column: charts filter and group on it
+            for c in cols:
+                if c.column_name.lower() in TIME_NAMES:
+                    c.is_dttm = True
+                    break
+        if not ds.main_dttm_col:
+            ds.main_dttm_col = next((c.column_name for c in cols if c.is_dttm), None)
+        db.session.commit()
+        return _virtual_out(ds)
+
+
+def drop_unused_datasets(trace: list[dict]) -> list[int]:
+    """After an answer that saved a chart: the datasets it created that no chart uses (tries that did
+    not work) are deleted, as the user who asked. Nothing is deleted when no chart was saved, nor a
+    dataset that any chart of Superset uses."""
+    import json
+
+    created, used, saved = [], set(), False
+    for t in trace:
+        tool = t.get("called") or t.get("tool")
+        if t.get("status") != "done":
+            continue
+        if tool == "create_virtual_dataset":
+            try:
+                res = json.loads(t.get("result") or "{}")
+            except ValueError:
+                continue
+            if isinstance(res, dict) and res.get("dataset_id") and not res.get("reused"):
+                created.append(int(res["dataset_id"]))
+        elif tool in ("generate_chart", "update_chart"):
+            args = t.get("args") or {}
+            req = args.get("request") if isinstance(args.get("request"), dict) else args
+            saved = saved or tool == "update_chart" or bool(req.get("save_chart"))
+            if req.get("dataset_id") is not None:
+                used.add(int(req["dataset_id"]))
+    unused = [d for d in created if d not in used]
+    if not saved or not unused:
+        return []
+    with _as_user():
+        from superset.commands.dataset.delete import DeleteDatasetCommand
+        from superset.extensions import db
+        from superset.models.slice import Slice
+
+        charted = {i for (i,) in db.session.query(Slice.datasource_id)
+                   .filter(Slice.datasource_type == "table", Slice.datasource_id.in_(unused))}
+        unused = [d for d in unused if d not in charted]
+        if not unused:
+            return []
+        try:
+            DeleteDatasetCommand(unused).run()
+        except Exception:  # pylint: disable=broad-except   (kept: the answer is not affected)
+            db.session.rollback()
+            return []
+    return unused

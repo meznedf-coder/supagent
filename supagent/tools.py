@@ -1264,7 +1264,8 @@ def promql_query(expr: str, start: str | None = None, end: str | None = None, st
 
                         hint = why_empty_promql(db_obj, expr) or \
                             "no series in this time range (check the dates: describe_data gives the data range)"
-                return {"expr": expr, "database": db_obj.database_name, **({"hint": hint} if hint else {}),
+                return {"expr": expr, "database": db_obj.database_name, "database_id": db_obj.id,
+                        **({"hint": hint} if hint else {}),
                         "start": f"{conn.zone.local(t0):%Y-%m-%d %H:%M}", "end": f"{conn.zone.local(t1):%Y-%m-%d %H:%M}",
                         "step": duration(step_ms) if step_ms else "instant", "series_count": total,
                         "series": _series_summary(conn, series[:max(1, min(max_series, 200))], 60),

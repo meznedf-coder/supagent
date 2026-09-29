@@ -278,9 +278,19 @@ def test_the_stop_button_and_command(app):
             db.session.add(run)
             db.session.commit()
             run_id = run.id
-        assert c.post("/supagent/admin/api/learn/stop", json={}).get_json() == {"stopping": run_id}
-        busy = c.post("/supagent/admin/api/learn", json={})
-        assert busy.status_code == 409 and "is stopping" in busy.get_json()["error"]
+        assert c.post("/supagent/admin/api/learn/stop", json={}).get_json() == {"stopped": run_id}
+        with app.app_context():
+            assert db.session.get(Run, run_id).status == "stopped"         # at once, not "stopping"
+        started = []
+        from supagent import tasks as supagent_tasks
+
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(supagent_tasks, "dispatch_learning", lambda *a, **k: started.append(a) or "thread")
+        try:
+            assert c.post("/supagent/admin/api/learn", json={}).status_code == 200    # Learn now: right away
+        finally:
+            monkey.undo()
+        assert len(started) == 1
     with app.test_client() as c:
         login(c, "alice")                                            # not an admin
         assert c.post("/supagent/admin/api/learn/stop", json={}).status_code in (401, 403)
@@ -291,7 +301,7 @@ def test_the_stop_button_and_command(app):
         db.session.add(run)
         db.session.commit()
         out = app.test_cli_runner().invoke(supagent, ["learn", "--stop"])
-        assert out.exit_code == 0 and f"stopping learning run {run.id}" in out.output
+        assert out.exit_code == 0 and f"learning run {run.id} stopped" in out.output
         db.session.get(Run, run.id).status = "stopped"
         db.session.commit()
 
@@ -417,4 +427,98 @@ def test_only_one_run_starts_at_a_time_for_all_the_processes(app):
         db.session.commit()
         second = _start_run("manual")
         assert second and second != first
+        _no_runs()
+
+
+def test_stop_frees_a_run_whose_process_died(app):
+    """A restart during a run left it "running": Stop ends it, and a new run starts at once."""
+    from superset.extensions import db
+
+    from supagent.knowledge.learner import _start_run, running_run
+    from supagent.knowledge.stopping import request_stop
+    from supagent.models import Run
+
+    with app.app_context():
+        _no_runs()
+        dead = Run(kind="learn", reason="schedule", status="running",
+                   started_at=dt.datetime.utcnow() - dt.timedelta(minutes=5))
+        db.session.add(dead)
+        db.session.commit()
+        assert running_run().id == dead.id and _start_run("manual") is None
+        assert request_stop() == dead.id
+        assert running_run() is None and _start_run("manual")
+        _no_runs()
+
+
+def test_stop_ends_the_wait_for_the_last_descriptions(four, app, monkeypatch):
+    """Stop pressed while the run waits for an LLM call of the descriptions (it can take minutes):
+    the run ends at once as stopped, with what it learned."""
+    import threading
+    import time as _time
+
+    from supagent.knowledge import enrich, learn_indices, learn_metrics, stopping
+    from supagent.knowledge.learner import run_learning
+    from supagent.knowledge.stopping import request_stop
+    from supagent.models import Run
+    from superset.extensions import db
+
+    calls: list = []
+    _fake_steps(monkeypatch, calls)
+    monkeypatch.setattr(stopping, "CHECK_S", 0.2)
+    release = threading.Event()
+
+    def describe(run, deadline, llm=None, source_id=None, pause=None):
+        if threading.current_thread().name.startswith("supagent-describe"):
+            release.wait(60)                                      # a long LLM call
+            return {"written": 0, "requests": 1, "by_source": {}}
+        return {"written": 0, "requests": 0}
+
+    left = [len(_in_learning_order())]
+
+    def learn(run, source, database, deadline):
+        left[0] -= 1
+        if not left[0]:                                           # the last database: Stop in a moment
+            def press():
+                _time.sleep(1.0)
+                with app.app_context():
+                    request_stop()
+            threading.Thread(target=press, daemon=True).start()
+        return {"complete": True, "fields": 1}
+
+    monkeypatch.setattr(enrich, "enrich", describe)
+    monkeypatch.setattr(learn_metrics, "learn_metrics", learn)
+    monkeypatch.setattr(learn_indices, "learn_indices", learn)
+    t0 = _time.time()
+    try:
+        out = run_learning(reason="test")
+    finally:
+        release.set()
+    assert out["status"] == "stopped" and _time.time() - t0 < 15
+    run = db.session.get(Run, out["run"])
+    assert run.status == "stopped" and len(run.stats["databases"]) == len(_in_learning_order())
+
+
+def test_the_wait_for_answers_ends_when_an_admin_stops_the_run(app, monkeypatch):
+    import time as _time
+
+    from superset.extensions import db
+
+    from supagent import priority
+    from supagent.knowledge import stopping
+    from supagent.knowledge.stopping import LearningStopped, request_stop, watching
+    from supagent.models import Run
+
+    monkeypatch.setattr(priority, "answers_running", lambda: 1)        # people are waiting for answers
+    monkeypatch.setattr(stopping, "CHECK_S", 0.1)
+    with app.app_context():
+        _no_runs()
+        run = Run(kind="learn", reason="test", status="running")
+        db.session.add(run)
+        db.session.commit()
+        request_stop()
+        t0 = _time.time()
+        with watching(run.id), pytest.raises(LearningStopped):
+            priority.wait_for_answers(max_wait=30, poll=0.05)
+        assert _time.time() - t0 < 3
+        assert priority.wait_for_answers(max_wait=0.2, poll=0.05) >= 0.2   # outside a run: it just waits
         _no_runs()

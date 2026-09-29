@@ -66,10 +66,17 @@ class Describer(threading.Thread):
             finally:
                 db.session.remove()
 
-    def finish(self, timeout: float) -> dict[str, Any]:
-        """Stop after the LLM request in progress; what it wrote."""
+    def finish(self, timeout: float, watch: bool = False) -> dict[str, Any]:
+        """Stop after the LLM request in progress; what it wrote. watch: an admin's Stop ends the
+        wait at once (LearningStopped in the learner; the LLM request ends in the background)."""
+        from supagent.knowledge.stopping import check
+
         self.done.set()
-        self.join(timeout)
+        end = time.time() + timeout
+        while self.is_alive() and time.time() < end:
+            self.join(min(1.0, max(0.0, end - time.time())))
+            if watch:
+                check()
         if self.is_alive():
             self.out["still_running"] = True
         return self.out

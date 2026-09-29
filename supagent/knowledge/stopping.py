@@ -1,8 +1,9 @@
 """Stopping a learning run: the Stop button of the settings page (or `superset supagent learn
---stop`) marks the running run "stopping"; the run looks at its status before each request to a
-database, each LLM request and each step (every few seconds at most) and ends as "stopped",
-keeping what it already learned. A new run can start once it stopped (or, if its process died,
-STOP_GRACE seconds after the Stop).
+--stop`) marks the running run "stopped" at once, so that a new run can start right away (also
+when the run's process died: a restart during a run). The run looks at its status before each
+request to a database, each LLM request, each step and while it waits (every few seconds at
+most), and ends, keeping what it learned; the request or LLM call in progress at that moment
+finishes in the background. Runs marked "stopping" by an older version are still honoured.
 
 LearningStopped is not an Exception (like KeyboardInterrupt): the learning code catches
 Exception to go on after a failed request, and must never record a stop as such a failure."""
@@ -71,18 +72,19 @@ def check(force: bool = False) -> None:
 
 
 def request_stop() -> int | None:
-    """Mark the running learning run as stopping; its id, or None when no run is running."""
+    """Mark the running learning run as stopped, at once; its id, or None when no run is running."""
     from superset import db
 
     from supagent.models import Run
 
-    run = (db.session.query(Run).filter(Run.kind == "learn", Run.status == "running")
+    run = (db.session.query(Run).filter(Run.kind == "learn", Run.status.in_(("running", "stopping")))
            .order_by(Run.id.desc()).first())
     if run is None:
         return None
-    n = (db.session.query(Run).filter(Run.id == run.id, Run.status == "running")
-         .update({"status": "stopping", "error": f"{ASKED}{dt.datetime.utcnow():%Y-%m-%d %H:%M:%S} UTC"},
-                 synchronize_session=False))
+    now = dt.datetime.utcnow()
+    n = (db.session.query(Run).filter(Run.id == run.id, Run.status.in_(("running", "stopping")))
+         .update({"status": "stopped", "finished_at": now,
+                  "error": f"stopped by an admin at {now:%Y-%m-%d %H:%M:%S} UTC"}, synchronize_session=False))
     db.session.commit()
     return run.id if n else None
 

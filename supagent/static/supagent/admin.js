@@ -224,7 +224,7 @@
     btn.disabled = true;
     S.admin("POST", "learn/stop", {}).then(function (r) {
       btn.disabled = false;
-      res.textContent = r.error || "stopping run #" + r.stopping + ": it keeps what it learned; Learn now starts a new one once it stopped";
+      res.textContent = r.error || "run #" + r.stopped + " stopped: it keeps what it learned; Learn now starts a new one";
       res.className = "result " + (r.error ? "bad" : "good");
       setTimeout(runs, 1000);
     });

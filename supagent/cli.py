@@ -180,8 +180,8 @@ def learn(databases: tuple[str, ...], no_llm: bool, minutes: int | None, plan: b
         from supagent.knowledge.stopping import request_stop
 
         run_id = request_stop()
-        click.echo(f"stopping learning run {run_id}: it ends at its next step" if run_id else
-                   "no learning run is running")
+        click.echo(f"learning run {run_id} stopped: it keeps what it learned (its request in progress ends in "
+                   "the background); a new run can start" if run_id else "no learning run is running")
         return
     if plan:
         from supagent.security import acting_as

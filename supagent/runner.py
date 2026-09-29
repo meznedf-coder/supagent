@@ -64,6 +64,20 @@ def _files_of(trace: list[dict]) -> list[dict]:
 
 RESULT_ROWS = 5000        # rows of one query result kept for the page (table, chart, CSV / Excel)
 RESULTS_KEPT = 6
+QUERIES_ANSWERS = 2       # the next questions see the queries behind the last two answers
+QUERIES_PER_ANSWER = 2
+
+
+def queries_of(results: list | None) -> list[dict]:
+    """The queries that gave the rows an answer showed (the last ones that returned rows), with the
+    database and the time window: what "that finding" is for the next question."""
+    out = []
+    for r in [r for r in results or [] if r.get("row_count")][-QUERIES_PER_ANSWER:]:
+        q = {k: r[k] for k in ("tool", "database", "database_id", "start", "end", "step") if r.get(k)}
+        q.update(query=str(r.get("sql") or "")[:700], columns=list(r.get("columns") or [])[:10],
+                 rows=r.get("row_count"))
+        out.append(q)
+    return out
 
 
 def _promql_rows(res: dict) -> tuple[list[str], list[list]]:
@@ -102,7 +116,9 @@ def _results_of(trace: list[dict]) -> list[dict]:
                     "database_id": req.get("database_id")}
         elif tool == "promql_query":
             columns, rows = _promql_rows(res)
-            item = {"tool": tool, "sql": args.get("expr") or res.get("expr"), "database": res.get("database")}
+            item = {"tool": tool, "sql": args.get("expr") or res.get("expr"), "database": res.get("database"),
+                    "database_id": res.get("database_id")}
+            item.update({k: res[k] for k in ("start", "end", "step") if res.get(k)})   # the finding's window
         else:
             continue
         if not columns:
@@ -209,8 +225,11 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
     earlier = (db.session.query(Message).filter(Message.conversation_id == conv.id, Message.id < message_id)
                .order_by(Message.id).all())
     question = next((m.content for m in reversed(earlier) if m.role == "user"), "")
-    history = [{"role": m.role, "content": m.content} for m in earlier[:-1]
-               if m.status == "done" and m.content]
+    done = [m for m in earlier[:-1] if m.status == "done" and m.content]
+    history = [{"role": m.role, "content": m.content} for m in done]
+    with_rows = [(h, m) for h, m in zip(history, done) if m.role == "assistant" and m.results]
+    for h, m in with_rows[-QUERIES_ANSWERS:]:            # "that finding": the queries behind the last answers
+        h["queries"] = queries_of(m.results)
 
     def on_step(trace: list[dict]) -> None:
         if not _save(message_id, steps=_steps_for_page(trace)):
@@ -236,6 +255,14 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
                 answer, trace = agent.ask(question, history)
             finally:
                 agent.close()
+            try:
+                from supagent.tools_superset import drop_unused_datasets
+
+                dropped = drop_unused_datasets(trace)       # datasets of tries that did not make the chart
+                if dropped:
+                    log.info("supagent: answer %s: unused datasets %s deleted", message_id, dropped)
+            except Exception:  # pylint: disable=broad-except
+                db.session.rollback()
             if should_stop():
                 raise Cancelled("stopped by the user")
             files = _keep_files(message_id, _files_of(trace))

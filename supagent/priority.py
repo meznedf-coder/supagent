@@ -31,8 +31,12 @@ def answers_running() -> int:
 
 
 def wait_for_answers(max_wait: float = WAIT_S, poll: float = POLL_S) -> float:
-    """Wait while answers are being computed; returns the seconds waited."""
+    """Wait while answers are being computed; returns the seconds waited. A learning run that an
+    admin stops ends its wait at once (LearningStopped)."""
+    from supagent.knowledge.stopping import check
+
     t0 = time.time()
     while time.time() - t0 < max_wait and answers_running():
+        check()
         time.sleep(poll)
     return round(time.time() - t0, 1)
