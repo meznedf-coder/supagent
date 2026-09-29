@@ -21,9 +21,14 @@ VECTOR_FLOOR = 0.35     # a piece found by meaning only must be at least this cl
 VECTOR_MARGIN = 0.2     # ... and not far behind the closest one: a weak neighbour is noise, not knowledge
 
 
+CONTEXT_PLACES = 5      # a Context page (partly AI-written) counts as found 5 places lower: on equal
+                        # relevance, the catalog and the documents come first
+
+
 def _allowed_query(kinds: tuple[str, ...] | None = None) -> Any:
     from flask import g
 
+    from supagent.knowledge.context import visible_pages
     from supagent.knowledge.curated import sources_of_user
     from supagent.security import visible_databases
 
@@ -34,9 +39,33 @@ def _allowed_query(kinds: tuple[str, ...] | None = None) -> Any:
          .filter(or_(Chunk.source_id.is_(None), Chunk.source_id.in_(sources)))
          .filter(or_(Chunk.database_id.is_(None), Chunk.database_id.in_(dbs)))
          .filter(or_(Chunk.scope == "team", and_(Chunk.scope == "user", Chunk.user_id == user_id))))
+    pages = [p.id for p in visible_pages()]                # a Context page: every database of it readable
+    q = q.filter(or_(Chunk.kind != "context", *[Chunk.ref.like(f"context:{i}#%") for i in pages]))
     if kinds:
         q = q.filter(Chunk.kind.in_(kinds))
     return q
+
+
+def _superset_allowed(c: Chunk) -> bool:
+    """A chart or dashboard piece only for a user Superset lets open it (and, for a dashboard, every chart
+    it lists): its database alone is not enough (dashboard roles, dataset access)."""
+    if c.kind not in ("chart", "dashboard"):
+        return True
+    try:
+        from superset.extensions import security_manager
+        from superset.models.dashboard import Dashboard
+        from superset.models.slice import Slice
+
+        parts = c.ref.split(":")
+        if parts[1] == "chart":
+            chart = db.session.get(Slice, int(parts[2]))
+            return chart is not None and bool(security_manager.can_access_chart(chart))
+        board = db.session.get(Dashboard, int(parts[2]))
+        return board is not None and bool(security_manager.can_access_dashboard(board)) and all(
+            security_manager.can_access_chart(sl) for sl in board.slices or [])
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        return False
 
 
 def _terms(query: str) -> list[str]:
@@ -64,15 +93,21 @@ def _lexical(q: Any, terms: list[str], limit: int = 50) -> list[int]:
     return [cid for _h, cid in sorted(scored, key=lambda x: -x[0])[:limit]]
 
 
-def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = None,
+           lower: dict[str, int] | None = None, skip: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    """The pieces for a query, best first. `lower`: kinds counted as found that many places lower
+    (default: the Context, CONTEXT_PLACES); `skip`: kinds left out."""
     from supagent.knowledge import embeddings as E
+
+    lower = {"context": CONTEXT_PLACES} if lower is None else lower
 
     k = int(k or settings.get("search.top_k"))
     q = _allowed_query(kinds)
-    ranks: dict[int, float] = {}
+    if skip:
+        q = q.filter(Chunk.kind.notin_(list(skip)))
+    found: list[tuple[int, int, str]] = []                # (chunk, rank, list)
     by_words = _lexical(q, _terms(query))
-    for rank, cid in enumerate(by_words):
-        ranks[cid] = ranks.get(cid, 0.0) + 1.0 / (RRF + rank)
+    found += [(cid, rank, "words") for rank, cid in enumerate(by_words)]
     by_meaning: set[int] = set()
     if E.enabled():
         try:
@@ -85,13 +120,19 @@ def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = Non
                 if score < floor and cid not in words:       # a weak neighbour found by meaning only
                     continue
                 by_meaning.add(cid)
-                ranks[cid] = ranks.get(cid, 0.0) + 1.0 / (RRF + rank)
+                found.append((cid, rank, "meaning"))
         except Exception as ex:  # pylint: disable=broad-except   (words still work)
             log.warning("supagent search: vectors not used: %s", ex)
-    best = sorted(ranks.items(), key=lambda x: -x[1])[:k]
+    ranks: dict[int, float] = {}
+    if found:
+        kinds_of = dict(db.session.query(Chunk.id, Chunk.kind).filter(Chunk.id.in_({cid for cid, _r, _l in found})))
+        for cid, rank, _list in found:
+            ranks[cid] = ranks.get(cid, 0.0) + 1.0 / (RRF + rank + lower.get(kinds_of.get(cid) or "", 0))
+    best = sorted(ranks.items(), key=lambda x: -x[1])[:k + 10]
     if not best:
         return []
     rows = {c.id: c for c in db.session.query(Chunk).filter(Chunk.id.in_([cid for cid, _s in best]))}
+    best = [(cid, sc) for cid, sc in best if cid in rows and _superset_allowed(rows[cid])][:k]
     words_found = set(by_words)
     out = []
     for cid, score in best:
@@ -104,10 +145,29 @@ def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = Non
     return out
 
 
-def knowledge_block(question: str) -> str:
-    """The knowledge relevant to a question, for the agent's prompt (short)."""
+OBJECT_KINDS = ("metric", "index")
+OBJECT_PLACES = 3       # in the knowledge found with a question: "Where the data is" gives the data first
+CONTEXT_LINES = 2       # at most, the pages about a subject of the question (an application...) first
+PAGE_WORDS = ("context ai written overview application data source inventory how the system works architecture "
+              "glossary rules and facts")
+
+
+SUPERSET_KINDS = ("chart", "dashboard")
+
+
+def knowledge_block(question: str, shown: set[str] | None = None, with_charts: bool = False) -> str:
+    """The knowledge relevant to a question, for the agent's prompt (short). `shown`: what the
+    other blocks give already (refs, titles of the metrics and indices): not given twice, nor a
+    metric or an index of the same name in another database, so that the room goes to the
+    catalog, the documents and the Context. Superset's charts and dashboards only `with_charts` (a
+    question about them, or about what is happening now)."""
+    shown = shown or set()
+    top_k = int(settings.get("search.top_k"))
     try:
-        found = search(question)
+        found = search(question, k=top_k + len(shown),     # data objects, charts: "Where the data is" and the
+                       lower={"context": CONTEXT_PLACES,     # tools give them; the room is for the team's words
+                              **{kind: OBJECT_PLACES for kind in OBJECT_KINDS + SUPERSET_KINDS}},
+                       skip=() if with_charts else SUPERSET_KINDS)    # charts: for questions about them
     except Exception as ex:  # pylint: disable=broad-except
         log.warning("supagent search: %s", ex)
         db.session.rollback()
@@ -118,6 +178,26 @@ def knowledge_block(question: str) -> str:
 
     gone = gone_names()
     found = [f for f in found if f["kind"] not in ("recipe", "memory") or not mentions_gone(f["text"], gone)]
+    given, kept = set(shown), []
+    for f in found:          # one line per metric or index name, glossary term, entry, document, page
+        key = f["title"] if f["kind"] in OBJECT_KINDS else (f["ref"] if f["kind"] == "glossary"
+                                                            else f["ref"].split("#")[0])
+        if key in given:
+            continue
+        given.add(key)
+        kept.append(f)
+    from supagent.knowledge.experience import words
+
+    asked, generic = words(question), words(PAGE_WORDS)
+
+    def about_it(f: dict[str, Any]) -> bool:          # a Context page named after a subject of the question
+        subject = words(f["title"]) - generic
+        return bool(subject) and subject <= asked
+
+    pages = [f for f in kept if f["kind"] == "context"]
+    pages = ([f for f in pages if about_it(f)] + [f for f in pages if not about_it(f)])[:CONTEXT_LINES]
+    found = [f for f in kept if f["kind"] != "context" or f in pages][:top_k]
+    found.sort(key=lambda f: f["kind"] == "context" and not about_it(f))   # the others' order kept
     budget = int(settings.get("search.prompt_chars"))
     lines = ["\n\nBackground that looks relevant to this question (from the data dictionary, the catalog, the "
              "team's learned answers and memory, the documents). It is a summary, not an answer: call "

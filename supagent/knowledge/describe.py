@@ -148,6 +148,8 @@ def _field_line(f: KObject) -> str:
             line += f", avg {_num(st.get('avg'))}"
     if st.get("filled_pct") is not None and st["filled_pct"] < 99.5:
         line += f" (filled in {st['filled_pct']}% of documents)"
+    if st.get("computed"):
+        line += f" ({st['computed']})"
     return line
 
 
@@ -389,9 +391,10 @@ def _metrics(src: Source, database: Any, ws: set[str], only: str | None, cat: di
     for lb in q.filter(KObject.kind == "label", KObject.name == "__tenant_id__").limit(50):
         tenants |= set((lb.stats or {}).get("values") or [])
     if len(tenants) > 1:
-        out.append(f"  tenants: {', '.join(sorted(tenants)[:40])} (Mimir tenant federation): every series has the "
-                   "label __tenant_id__; keep it in GROUP BY (__tenant_id__, node) so that the same name in two "
-                   "tenants stays apart, filter with WHERE __tenant_id__ = '...'.")
+        out.append(f"  tenants: {', '.join(sorted(tenants)[:40])} (Mimir tenant federation; each tenant is usually a "
+                   "different application or subject): every series has the label __tenant_id__; keep it in GROUP "
+                   "BY (__tenant_id__, node) so that the same name in two tenants stays apart, filter with WHERE "
+                   "__tenant_id__ = '...' for one of them, never add tenants up unless asked.")
     label_ids = [i for (i,) in db.session.query(KObject.id).filter(
         KObject.source_id == src.id, KObject.kind == "label", KObject.gone_at.is_(None)).limit(20000)]
     measured = []
@@ -525,19 +528,23 @@ def describe(topic: str | None = None, name: str | None = None) -> str | None:
     return "\n".join(x for x in out if x is not None)[:MAX_CHARS]
 
 
-def changes(days: int = 7, limit: int = 200) -> list[dict[str, Any]]:
-    """What the learning runs found different in the last days, for the user's databases."""
+def changes(days: int = 7, limit: int = 200, offset: int = 0, total: dict[str, int] | None = None
+            ) -> list[dict[str, Any]]:
+    """What the learning runs found different in the last days, for the user's databases, newest
+    first (`offset` for the next pages; `total` receives how many there are in all)."""
     from supagent.knowledge.curated import sources_of_user
 
     ids = {s.id: s for s in sources_of_user()}
     if not ids:
         return []
     since = dt.datetime.utcnow() - dt.timedelta(days=max(1, int(days)))
-    rows = (db.session.query(Change, KObject, Run)
-            .join(KObject, KObject.id == Change.object_id)
-            .join(Run, Run.id == Change.run_id)
-            .filter(Change.at >= since, KObject.source_id.in_(list(ids)))
-            .order_by(Change.id.desc()).limit(limit).all())
+    q = (db.session.query(Change, KObject, Run)
+         .join(KObject, KObject.id == Change.object_id)
+         .join(Run, Run.id == Change.run_id)
+         .filter(Change.at >= since, KObject.source_id.in_(list(ids))))
+    if total is not None:
+        total["total"] = q.count()
+    rows = q.order_by(Change.id.desc()).offset(max(0, offset)).limit(limit).all()
     return [{"at": c.at.strftime("%Y-%m-%d %H:%M"), "change": c.change, "kind": o.kind,
              "name": o.name, "parent": o.parent or None, "database": ids[o.source_id].database_name,
              "detail": c.detail or {}, "run": r.id} for c, o, r in rows]

@@ -15,12 +15,15 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 from typing import Any
 
 from flask import Response, g, request
 from flask_appbuilder import BaseView, expose
 from flask_appbuilder.security.decorators import has_access, has_access_api
+
+log = logging.getLogger(__name__)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ADMIN_VIEW = "AIAgentAdmin"
@@ -58,15 +61,36 @@ def abort(code: int) -> None:
 def _sync_chunks(prefix: str) -> None:
     """The searchable pieces follow a change (words at once, vectors at the next indexing)."""
     try:
-        from supagent.knowledge.index import embed_pending, sync
+        from supagent.knowledge.index import sync
 
-        out = sync((prefix,))
-        if 0 < out.get("added", 0) + out.get("changed", 0) <= 64:
-            embed_pending(limit=64)             # a few new pieces: their vectors at once
+        _embed_few(sync((prefix,)))
     except Exception:  # pylint: disable=broad-except
         from superset import db
 
         db.session.rollback()
+
+
+def _embed_few(out: dict[str, int]) -> None:
+    from supagent.knowledge.index import embed_few
+
+    embed_few(out)
+
+
+def _catalog_changed(before: dict) -> dict:
+    """After a change of the catalog: the dictionary and the searchable pieces in step at once."""
+    from supagent.knowledge.curated import after_change
+
+    try:
+        out = after_change(before)
+        _embed_few(out.get("pieces") or {})
+    except Exception:  # pylint: disable=broad-except
+        from superset import db
+
+        db.session.rollback()
+        log.warning("supagent: catalog applied to the dictionary: failed", exc_info=True)
+        return {}
+    out.pop("pieces", None)
+    return out
 
 
 def _is_admin() -> bool:
@@ -157,7 +181,7 @@ class ChatView(BaseView):
         final = m.status in ("done", "error", "cancelled")
         return {"id": m.id, "role": m.role, "status": m.status, "content": m.content or "",
                 "html": render_markdown(m.content or "") if m.role == "assistant" else None,
-                "steps": m.steps or [], "files": files, "feedback": m.feedback,
+                "steps": m.steps or [], "files": files, "feedback": m.feedback, "feedback_reason": m.feedback_reason,
                 "results": (m.results or []) if final else [],
                 "created_at": m.created_at, "finished_at": m.finished_at}
 
@@ -355,16 +379,18 @@ class ChatView(BaseView):
         if m is None or (not _is_admin() and not (m.user_id == g.user.id and (m.scope == "user" or
                                                                               m.status == "proposed"))):
             abort(404)
-        m.status = "disabled"
+        db.session.delete(m)                     # removed (Disable keeps a team one without using it)
         db.session.commit()
         _sync_chunks("memory:")
-        return _json({"disabled": mem_id})
+        return _json({"deleted": mem_id})
 
     @expose("/api/messages/<int:mid>/feedback", methods=("POST",))
     @has_access_api
     def feedback(self, mid: int) -> Response:
         """Helpful (+1) makes a learned answer of it (in the background: the LLM writes its generic
-        question), for an admin to confirm or reject; Not helpful (-1) or 0 takes it back."""
+        question), for an admin to confirm or reject; Not helpful (-1) or 0 takes it back. With Not
+        helpful, `reason` (what was wrong) is kept for the admins (superset supagent gaps) and what it
+        says about the data is proposed to the memory (a team point waits for an admin)."""
         from superset import db
 
         from supagent.models import Example, Message
@@ -373,8 +399,19 @@ class ChatView(BaseView):
         if m is None or m.role != "assistant":
             abort(404)
         self._conversation(m.conversation_id)
-        value = int(_body().get("value") or 0)
+        body = _body()
+        value = int(body.get("value") or 0)
+        reason = " ".join(str(body.get("reason") or "").split())[:1000]
+        if reason and value == -1 and m.feedback == -1:          # the reason of a Not helpful given before
+            m.feedback_reason = reason
+            db.session.commit()
+            from supagent.tasks import dispatch_memory
+
+            dispatch_memory(m.id)                    # what it says about the data: to the memory
+            return _json({"feedback": m.feedback, "feedback_reason": m.feedback_reason, "example_kept": False,
+                          "recipes": 0})
         m.feedback = value if value in (-1, 1) else None
+        m.feedback_reason = (reason or None) if value == -1 else None
         db.session.query(Example).filter_by(message_id=m.id).delete(synchronize_session=False)
         kept = False
         if value == 1:
@@ -406,7 +443,10 @@ class ChatView(BaseView):
                 from supagent.knowledge.experience import forget_associations
 
                 forget_associations(m.id)            # nor where its data was
-        return _json({"feedback": m.feedback, "example_kept": kept, "recipes": recipes})
+                if m.feedback_reason:
+                    dispatch_memory(m.id)
+        return _json({"feedback": m.feedback, "feedback_reason": m.feedback_reason, "example_kept": kept,
+                      "recipes": recipes})
 
     @expose("/api/files/<int:fid>", methods=("GET",))
     @has_access_api
@@ -428,6 +468,16 @@ class ChatView(BaseView):
         headers = {"Content-Disposition": content_disposition("inline" if inline else "attachment", f.name or "file"),
                    "Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"}
         return Response(f.data, mimetype=f.mime or "application/octet-stream", headers=headers)
+
+
+def _page_args(default_size: int = 50) -> tuple[int, int]:
+    """The page (from 0) and its size asked by a list of the pages."""
+    try:
+        page = max(0, int(request.args.get("page") or 0))
+        size = min(200, max(5, int(request.args.get("size") or default_size)))
+    except ValueError:
+        page, size = 0, default_size
+    return page, size
 
 
 def _visible_databases() -> set[int]:
@@ -492,19 +542,22 @@ class _RecipesMixin:
     @expose("/api/timings", methods=("GET",))
     @has_access_api
     def timings(self) -> Response:
+        from sqlalchemy import false, or_
         from superset import db
 
         from supagent.models import QueryStat
 
         visible, admin = _visible_databases(), _is_admin()
-        rows = (db.session.query(QueryStat).order_by(QueryStat.max_seconds.desc()).limit(300).all())
+        page, size = _page_args()
+        q = db.session.query(QueryStat).filter(or_(QueryStat.database_id.in_(list(visible) or [-1]),
+                                                   QueryStat.database_id.is_(None) if admin else false()))
+        rows = q.order_by(QueryStat.max_seconds.desc(), QueryStat.id).offset(page * size).limit(size).all()
         return _json({"timings": [{"target": r.target, "database_id": r.database_id, "pattern": r.pattern,
                                    "calls": r.calls, "errors": r.errors, "avg_seconds": round((r.total_seconds or 0) /
                                                                                           max(r.calls or 1, 1), 2),
                                    "max_seconds": r.max_seconds, "last_error": r.last_error, "last_at": r.last_at,
-                                   "last_query": r.last_query if admin else None}
-                                  for r in rows if r.database_id in visible or (admin and not r.database_id)],
-                      "is_admin": admin})
+                                   "last_query": r.last_query if admin else None} for r in rows],
+                      "total": q.count(), "page": page, "size": size, "is_admin": admin})
 
 
 class KnowledgeView(_RecipesMixin, BaseView):
@@ -513,7 +566,9 @@ class KnowledgeView(_RecipesMixin, BaseView):
     class_permission_name = "AIAgentDictionary"
     method_permission_name = {"index": "read", "summary": "read", "objects": "read", "obj": "read",
                               "changes": "read", "relations": "read", "edit": "write", "recipes": "read",
-                              "set_recipe": "write", "timings": "read", "search": "read", "set_relation": "write"}
+                              "set_recipe": "write", "timings": "read", "search": "read", "set_relation": "write",
+                              "knowledge": "read", "agent_knowledge": "read", "context": "read",
+                              "context_page": "read", "context_edit": "write", "context_build": "write"}
 
     @expose("/api/search", methods=("GET",))
     @has_access_api
@@ -683,7 +738,17 @@ class KnowledgeView(_RecipesMixin, BaseView):
             syn = body.get("synonyms")
             o.synonyms = [s.strip() for s in (syn if isinstance(syn, list) else str(syn or "").split(","))
                           if str(s).strip()] or None
+        from supagent.knowledge.freshness import touch
+
+        touch()                                  # every server: the next answer uses it
         db.session.commit()
+        try:                                     # and the agent's search finds it at once
+            from supagent.knowledge.index import sync_objects
+
+            _embed_few(sync_objects([o.id]))
+        except Exception:  # pylint: disable=broad-except
+            db.session.rollback()
+            log.warning("supagent: search pieces of %s: not written", o.name, exc_info=True)
         return _json(_obj_row(o, self._sources()))
 
     @expose("/api/changes", methods=("GET",))
@@ -691,7 +756,155 @@ class KnowledgeView(_RecipesMixin, BaseView):
     def changes(self) -> Response:
         from supagent.knowledge.describe import changes
 
-        return _json({"changes": changes(int(request.args.get("days") or 7), limit=500)})
+        page, size = _page_args()
+        total: dict[str, int] = {}
+        rows = changes(int(request.args.get("days") or 7), limit=size, offset=page * size, total=total)
+        return _json({"changes": rows, "total": total.get("total", 0), "page": page, "size": size})
+
+    @expose("/api/knowledge", methods=("GET",))
+    @has_access_api
+    def knowledge(self) -> Response:
+        """What the team gave the agent, read only (the settings page changes it): the catalog
+        entries, the documents and sites, the team memory (approved). A formula the agent learned
+        on a database is shown only to the users who may query that database."""
+        from superset import db
+
+        from supagent.knowledge.catalog import AGENT
+        from supagent.models import Doc, Entry, Memory
+
+        dbs = _visible_databases()
+        entries = []
+        for e in (db.session.query(Entry).filter(Entry.deleted_at.is_(None), Entry.enabled.is_(True))
+                  .order_by(Entry.classification, Entry.category, Entry.title)):
+            database_id = (e.evidence or {}).get("database_id")
+            if database_id is not None and int(database_id) not in dbs:
+                continue
+            entries.append({"id": e.id, "title": e.title, "classification": e.classification, "category": e.category,
+                            "fmt": e.fmt, "content": e.content or "", "updated_at": e.updated_at,
+                            "by": "the agent" if e.updated_by == AGENT else (e.updated_by or e.created_by or "")})
+        docs = [{"id": d.id, "title": d.title or d.url or f"document {d.id}", "kind": d.kind, "url": d.url,
+                 "category": d.category, "status": d.status, "pages": len(d.pages or []) or None,
+                 "chars": len(d.content or ""), "excerpt": (d.content or "")[:1500], "fetched_at": d.fetched_at}
+                for d in db.session.query(Doc).filter(Doc.enabled.is_(True)).order_by(Doc.title)]
+        team = [{"id": m.id, "kind": m.kind, "text": m.text, "category": m.category, "created_at": m.created_at}
+                for m in (db.session.query(Memory).filter(Memory.scope == "team", Memory.status == "active")
+                          .order_by(Memory.created_at.desc()))]
+        return _json({"entries": entries, "docs": docs, "team_memory": team})
+
+    @expose("/api/agent_knowledge", methods=("GET",))
+    @has_access_api
+    def agent_knowledge(self) -> Response:
+        """What the agent learned by itself, on the databases this user may query: its catalog
+        entries (with their evidence), where the data is from the answers (a word of the questions
+        and the metric or index that answered them), the AI descriptions still to verify, the
+        relations it measured."""
+        from sqlalchemy import func
+        from superset import db
+
+        from supagent.knowledge.catalog import AGENT
+        from supagent.models import Association, Entry, KObject, Relation, Source
+
+        dbs = _visible_databases()
+        names = {s.id: s for s in db.session.query(Source).filter(Source.database_id.in_(dbs or [-1]))}
+        entries = []
+        for e in db.session.query(Entry).filter(Entry.deleted_at.is_(None), Entry.updated_by == AGENT) \
+                .order_by(Entry.updated_at.desc()):
+            database_id = (e.evidence or {}).get("database_id")
+            if database_id is not None and int(database_id) not in dbs:
+                continue
+            entries.append({"id": e.id, "title": e.title, "classification": e.classification, "category": e.category,
+                            "content": e.content or "", "origin": e.origin, "evidence": e.evidence or {},
+                            "enabled": bool(e.enabled), "updated_at": e.updated_at})
+        by_db = {s.database_id: s.database_name for s in names.values()}
+        words = [{"word": a.word, "database": by_db.get(a.database_id, a.database_id), "kind": a.kind,
+                  "parent": a.parent, "name": a.name, "uses": a.uses, "updated_at": a.updated_at}
+                 for a in (db.session.query(Association).filter(Association.database_id.in_(dbs or [-1]))
+                           .order_by(Association.uses.desc(), Association.updated_at.desc()).limit(300))]
+        unverified = (db.session.query(KObject.source_id, func.count(KObject.id))
+                      .filter(KObject.source_id.in_(list(names) or [-1]), KObject.description_source == "llm",
+                              KObject.verified.is_(False), KObject.gone_at.is_(None))
+                      .group_by(KObject.source_id).all())
+        measured = (db.session.query(func.count(Relation.id)).join(KObject, KObject.id == Relation.a_id)
+                    .filter(Relation.origin == "learned", Relation.rejected_at.is_(None),
+                            KObject.source_id.in_(list(names) or [-1])).scalar())
+        return _json({"entries": entries, "associations": words,
+                      "to_verify": [{"source_id": sid, "database": names[sid].database_name, "count": n}
+                                    for sid, n in unverified if sid in names],
+                      "relations_measured": int(measured or 0)})
+
+    @expose("/api/context", methods=("GET",))
+    @has_access_api
+    def context(self) -> Response:
+        """The Context pages this user may read (each database of a page is one they may query), and
+        the last build."""
+        from superset import db
+
+        from supagent import settings
+        from supagent.knowledge.context import visible_pages
+        from supagent.models import Run
+
+        pages = [{"id": p.id, "section": p.section, "slug": p.slug, "title": p.title, "kind": p.kind,
+                  "author": p.author or "agent", "ai": p.kind == "summary" and (p.author or "agent") == "agent",
+                  "version": p.version, "updated_at": p.updated_at} for p in visible_pages()]
+        last = db.session.query(Run).filter(Run.kind == "context").order_by(Run.id.desc()).first()
+        return _json({"pages": pages, "enabled": bool(settings.get("context.enabled")),
+                      "hour": settings.get("context.hour"),
+                      "last_build": {"id": last.id, "status": last.status, "started_at": last.started_at,
+                                     "finished_at": last.finished_at} if last else None})
+
+    @expose("/api/context/<int:pid>", methods=("GET",))
+    @has_access_api
+    def context_page(self, pid: int) -> Response:
+        from supagent.knowledge.context import visible_pages
+
+        p = next((x for x in visible_pages() if x.id == pid), None)
+        if p is None:
+            abort(404)
+        return _json({"id": p.id, "section": p.section, "title": p.title, "kind": p.kind, "author": p.author or "agent",
+                      "ai": p.kind == "summary" and (p.author or "agent") == "agent", "content": p.content or "",
+                      "html": render_markdown(p.content or ""), "sources": p.sources or [], "version": p.version,
+                      "updated_at": p.updated_at, "llm_calls": p.llm_calls, "tokens": p.tokens})
+
+    @expose("/api/context/<int:pid>", methods=("POST",))
+    @has_access_api
+    def context_edit(self, pid: int) -> Response:
+        """Admins: correct a page (it is then theirs: the agent never writes over it), or give it
+        back to the agent ({"reset": true}: written again at the next build)."""
+        import datetime as dt
+
+        from superset import db
+
+        from supagent.knowledge.context import visible_pages
+        from supagent.models import ContextPage
+
+        if next((x for x in visible_pages() if x.id == pid), None) is None:
+            abort(404)
+        p = db.session.get(ContextPage, pid)
+        body = _body()
+        if body.get("reset"):
+            p.author, p.input_hash = "agent", None
+        else:
+            text = str(body.get("content") or "").strip()
+            if not text:
+                return _json({"error": "empty page"}, 400)
+            p.content, p.author = text, g.user.username
+            p.version, p.updated_at = (p.version or 0) + 1, dt.datetime.utcnow()
+        db.session.commit()
+        _sync_chunks("context:")
+        return _json({"id": p.id, "author": p.author, "version": p.version})
+
+    @expose("/api/context/build", methods=("POST",))
+    @has_access_api
+    def context_build(self) -> Response:
+        """Admins: build the Context now (a run of kind "context" in the runs list)."""
+        from supagent.knowledge.learner import running_run
+        from supagent.tasks import dispatch_context
+
+        busy = running_run()
+        if busy is not None:
+            name = "a context build" if busy.kind == "context" else "a learning run"
+            return _json({"error": f"{name} is running (run {busy.id}): the Context is built after it"}, 409)
+        return _json({"started": dispatch_context("manual")})
 
     @expose("/api/relations", methods=("GET",))
     @has_access_api
@@ -708,7 +921,9 @@ class KnowledgeView(_RecipesMixin, BaseView):
                                               Relation.relation != "family_part")
         if not admin:
             q = q.filter(Relation.rejected_at.is_(None))
-        rels = q.order_by(Relation.origin, Relation.confidence.desc()).limit(1000).all()
+        page, size = _page_args()
+        total = q.count()
+        rels = q.order_by(Relation.origin, Relation.confidence.desc(), Relation.id).offset(page * size).limit(size).all()
         ends = {r.a_id for r in rels} | {r.b_id for r in rels}
         objs = {x.id: x for x in db.session.query(KObject).filter(KObject.id.in_(ends))} if ends else {}
         out = []
@@ -720,7 +935,7 @@ class KnowledgeView(_RecipesMixin, BaseView):
                         "evidence": r.evidence or {}, "text": _relation_text(r, a, b),
                         "rejected": r.rejected_at is not None, "rejected_by": r.rejected_by,
                         "a": _obj_row(a, sources), "b": _obj_row(b, sources)})
-        return _json({"relations": out, "is_admin": admin})
+        return _json({"relations": out, "total": total, "page": page, "size": size, "is_admin": admin})
 
     @expose("/api/relations/<int:rid>", methods=("POST",))
     @has_access_api
@@ -766,7 +981,8 @@ class AdminView(BaseView):
                               "entries": "read", "create_entry": "write", "update_entry": "write",
                               "delete_entry": "write", "entry_history": "read", "restore_entry": "write",
                               "export_catalog": "read", "team_memory": "read", "set_memory": "write",
-                              "docs": "read", "add_doc": "write", "refresh_doc": "write", "delete_doc": "write"}
+                              "docs": "read", "add_doc": "write", "refresh_doc": "write", "delete_doc": "write",
+                              "usage": "read", "usage_data": "read"}
 
     # ---- team memory
     @expose("/api/memory", methods=("GET",))
@@ -909,6 +1125,34 @@ class AdminView(BaseView):
     def index(self) -> Any:
         return self.render_template("supagent/admin.html", nav=_nav("admin"))
 
+    @expose("/usage")
+    @has_access
+    def usage(self) -> Any:
+        """The LLM usage page (admins): tokens, calls, context sizes, per person, per task, over time."""
+        return self.render_template("supagent/usage.html", nav=_nav("usage"))
+
+    @expose("/api/usage", methods=("GET",))
+    @has_access_api
+    def usage_data(self) -> Response:
+        """?start=&end= (ISO, UTC; default the last 24 hours) &grain=hour|day &tz= (the browser's offset in
+        minutes, for the buckets)."""
+        from supagent.knowledge.usage import report
+
+        def when(name: str, default: dt.datetime) -> dt.datetime:
+            text = str(request.args.get(name) or "").strip().replace("Z", "")
+            try:
+                return dt.datetime.fromisoformat(text) if text else default
+            except ValueError:
+                return default
+
+        end = when("end", dt.datetime.utcnow())
+        start = when("start", end - dt.timedelta(days=1))
+        if start >= end:
+            start = end - dt.timedelta(days=1)
+        grain = request.args.get("grain") or ("day" if end - start > dt.timedelta(days=3) else "hour")
+        tz = request.args.get("tz", type=int) or 0
+        return _json(report(start, end, grain, tz_offset_minutes=max(-900, min(900, tz))))
+
     @expose("/api/settings", methods=("GET",))
     @has_access_api
     def get_settings(self) -> Response:
@@ -945,7 +1189,10 @@ class AdminView(BaseView):
         from supagent.llm import LLM
 
         try:
-            return _json({"ok": True, **LLM().check()})
+            from supagent.llm import llm_task
+
+            with llm_task("test", user_id=g.user.id):
+                return _json({"ok": True, **LLM().check()})
         except Exception as ex:  # pylint: disable=broad-except
             return _json({"ok": False, "error": f"{type(ex).__name__}: {str(ex)[:800]}"})
 
@@ -958,7 +1205,8 @@ class AdminView(BaseView):
         busy = running_run()
         if busy is not None:
             what = "is stopping: try again in a moment" if busy.status == "stopping" else "is still running"
-            return _json({"error": f"learning run {busy.id} {what}", "running": busy.id}, 409)
+            name = "context build" if busy.kind == "context" else "learning run"
+            return _json({"error": f"{name} {busy.id} {what}", "running": busy.id}, 409)
         databases = _body().get("databases") or None
         return _json({"started": dispatch_learning("manual", databases)})
 
@@ -984,7 +1232,9 @@ class AdminView(BaseView):
 
         from supagent.models import KObject
 
-        rows = db.session.query(Run).order_by(Run.id.desc()).limit(30).all()
+        page, size = _page_args(15)
+        total = db.session.query(Run).count()
+        rows = db.session.query(Run).order_by(Run.id.desc()).offset(page * size).limit(size).all()
         counts = dict(db.session.query(Change.run_id, func.count(Change.id))
                       .filter(Change.run_id.in_([r.id for r in rows] or [-1])).group_by(Change.run_id).all())
         progress = {}
@@ -992,9 +1242,12 @@ class AdminView(BaseView):
             if r.status in ("running", "stopping") and r.started_at is not None:
                 progress[r.id] = {"new_objects": db.session.query(KObject)
                                   .filter(KObject.first_seen >= r.started_at).count()}
-        return _json({"runs": [{"id": r.id, "reason": r.reason, "status": r.status, "started_at": r.started_at,
-                                "finished_at": r.finished_at, "stats": r.stats or {}, "error": r.error,
-                                "changes": counts.get(r.id, 0), "progress": progress.get(r.id)} for r in rows]})
+        return _json({"runs": [{"id": r.id, "kind": r.kind, "reason": r.reason, "status": r.status,
+                                "started_at": r.started_at, "finished_at": r.finished_at, "stats": r.stats or {},
+                                "error": r.error, "changes": counts.get(r.id, 0), "progress": progress.get(r.id)}
+                               for r in rows], "total": total, "page": page, "size": size,
+                      "running": db.session.query(Run.id).filter(Run.status.in_(("running", "stopping")))
+                      .order_by(Run.id.desc()).limit(1).scalar()})
 
     # ---- the catalog, as separate entries
     @staticmethod
@@ -1035,27 +1288,28 @@ class AdminView(BaseView):
 
     def _save_entry(self, eid: int | None) -> Response:
         from supagent.knowledge.catalog import CatalogError, save_entry
-        from supagent.knowledge.curated import apply_catalog
+        from supagent.knowledge.curated import catalog_texts
 
         body = _body()
+        before = catalog_texts()
         try:
             e = save_entry(body, by=g.user.username, entry_id=eid, expected_version=body.get("version"))
         except CatalogError as ex:
             return _json({"error": str(ex)}, 409 if "changed meanwhile" in str(ex) else 400)
-        applied = apply_catalog() if e.classification != "note" else {}
-        _sync_chunks("entry:")
-        return _json({"entry": self._entry_json(e), "applied": applied})
+        return _json({"entry": self._entry_json(e), "applied": _catalog_changed(before)})
 
     @expose("/api/entries/<int:eid>", methods=("DELETE",))
     @has_access_api
     def delete_entry(self, eid: int) -> Response:
         from supagent.knowledge.catalog import CatalogError, delete_entry
+        from supagent.knowledge.curated import catalog_texts
 
+        before = catalog_texts()
         try:
             delete_entry(eid, by=g.user.username, expected_version=request.args.get("version", type=int))
         except CatalogError as ex:
             return _json({"error": str(ex)}, 409 if "changed meanwhile" in str(ex) else 404)
-        _sync_chunks("entry:")
+        _catalog_changed(before)
         return _json({"deleted": eid})
 
     @expose("/api/entries/<int:eid>/history", methods=("GET",))
@@ -1076,13 +1330,14 @@ class AdminView(BaseView):
     @has_access_api
     def restore_entry(self, eid: int) -> Response:
         from supagent.knowledge.catalog import CatalogError, restore_entry
-        from supagent.knowledge.curated import apply_catalog
+        from supagent.knowledge.curated import catalog_texts
 
+        before = catalog_texts()
         try:
             e = restore_entry(eid, int(_body().get("version") or 0), by=g.user.username)
         except CatalogError as ex:
             return _json({"error": str(ex)}, 404)
-        return _json({"entry": self._entry_json(e), "applied": apply_catalog()})
+        return _json({"entry": self._entry_json(e), "applied": _catalog_changed(before)})
 
     @expose("/api/catalog/export", methods=("GET",))
     @has_access_api
@@ -1097,15 +1352,16 @@ class AdminView(BaseView):
     def put_catalog(self) -> Response:
         """A whole catalog (YAML): split into entries (merge by title, or replace)."""
         from supagent.knowledge.catalog import CatalogError, import_catalog
-        from supagent.knowledge.curated import apply_catalog
+        from supagent.knowledge.curated import catalog_texts
 
         body = _body()
+        before = catalog_texts()
         try:
             counts = import_catalog(str(body.get("content") or ""), by=g.user.username,
                                     mode="replace" if body.get("mode") == "replace" else "merge")
         except CatalogError as ex:
             return _json({"error": str(ex)}, 400)
-        return _json({"imported": counts, "applied": apply_catalog()})
+        return _json({"imported": counts, "applied": _catalog_changed(before)})
 
     @expose("/api/status", methods=("GET",))
     @has_access_api

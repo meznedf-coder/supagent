@@ -60,17 +60,27 @@ def catalog_texts() -> dict[tuple[str, str, str], dict[str, Any]]:
     return out
 
 
-def apply_catalog() -> dict[str, int]:
+def apply_catalog(changed: set[int] | None = None) -> dict[str, int]:
+    """The catalog's descriptions, units, synonyms and relationships written on the dictionary's
+    objects (`changed` gets the ids of the objects it changed)."""
     cat = load_catalog()
     out = {"curated": 0, "relations": 0}
+    changed = set() if changed is None else changed
+
+    def curate(obj: KObject, *args: Any) -> int:
+        if _curate(obj, *args):
+            changed.add(obj.id)
+            return 1
+        return 0
+
     for index, spec in (cat.get("indices") or {}).items():
         for obj in _objects("index", index):
-            out["curated"] += _curate(obj, spec.get("description"))
+            out["curated"] += curate(obj, spec.get("description"))
         for fname, fspec in (spec.get("fields") or {}).items():
             fspec = fspec if isinstance(fspec, dict) else {"description": str(fspec)}
             for obj in _objects("field", fname, index):
-                out["curated"] += _curate(obj, fspec.get("description") or fspec.get("label"),
-                                          fspec.get("unit"), fspec.get("synonyms"))
+                out["curated"] += curate(obj, fspec.get("description") or fspec.get("label"),
+                                         fspec.get("unit"), fspec.get("synonyms"))
         for rel in spec.get("relationships") or []:
             for a_field, b_field in (rel.get("keys") or {}).items():
                 for a in _objects("field", a_field, index):
@@ -82,11 +92,11 @@ def apply_catalog() -> dict[str, int]:
     for name, spec in (metrics.get("tables") or {}).items():
         spec = spec or {}
         for obj in _objects("metric", name):
-            out["curated"] += _curate(obj, spec.get("description"), spec.get("unit"), spec.get("synonyms"),
-                                      spec.get("category"))
+            out["curated"] += curate(obj, spec.get("description"), spec.get("unit"), spec.get("synonyms"),
+                                     spec.get("category"))
         for label, text in (spec.get("labels") or {}).items():
             for obj in _objects("label", label, name):
-                out["curated"] += _curate(obj, str(text))
+                out["curated"] += curate(obj, str(text))
     for rel in metrics.get("label_relationships") or []:
         fields = _objects("field", rel.get("field", ""), rel.get("index", ""))
         labels = _objects("label", rel.get("label", ""))
@@ -99,7 +109,51 @@ def apply_catalog() -> dict[str, int]:
                 relate(lb, f, "curated", {"description": rel.get("description", ""), "label": lb.name,
                                           "field": f.name, "index": f.parent}, 1.0, origin="curated")
                 out["relations"] += 1
+    if out["curated"]:
+        from supagent.knowledge.freshness import touch
+
+        touch()                                    # every process: the new descriptions at once
     db.session.commit()
+    return out
+
+
+def release(before: dict[tuple[str, str, str], dict[str, Any]]) -> set[int]:
+    """The descriptions the catalog gave (`before`, catalog_texts() before a change) and no longer
+    gives: taken back from the objects (the learner describes them again), unless a person wrote
+    another one since. Returns the ids of the objects changed."""
+    now = catalog_texts()
+    out: set[int] = set()
+    for (kind, parent, name), spec in before.items():
+        old = str((spec or {}).get("description") or "").strip()
+        if not old or str((now.get((kind, parent, name)) or {}).get("description") or "").strip():
+            continue
+        for obj in _objects(kind, name, parent if kind in ("field", "label") else None):
+            if obj.description_source == "curated" and (obj.description or "").strip() == old:
+                obj.description, obj.description_source, obj.verified = None, None, False
+                out.add(obj.id)
+    if out:
+        from supagent.knowledge.freshness import touch
+
+        touch()
+    db.session.commit()
+    return out
+
+
+def after_change(before: dict[tuple[str, str, str], dict[str, Any]]) -> dict[str, Any]:
+    """After a change of the catalog (an entry saved, deleted, restored, a catalog imported): its
+    descriptions on the dictionary, the ones it no longer gives taken back, and the searchable
+    pieces of the entries and of the objects concerned made again at once."""
+    from supagent.knowledge.index import sync, sync_objects
+
+    changed: set[int] = set()
+    out: dict[str, Any] = apply_catalog(changed)
+    released = release(before)
+    out["released"] = len(released)
+    pieces = sync(("entry:",))
+    if changed | released:
+        more = sync_objects(changed | released)
+        pieces = {k: pieces.get(k, 0) + more.get(k, 0) for k in set(pieces) | set(more)}
+    out["pieces"] = pieces
     return out
 
 

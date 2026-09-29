@@ -83,7 +83,7 @@ def test_the_agent_sees_what_that_finding_was(ctx, monkeypatch):
 
     subjects: list[str] = []
     a, _ran = agent_with(monkeypatch, [say("Saved."), say("Saved.")])
-    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q: subjects.append(q) or "")
+    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q, shown=None: subjects.append(q) or "")
     earlier = "Show me the CPU usage of host srv-amer-002 over the last 12 hours."
     answer = "CPU climbed from 12% to 42%.\n\n```sql\nSELECT cpu_busy_pct FROM x\n```"
     history = [{"role": "user", "content": earlier},
@@ -100,7 +100,7 @@ def test_the_agent_sees_what_that_finding_was(ctx, monkeypatch):
 
     subjects.clear()
     b, _ = agent_with(monkeypatch, [say("12 jobs."), say("12 jobs.")])
-    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q: subjects.append(q) or "")
+    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q, shown=None: subjects.append(q) or "")
     b.ask("How many jobs failed on 23 September?", history)          # a new question: its own data
     assert subjects == ["How many jobs failed on 23 September?"]
 
@@ -248,3 +248,131 @@ def test_the_datasets_of_tries_that_did_not_make_the_chart_are_dropped(app, loca
         assert drop_unused_datasets([try1, failed, try2]) == []         # no chart saved: nothing deleted
         assert drop_unused_datasets([try1, failed, try2, chart]) == [first]
         assert db.session.get(SqlaTable, first) is None and db.session.get(SqlaTable, second) is not None
+
+
+def test_an_osagg_dataset_with_order_by_is_wrapped():
+    from supagent.tools_superset import osagg_safe
+
+    sql = 'SELECT "APP", COUNT(*) AS n FROM "jobs" GROUP BY "APP" ORDER BY n DESC'
+    assert osagg_safe(sql, "osagg") == f"SELECT * FROM ({sql}) AS agent_query"      # LIMIT 0 goes outside
+    assert osagg_safe('SELECT "APP", COUNT(*) FROM "jobs" GROUP BY 1', "osagg") == 'SELECT "APP", COUNT(*) FROM "jobs" GROUP BY 1'
+    assert osagg_safe(sql, "promagg") == sql
+
+
+def test_the_agent_has_every_tool_and_no_helper_as_a_tool():
+    from supagent import tools, tools_superset  # noqa: F401  (registers the tools)
+
+    names = set(tools.mcp.tools)
+    assert {"execute_sql", "list_databases", "list_datasets", "get_dataset_info", "create_virtual_dataset",
+            "describe_data", "search_knowledge", "export_excel", "chart_image", "send_email", "promql_query",
+            "check_health", "compare_to_usual", "data_changes"} <= names
+    assert not {"osagg_safe", "latest_tries", "name_results"} & names
+
+
+def test_a_chart_of_a_period_needs_its_date_filter(app, local_db, monkeypatch):
+    import types
+
+    from superset.connectors.sqla.models import SqlaTable, TableColumn
+    from superset.extensions import db
+
+    from supagent.agent import Agent, ChartGuard
+
+    with app.app_context():
+        ds = SqlaTable(table_name="samples", database_id=local_db, main_dttm_col="ts")
+        ds.columns = [TableColumn(column_name="ts", is_dttm=True, type="TEXT"),
+                      TableColumn(column_name="node", type="TEXT"), TableColumn(column_name="value", type="REAL")]
+        db.session.add(ds)
+        db.session.commit()
+        a = object.__new__(Agent)
+        a.question, a.names = "CPU per server on 24 September, as a saved bar chart", {"generate_chart"}
+        a.superset = types.SimpleNamespace(available=True, error=None, call=lambda n, args: "{}")
+        guard = ChartGuard(a)
+        config = {"chart_type": "xy", "x": {"name": "node"}, "y": [{"name": "value", "aggregate": "SUM"}], "kind": "bar"}
+        assert 'no filter on the time column "ts"' in guard._period_missing(ds.id, config)[0]
+        dated = dict(config, filters=[{"column": "ts", "op": ">=", "value": "2026-09-24 00:00"}])
+        assert guard._period_missing(ds.id, dated) == []
+        a.question = "CPU per server, as a saved bar chart"                     # no period asked: fine
+        assert guard._period_missing(ds.id, config) == []
+
+
+def test_the_agent_is_told_what_a_saved_chart_returns(ctx):
+    import json
+    import types
+
+    from supagent.agent import Agent, ChartGuard
+
+    a = object.__new__(Agent)
+    a.names = {"get_chart_data", "update_chart"}
+    rows = [{"APP": f"A{i}", "failed": 10 - i} for i in range(10)]
+    a.superset = types.SimpleNamespace(available=True,
+                                       call=lambda name, args: json.dumps({"data": rows, "row_count": 10}))
+    guard = ChartGuard(a)
+    out = guard.after("update_chart", {"request": {"identifier": 7, "config": {}}}, json.dumps({"success": True}))
+    assert "(the saved chart 7 returns 10 row(s) now; first: APP=A0, failed=10" in out
+
+
+def test_a_saved_chart_needs_a_name(ctx):
+    import types
+
+    from supagent.agent import Agent, ChartGuard
+
+    a = object.__new__(Agent)
+    a.names, a.question = {"generate_chart"}, "failed jobs per app"
+    a.superset = types.SimpleNamespace(available=False, call=lambda n, args: "{}")
+    guard = ChartGuard(a)
+    guard.parse = None
+    guard._dataset = lambda ident: None
+    config = {"chart_type": "xy", "x": {"name": "APP"}, "y": [{"name": "n", "aggregate": "SUM"}], "kind": "bar"}
+    _n, _a, refused = guard.before("generate_chart", {"request": {"dataset_id": None, "config": config,
+                                                                 "save_chart": True}})
+    assert refused and "needs a chart_name" in refused
+    _n, _a, fine = guard.before("generate_chart", {"request": {"dataset_id": None, "config": config,
+                                                              "save_chart": True, "chart_name": "Failed jobs - 23 Sep"}})
+    assert fine is None
+
+
+def test_update_chart_cannot_change_the_dataset(ctx):
+    import types
+
+    from supagent.agent import Agent, ChartGuard
+
+    a = object.__new__(Agent)
+    a.names, a.question = {"update_chart"}, "change it to 23 September"
+    a.superset = types.SimpleNamespace(available=False, call=lambda n, args: "{}")
+    guard = ChartGuard(a)
+    _n, _a, refused = guard.before("update_chart", {"request": {"identifier": 7, "dataset_id": 55, "config": {}}})
+    assert refused and "cannot change the dataset" in refused and "add_chart_to_existing_dashboard" in refused
+
+
+def test_a_time_column_a_chart_filter_cannot_name_asks_for_a_dataset(app, local_db):
+    import types
+
+    from superset.connectors.sqla.models import SqlaTable, TableColumn
+    from superset.extensions import db
+
+    from supagent.agent import Agent, ChartGuard
+
+    with app.app_context():
+        ds = SqlaTable(table_name="samples", database_id=local_db, main_dttm_col="@timestamp_date")
+        ds.columns = [TableColumn(column_name="@timestamp_date", is_dttm=True, type="TEXT"),
+                      TableColumn(column_name="node", type="TEXT")]
+        db.session.add(ds)
+        db.session.commit()
+        a = object.__new__(Agent)
+        a.question, a.names = "failed jobs per node on 23 September", set()
+        guard = ChartGuard(a)
+        msg = guard._period_missing(ds.id, {"chart_type": "xy", "x": {"name": "node"}})[0]
+        assert "cannot be used in a chart filter" in msg and "create_virtual_dataset" in msg
+
+
+def test_the_same_saving_call_is_not_made_again(ctx, monkeypatch):
+    import json
+
+    from test_agent_loop import agent_with, call, say
+
+    same = {"request": {"identifier": 124, "config": {"chart_type": "xy"}, "generate_preview": False}}
+    a, ran = agent_with(monkeypatch, [call("update_chart", same), call("update_chart", same), say("Done.")],
+                        results=lambda n, args: json.dumps({"success": True}))
+    a.names |= {"update_chart"}
+    a.ask("Change chart 124")
+    assert len(ran) == 1                                                # the second one: "already made"

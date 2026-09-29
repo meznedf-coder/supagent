@@ -8,6 +8,7 @@ import datetime as dt
 import logging
 import mimetypes
 import os
+import re
 import time
 import traceback
 from typing import Any
@@ -16,6 +17,7 @@ from superset import db
 
 from supagent import settings
 from supagent.agent import Cancelled
+from supagent.llm import llm_task
 from supagent.models import Conversation, File, Message
 
 log = logging.getLogger(__name__)
@@ -128,7 +130,112 @@ def _results_of(trace: list[dict]) -> list[dict]:
         out.append(item)
     if any(r["row_count"] for r in out):          # empty probes only clutter the page
         out = [r for r in out if r["row_count"]]
+    out = latest_tries(out)
+    name_results(out)
     return out[-RESULTS_KEPT:]
+
+
+DATE_LIT = re.compile(r"'(\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)'")
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _sql_parts(item: dict) -> tuple[set[str], list[str], list[str]]:
+    """(tables, conditions that are not about time, time literals) of a result's query."""
+    text = str(item.get("sql") or "")
+    times = DATE_LIT.findall(text)
+    if item.get("tool") == "promql_query":
+        metrics = set(re.findall(r"\b([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{|\[)", text)) - {"by", "without"}
+        return metrics, sorted(re.findall(r"\{([^}]*)\}", text)), [str(item.get(k) or "") for k in ("start", "end")]
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(text, read="duckdb")
+        tables = {t.name for t in tree.find_all(exp.Table) if t.name}
+        conds = []
+        for where in tree.find_all(exp.Where):
+            for node in where.find_all(exp.EQ, exp.NEQ, exp.In, exp.Like, exp.Is):
+                if not DATE_LIT.search(node.sql()):
+                    conds.append(node.sql(dialect="duckdb"))
+        return tables, sorted(set(conds)), times
+    except Exception:  # pylint: disable=broad-except
+        return set(), [], times
+
+
+def latest_tries(results: list[dict]) -> list[dict]:
+    """A query run again in the same shape (the same tool, database, tables, columns and time window)
+    with the same conditions or more (fixed after an error, a check or a rule: "... AND ENV <> 'UAT'")
+    replaces the earlier try: the page shows what the answer is based on (the tries stay in the
+    answer's tool calls). Other conditions ("ENV = 'PROD'" then "ENV = 'UAT'") are a comparison: both
+    are kept, each named with its filter."""
+    keys, conds = [], []
+    for r in results:
+        tables, c, times = _sql_parts(r)
+        keys.append((r.get("tool"), r.get("database_id"), tuple(sorted(tables)),
+                     tuple(c.lower() for c in r.get("columns") or []), tuple(times)))
+        conds.append(set(c))
+    return [r for i, r in enumerate(results)
+            if not any(keys[j] == keys[i] and conds[i] <= conds[j] for j in range(i + 1, len(results)))]
+
+
+def _window(times: list[str]) -> str:
+    """'23 Sep', '23 Sep 00:00-06:00', '20-24 Sep' from the time literals of a query."""
+    stamps = []
+    for t in times:
+        try:
+            stamps.append(dt.datetime.fromisoformat(str(t).replace("T", " ")))
+        except ValueError:
+            continue
+    if not stamps:
+        return ""
+    a, b = min(stamps), max(stamps)
+
+    def day(x: dt.datetime) -> str:
+        return f"{x.day} {MONTHS[x.month - 1]}"
+
+    if a == b:
+        return day(a)
+    if a.time() == dt.time() and b.time() == dt.time():          # whole days
+        last = b - dt.timedelta(days=1)
+        if last.date() <= a.date():
+            return day(a)
+        return f"{a.day}-{day(last)}" if a.month == last.month else f"{day(a)} - {day(last)}"
+    if b - a < dt.timedelta(days=1):
+        return f"{day(a)} {a:%H:%M}-{b:%H:%M}"
+    return f"{day(a)} {a:%H:%M} - {day(b)} {b:%H:%M}"
+
+
+def _title(r: dict) -> str:
+    """What a result shows: its measures by its dimensions (over time), and its window."""
+    cols, rows = r.get("columns") or [], r.get("rows") or []
+    numeric = [c for k, c in enumerate(cols)
+               if any(isinstance(row[k], (int, float)) and not isinstance(row[k], bool)
+                      for row in rows[:50] if k < len(row) and row[k] is not None)]
+    dims = [c for c in cols if c not in numeric]
+    timed = [c for c in dims if str(c).lower() in ("t", "ts", "time", "timestamp", "@timestamp", "date", "day", "hour",
+                                                     "bucket", "datetime") or re.search(r"(time|date)$", str(c), re.I)]
+    by = [d for d in dims if d not in timed][:2]
+    text = ", ".join(map(str, numeric[:2])) or ", ".join(map(str, cols[:2]))
+    text += (f" by {', '.join(map(str, by))}" if by else "") + (" over time" if timed else "")
+    window = _window(_sql_parts(r)[2]) if r.get("tool") != "promql_query" else ""
+    return f"{text} · {window}" if window else text
+
+
+def name_results(results: list[dict]) -> None:
+    """Each result gets a title; results of the same title say what differs (their filters)."""
+    for r in results:
+        r["title"] = _title(r)
+    by_title: dict[str, list[dict]] = {}
+    for r in results:
+        by_title.setdefault(r["title"], []).append(r)
+    for same in by_title.values():
+        if len(same) < 2:
+            continue
+        conds = [set(_sql_parts(r)[1]) for r in same]
+        common = set.intersection(*conds)
+        for r, c in zip(same, conds):
+            own = sorted(c - common)
+            r["title"] += " · " + ("; ".join(own)[:80] if own else "no other filter")
 
 
 def _keep_files(message_id: int, files: list[dict]) -> list[dict]:
@@ -252,7 +359,8 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
         with acting_as(username):
             agent = Agent(username, on_step=on_step, rich_results=True, should_stop=should_stop)
             try:
-                answer, trace = agent.ask(question, history)
+                with llm_task("answer", user_id=user_id, message_id=message_id):
+                    answer, trace = agent.ask(question, history)
             finally:
                 agent.close()
             try:
@@ -277,12 +385,15 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
             from supagent.knowledge.experience import learn_from_answer
 
             learn_from_answer(message_id, user_id, question, trace)      # query timings
-            _name_chat(conv.id, question, earlier, trace)
+            with llm_task("names", user_id=user_id, message_id=message_id):
+                _name_chat(conv.id, question, earlier, trace)
             try:
-                from supagent.knowledge.memory import learn_from_message, worth_learning
+                from supagent.knowledge.memory import asked_back, learn_from_message, worth_learning
 
-                if worth_learning(question):      # "always...", "from now on...", "remember..."
-                    learn_from_message(message_id)
+                asked = db.session.query(Message).filter(Message.conversation_id == conv.id, Message.role == "user",
+                                                         Message.id < message_id).order_by(Message.id.desc()).first()
+                if worth_learning(question) or (asked is not None and asked_back(asked) is not None):
+                    learn_from_message(message_id)    # "always...", "remember...", or what a word meant
             except Exception:  # pylint: disable=broad-except
                 db.session.rollback()
     except Cancelled:

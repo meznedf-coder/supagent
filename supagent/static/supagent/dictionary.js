@@ -202,8 +202,14 @@
     return el("div", { class: "edit section" }, kids);
   }
 
+  var pages = { relations: { page: 0, size: 50, total: 0 }, changes: { page: 0, size: 50, total: 0 },
+                timings: { page: 0, size: 50, total: 0 } };
+  function paged(name) { var p = pages[name]; return "page=" + p.page + "&size=" + p.size; }
+
   function relations() {
-    S.dict("GET", "relations").then(function (data) {
+    S.dict("GET", "relations?" + paged("relations")).then(function (data) {
+      pages.relations.total = data.total || 0;
+      S.pager($("rel-pager"), pages.relations, relations);
       var tb = $("relations").querySelector("tbody");
       tb.innerHTML = "";
       (data.relations || []).forEach(function (r) {
@@ -230,7 +236,9 @@
   }
 
   function changes() {
-    S.dict("GET", "changes?days=" + $("c-days").value).then(function (data) {
+    S.dict("GET", "changes?days=" + $("c-days").value + "&" + paged("changes")).then(function (data) {
+      pages.changes.total = data.total || 0;
+      S.pager($("c-pager"), pages.changes, changes);
       var tb = $("changes").querySelector("tbody");
       tb.innerHTML = "";
       (data.changes || []).forEach(function (c) {
@@ -242,7 +250,169 @@
     });
   }
 
+  /* a text in the side panel: a catalog entry, a document, an agent's entry with its evidence */
+  function textDrawer(title, meta, text, extra) {
+    var b = $("d-body");
+    b.innerHTML = "";
+    if (meta) b.appendChild(el("div", { class: "muted", text: meta }));
+    b.appendChild(el("h2", { id: "d-title", text: title }));
+    b.appendChild(el("pre", { class: "entry-text", text: text || "" }));
+    (extra || []).forEach(function (x) { if (x) b.appendChild(x); });
+    $("drawer").hidden = false;
+  }
+  function emptyRow(cols, text) { return el("tr", {}, [el("td", { colspan: String(cols), class: "muted", text: text })]); }
+  function row(onclick, cells) {
+    return el("tr", { class: "clickable", tabindex: "0", onclick: onclick,
+      onkeydown: function (ev) { if (ev.key === "Enter") onclick(); } }, cells);
+  }
+
+  function knowledge() {
+    return S.dict("GET", "knowledge").then(function (d) {
+      var tb = $("kn-entries").querySelector("tbody");
+      tb.innerHTML = "";
+      (d.entries || []).forEach(function (e) {
+        tb.appendChild(row(function () {
+          textDrawer(e.title, e.classification + (e.category ? " · " + e.category : "") + " · by " + (e.by || "?"), e.content);
+        }, [el("td", { class: "nm", text: e.title }), el("td", { text: e.classification }), el("td", { text: e.category || "" }),
+            el("td", { text: e.by || "" }), el("td", { text: S.when(e.updated_at) })]));
+      });
+      if (!(d.entries || []).length) tb.appendChild(emptyRow(5, "No catalog entry yet."));
+      var td = $("kn-docs").querySelector("tbody");
+      td.innerHTML = "";
+      (d.docs || []).forEach(function (x) {
+        td.appendChild(row(function () {
+          textDrawer(x.title, (x.url || "uploaded file") + (x.category ? " · " + x.category : ""),
+            x.excerpt + (x.chars > (x.excerpt || "").length ? "\n\u2026 (" + S.num(x.chars) + " characters in all)" : ""));
+        }, [el("td", { class: "nm", text: x.title }), el("td", { text: x.kind === "url" ? "site" + (x.pages ? " (" + x.pages + " pages)" : "") : "file" }),
+            el("td", { text: x.status || "" }), el("td", { class: "num", text: S.num(x.chars) + " characters" }),
+            el("td", { text: S.when(x.fetched_at) })]));
+      });
+      if (!(d.docs || []).length) td.appendChild(emptyRow(5, "No document or site yet."));
+      var ul = $("kn-memory");
+      ul.innerHTML = "";
+      (d.team_memory || []).forEach(function (m) {
+        ul.appendChild(el("li", {}, [el("span", { class: "badge", text: m.kind }), " ", m.text,
+          el("span", { class: "muted", text: " · " + S.when(m.created_at) })]));
+      });
+      if (!(d.team_memory || []).length) ul.appendChild(el("li", { class: "muted", text: "No team memory yet." }));
+    });
+  }
+
+  function browseUnverified(sourceId) {             // the AI descriptions of a database, to verify
+    $("f-source").value = String(sourceId);
+    $("f-show").value = "unverified";
+    document.querySelector('.subtabs button[data-tab="browse"]').click();
+    state.page = 0;
+    load();
+  }
+
+  function agentKnowledge() {
+    return S.dict("GET", "agent_knowledge").then(function (d) {
+      var box = $("agent-summary");
+      box.innerHTML = "";
+      box.appendChild(el("span", { class: "muted", text: S.num(d.relations_measured) + " relations measured" }));
+      (d.to_verify || []).forEach(function (v) {
+        box.appendChild(document.createTextNode(" · "));
+        box.appendChild(el("button", { type: "button", class: "linkish", text: S.num(v.count) + " AI descriptions to verify in " + v.database,
+          onclick: function () { browseUnverified(v.source_id); } }));
+      });
+      var te = $("agent-entries").querySelector("tbody");
+      te.innerHTML = "";
+      (d.entries || []).forEach(function (e) {
+        te.appendChild(row(function () {
+          textDrawer(e.title, e.classification + " · written by the agent" + (e.enabled ? "" : " · disabled"), e.content,
+            [el("h3", { text: "Evidence" }), el("pre", { class: "entry-text", text: JSON.stringify(e.evidence || {}, null, 2) })]);
+        }, [el("td", { class: "nm", text: e.title }), el("td", { text: e.classification }),
+            el("td", { class: "nm", text: e.origin || "" }), el("td", { text: S.when(e.updated_at) })]));
+      });
+      if (!(d.entries || []).length) te.appendChild(emptyRow(4, "No catalog entry written by the agent yet."));
+      var ta = $("associations").querySelector("tbody");
+      ta.innerHTML = "";
+      (d.associations || []).forEach(function (a) {
+        ta.appendChild(el("tr", {}, [el("td", { class: "nm", text: a.word }),
+          el("td", { class: "nm", text: (a.parent ? a.parent + " \u203a " : "") + a.name + " (" + a.kind + ")" }),
+          el("td", { text: String(a.database) }), el("td", { class: "num", text: S.num(a.uses) })]));
+      });
+      if (!(d.associations || []).length) ta.appendChild(emptyRow(4, "Nothing yet: it comes from the answers of the chat."));
+    });
+  }
+
+  function contextPage(id) {
+    S.dict("GET", "context/" + id).then(function (p) {
+      if (p.error) return;
+      var b = $("d-body");
+      b.innerHTML = "";
+      b.appendChild(el("div", { class: "muted", text: p.section + " · version " + p.version + " · " + S.when(p.updated_at) +
+        (p.author !== "agent" ? " · edited by " + p.author : "") }));
+      b.appendChild(el("h2", { id: "d-title", text: p.title }));
+      if (p.ai) b.appendChild(el("p", {}, [el("span", { class: "badge llm", text: "AI-written" }),
+        el("span", { class: "muted", text: " from the sources below; check before relying on it" })]));
+      b.appendChild(el("div", { class: "answer context-page", html: p.html }));   // Markdown made safe on the server
+      if ((p.sources || []).length) {
+        b.appendChild(el("h3", { text: "Sources" }));
+        var ol = el("ol", { class: "context-sources" });
+        p.sources.forEach(function (x) { ol.appendChild(el("li", { text: x.title + " (" + x.ref + ")" })); });
+        b.appendChild(ol);
+      }
+      if (state.admin) {
+        var area = el("textarea", { class: "context-edit", rows: "14", "aria-label": "Page" });
+        area.value = p.content;
+        var result = el("span", { class: "result" });
+        var save = el("button", { type: "button", class: "btn primary", text: "Save my version", onclick: function () {
+          S.dict("POST", "context/" + p.id, { content: area.value }).then(function (r) {
+            result.textContent = r.error || "saved: the agent will not write over it";
+            if (!r.error) contextTab();
+          });
+        } });
+        var back = el("button", { type: "button", class: "btn", text: "Give it back to the agent", onclick: function () {
+          S.dict("POST", "context/" + p.id, { reset: true }).then(function (r) {
+            result.textContent = r.error || "the agent writes it again at the next build";
+            if (!r.error) contextTab();
+          });
+        } });
+        b.appendChild(el("details", { class: "context-editor" }, [el("summary", { text: "Correct this page" }), area,
+          el("div", { class: "actions" }, [save, p.author !== "agent" ? back : null, result])]));
+      }
+      $("drawer").hidden = false;
+    });
+  }
+
+  function contextTab() {
+    return S.dict("GET", "context").then(function (d) {
+      ["functional", "technical"].forEach(function (sec) {
+        var ul = $("ctx-" + sec);
+        ul.innerHTML = "";
+        (d.pages || []).filter(function (p) { return p.section === sec; }).forEach(function (p) {
+          var badge = p.ai ? el("span", { class: "badge llm", text: "AI-written" }) :
+            (p.author !== "agent" ? el("span", { class: "badge curated", text: "edited by " + p.author }) :
+              el("span", { class: "badge backend", text: "facts" }));
+          ul.appendChild(el("li", {}, [el("button", { type: "button", class: "linkish", text: p.title,
+            onclick: function () { contextPage(p.id); } }), " ", badge,
+            el("span", { class: "muted", text: " · " + S.when(p.updated_at) })]));
+        });
+        if (!ul.children.length) ul.appendChild(el("li", { class: "muted", text: "No page yet." }));
+      });
+      var box = $("ctx-actions");
+      box.innerHTML = "";
+      var last = d.last_build;
+      box.appendChild(el("span", { class: "muted", text: (d.enabled ? "Built every night from " + d.hour + ":00" :
+        "The nightly build is off (context.enabled)") + (last ? " · last build #" + last.id + ": " + last.status + ", " +
+        S.when(last.finished_at || last.started_at) : " · no build yet") }));
+      if (state.admin) {
+        var res = el("span", { class: "result" });
+        box.appendChild(document.createTextNode(" "));
+        box.appendChild(el("button", { type: "button", class: "btn", text: "Build now", onclick: function () {
+          S.dict("POST", "context/build", {}).then(function (r) {
+            res.textContent = r.error || "started: it shows in Settings → Chat settings, runs list";
+          });
+        } }));
+        box.appendChild(res);
+      }
+    });
+  }
+
   function learned() {
+    agentKnowledge();
     var st = $("r-status").value;
     S.dict("GET", "recipes" + (st ? "?status=" + st : "")).then(function (data) {
       var tb = $("recipes").querySelector("tbody");
@@ -272,7 +442,13 @@
       if (!(data.recipes || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted",
         text: "Nothing learned yet: an answer marked Helpful in the chat is learned here, for an admin to confirm or reject." })]));
     });
-    S.dict("GET", "timings").then(function (data) {
+    timings();
+  }
+
+  function timings() {
+    S.dict("GET", "timings?" + paged("timings")).then(function (data) {
+      pages.timings.total = data.total || 0;
+      S.pager($("t-pager"), pages.timings, timings);
       var tb = $("timings").querySelector("tbody");
       tb.innerHTML = "";
       (data.timings || []).forEach(function (t) {
@@ -294,10 +470,12 @@
   document.querySelectorAll(".subtabs button").forEach(function (btn) {
     btn.addEventListener("click", function () {
       document.querySelectorAll(".subtabs button").forEach(function (x) { x.classList.toggle("on", x === btn); });
-      ["browse", "relations", "changes", "learned", "search"].forEach(function (t) { $("tab-" + t).hidden = t !== btn.dataset.tab; });
+      ["browse", "relations", "changes", "learned", "knowledge", "context", "search"].forEach(function (t) { $("tab-" + t).hidden = t !== btn.dataset.tab; });
       if (btn.dataset.tab === "relations") relations();
       if (btn.dataset.tab === "changes") changes();
       if (btn.dataset.tab === "learned") learned();
+      if (btn.dataset.tab === "knowledge") knowledge();
+      if (btn.dataset.tab === "context") contextTab();
     });
   });
   $("r-status").addEventListener("change", learned);
@@ -322,7 +500,7 @@
   $("filters").addEventListener("submit", function (ev) { ev.preventDefault(); });
   $("prev").addEventListener("click", function () { if (state.page > 0) { state.page--; load(); } });
   $("next").addEventListener("click", function () { state.page++; load(); });
-  $("c-days").addEventListener("change", changes);
+  $("c-days").addEventListener("change", function () { pages.changes.page = 0; changes(); });
   $("d-close").addEventListener("click", function () { $("drawer").hidden = true; });
   $("drawer").addEventListener("click", function (ev) { if (ev.target === $("drawer")) $("drawer").hidden = true; });
   document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") $("drawer").hidden = true; });

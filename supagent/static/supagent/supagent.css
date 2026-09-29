@@ -106,7 +106,9 @@ details.query pre.err { color: var(--bad); }
 
 /* chat */
 .page-chat { padding: 0; height: calc(100% - 52px); }
-.chat { display: grid; grid-template-columns: 260px 1fr; height: 100%; }
+/* the messages scroll, never the page: the rows and the thread may not grow with the conversation */
+.chat { display: grid; grid-template-columns: 260px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: 100%;
+  min-height: 0; }
 .convs { border-right: 1px solid var(--line); background: var(--panel); padding: 12px; overflow-y: auto; overflow-x: hidden; min-width: 0; }
 .conv-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 2px; }
 .conv-list li { display: flex; align-items: center; gap: 4px; border-radius: 6px; min-width: 0; }
@@ -115,8 +117,9 @@ details.query pre.err { color: var(--bad); }
   overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
 .conv-list button { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 4px 6px; font-size: 15px; }
 .conv-list button:hover { color: var(--bad); }
-.thread { display: flex; flex-direction: column; min-width: 0; height: 100%; }
-.messages { flex: 1; overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 16px; }
+.thread { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
+.messages { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column;
+  gap: 16px; }
 .msg { max-width: 920px; width: 100%; margin: 0 auto; }
 .msg.user .bubble { margin-left: auto; max-width: 75%; background: var(--user-bubble); padding: 9px 13px;
   border-radius: 12px 12px 2px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -134,6 +137,12 @@ details.query pre.err { color: var(--bad); }
 .fb { border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 6px; padding: 2px 8px;
   cursor: pointer; font: inherit; font-size: 12px; }
 .fb.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.fb-wrap { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.fb-why { display: inline-flex; gap: 6px; flex: 1 1 260px; min-width: 0; }
+.fb-why[hidden] { display: none; }
+.fb-why input { flex: 1; min-width: 0; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel); color: var(--ink); font: inherit; font-size: 12.5px; }
+.fb-said { font-size: 12.5px; overflow-wrap: anywhere; }
 details.steps { margin-top: 8px; font-size: 12.5px; }
 details.steps summary { cursor: pointer; color: var(--ink-2); }
 .step { border-left: 2px solid var(--line); padding: 2px 0 2px 10px; margin: 6px 0; }
@@ -230,7 +239,7 @@ table.grid td.desc { max-width: 520px; }
 #catalog { width: 100%; font-family: var(--mono); font-size: 12.5px; }
 
 @media (max-width: 760px) {
-  .chat { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  .chat { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .convs { border-right: 0; border-bottom: 1px solid var(--line); max-height: 30vh; }
   .msg.user .bubble { max-width: 92%; }
   .fields { grid-template-columns: 1fr; }
@@ -248,7 +257,8 @@ table.grid td.desc { max-width: 520px; }
 .answer pre:hover .copy-code, .answer pre:focus-within .copy-code { opacity: 1; }
 .result-card { margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); position: relative; }
 .result-tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 10px 0; }
-.result-tabs button { border: 1px solid var(--line); background: var(--panel); color: var(--ink-2); border-radius: 12px; padding: 2px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+.result-tabs button { border: 1px solid var(--line); background: var(--panel); color: var(--ink-2); border-radius: 12px; padding: 2px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .result-tabs button.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .viz-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line-2); }
 .viz-toolbar .caption { color: var(--muted); font-size: 12px; margin-right: auto; }
@@ -323,11 +333,13 @@ details.sql summary { cursor: pointer; color: var(--ink-2); }
 /* the chat in the panel docked on Superset's pages (?embed=1): one column, the conversations
    behind a button, no top bar */
 #toggle-convs { display: none; }
+html.embed, html.embed body { overflow: hidden; }          /* the panel's page never scrolls: its buttons stay */
 .embed .page { height: 100vh; }
-.embed .chat { grid-template-columns: 1fr; grid-template-rows: auto 1fr; height: 100%; }
+.embed .chat { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: 100%; }
 .embed .convs { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border-right: 0;
   border-bottom: 1px solid var(--line); max-height: none; }
 .embed .convs .btn.wide { width: auto; flex: 1 1 auto; }
+.embed .convs #open-memory { margin-top: 0; }
 .embed #toggle-convs { display: inline-flex; justify-content: center; }
 .embed .conv-list { display: none; flex-basis: 100%; max-height: 40vh; overflow: auto; margin: 0; }
 .embed .convs.open .conv-list { display: block; }
@@ -337,3 +349,44 @@ details.steps { margin-top: 4px; }
 details.steps summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 details.steps ol { margin: 4px 0 0 18px; padding: 0; font-size: 12px; color: var(--ink-2); }
 details.steps li { margin: 2px 0; }
+/* the dictionary's Knowledge and Learned tabs */
+tr.clickable { cursor: pointer; }
+tr.clickable:hover, tr.clickable:focus { background: var(--line-2); outline: none; }
+pre.entry-text { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; max-height: 60vh; overflow: auto;
+  background: var(--line-2); padding: 10px; border-radius: 6px; }
+ul.plain-list { list-style: none; padding: 0; margin: 4px 0; }
+ul.plain-list li { margin: 6px 0; }
+.agent-summary { margin: 6px 0 10px; font-size: 13px; }
+/* the dictionary's Context tab */
+.context-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+@media (max-width: 800px) { .context-cols { grid-template-columns: 1fr; } }
+.context-page { font-size: 13.5px; line-height: 1.5; }
+.context-page h1 { font-size: 18px; } .context-page h2 { font-size: 15px; margin-top: 14px; }
+ol.context-sources { font-size: 12px; color: var(--ink-2); }
+textarea.context-edit { width: 100%; font-family: var(--mono, monospace); font-size: 12.5px; margin: 6px 0; }
+/* the LLM usage page (admins) */
+.usage { display: grid; gap: 16px; max-width: 1300px; margin: 0 auto; }
+.usage > * { min-width: 0; }
+.usage-head { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; justify-content: space-between; }
+.usage-head h1 { margin: 0 0 4px; font-size: 22px; }
+.usage-head p { margin: 0; max-width: 70ch; }
+.usage-range { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+.usage-range label { display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+.usage-range label[hidden] { display: none; }
+.usage-range select, .usage-range input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel); color: var(--ink); font: inherit; font-size: 13px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px;
+  display: grid; gap: 2px; align-content: start; }
+.tile-label { font-size: 12px; color: var(--muted); letter-spacing: .02em; }
+.tile-value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile-hint { font-size: 12px; }
+.usage-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+.usage .card { align-content: start; }
+.usage .card h2 { margin: 0; font-size: 15px; }
+.usage .table-wrap { overflow-x: auto; }
+.usage table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.usage th, .usage td { padding: 5px 8px; border-bottom: 1px solid var(--line-2); text-align: left; vertical-align: top; }
+.usage th.num, .usage td.num { text-align: right; font-variant-numeric: tabular-nums; }
+@media (max-width: 520px) { .usage-cols { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 520px) { .topbar { gap: 8px; } .tabs a { padding: 6px 7px; } }

@@ -48,6 +48,11 @@ def init() -> None:
 
     before, after = create_or_upgrade()
     click.echo(f"tables: schema version {before} -> {after}")
+    from supagent.knowledge.memory import merge_duplicates
+
+    merged = merge_duplicates()
+    if merged:
+        click.echo(f"memory: {merged} copies of the same memory removed (one of each kept)")
     from supagent.models import Recipe
 
     auto = db.session.query(Recipe).filter(Recipe.status == "auto").count()
@@ -155,11 +160,14 @@ def settings_cmd(pairs: tuple[str, ...], unset: tuple[str, ...]) -> None:
 def test_llm(profile: bool) -> None:
     from supagent.llm import LLM
 
+    from supagent.llm import llm_task
+
     try:
         llm = LLM()
-        out = llm.check()
-        if profile:
-            out["profile"] = llm.profile()
+        with llm_task("test"):
+            out = llm.check()
+            if profile:
+                out["profile"] = llm.profile()
     except Exception as ex:  # pylint: disable=broad-except
         raise click.ClickException(f"{type(ex).__name__}: {ex}") from ex
     for k, v in out.items():
@@ -208,17 +216,74 @@ def learn(databases: tuple[str, ...], no_llm: bool, minutes: int | None, plan: b
         sys.exit(1)
 
 
+@supagent.command("context", help="The Context (the system's functional and technical documentation): list its pages, "
+                                   "or build it now")
+@click.option("--build", is_flag=True, help="Build it now: the facts pages, and the summary pages whose sources changed")
+@click.option("--no-llm", is_flag=True, help="Only the facts pages (no LLM call)")
+@click.option("--force", is_flag=True, help="Write the summary pages again even when their sources did not change")
+@with_appcontext
+def context(build: bool, no_llm: bool, force: bool) -> None:
+    from superset.extensions import db
+
+    from supagent.models import ContextPage
+
+    if build:
+        from supagent.knowledge.context import build_context
+
+        out = build_context(reason="cli", llm=not no_llm, force=force)
+        click.echo(json.dumps(out, indent=2, default=str))
+        if out.get("status") == "error":
+            sys.exit(1)
+        return
+    pages = db.session.query(ContextPage).order_by(ContextPage.section, ContextPage.title).all()
+    for p in pages:
+        who = "AI-written" if p.kind == "summary" and (p.author or "agent") == "agent" else \
+            ("facts" if (p.author or "agent") == "agent" else f"edited by {p.author}")
+        click.echo(f"{p.section:<10} {p.title} ({who}, version {p.version}, {p.updated_at:%Y-%m-%d %H:%M})")
+    if not pages:
+        click.echo("no Context page yet: superset supagent context --build (or wait for the nightly build)")
+
+
+@supagent.command("prompt", help="What the agent gives the LLM for a question, without asking the LLM: the "
+                                  "instructions and the team's rules, the memory, where the data is, the knowledge "
+                                  "found (dictionary, catalog, documents, Context) and the learned answers")
+@click.argument("question")
+@click.option("--user", "username", required=True, help="As this Superset user (what they may see)")
+@click.option("--full", is_flag=True, help="Also print the whole instructions (else their size and the team's rules)")
+@with_appcontext
+def prompt(question: str, username: str, full: bool) -> None:
+    from supagent.agent import Agent
+    from supagent.security import acting_as
+
+    import types
+
+    with acting_as(username):
+        agent = Agent(username, rich_results=True, llm=types.SimpleNamespace())   # the LLM is not asked
+        try:
+            messages = agent.prompt(question)
+        finally:
+            agent.close()
+    system, asked = messages[0]["content"], messages[-1]["content"]
+    if full:
+        click.echo("=== instructions\n" + system)
+    else:
+        rules = system[system.find("Rules of the team"):] if "Rules of the team" in system else "(no team rule)"
+        click.echo(f"=== instructions: {len(system)} characters; the team's rules:\n{rules}")
+    click.echo("\n=== with the question\n" + asked)
+
+
 @supagent.command("import-catalog", help="Split a catalog (YAML) into entries in Superset's database, and apply it")
 @click.argument("path", type=click.Path(exists=True, dir_okay=False))
 @click.option("--replace", is_flag=True, help="Also delete the structured entries the file does not have")
 @with_appcontext
 def import_catalog_cmd(path: str, replace: bool) -> None:
     from supagent.knowledge.catalog import import_catalog
-    from supagent.knowledge.curated import apply_catalog
+    from supagent.knowledge.curated import after_change, catalog_texts
 
+    before = catalog_texts()
     with open(path, encoding="utf-8") as fh:
         counts = import_catalog(fh.read(), by="cli", mode="replace" if replace else "merge")
-    click.echo(f"imported: {counts}; applied: {apply_catalog()}")
+    click.echo(f"imported: {counts}; applied: {after_change(before)}")
 
 
 @supagent.command("export-catalog", help="Print the catalog: every enabled entry merged into one YAML")
@@ -315,6 +380,34 @@ def index(refresh_docs: bool) -> None:
         for r in refresh_due():
             click.echo(f"document {r['id']}: {r['status']}, {r['pages']} page(s) {r.get('error') or ''}")
     click.echo(json.dumps(index_knowledge(), indent=2, default=str))
+
+
+@supagent.command("check-knowledge", help="Is everything the team put in the knowledge given to the agent? "
+                  "(searchable pieces in step, vectors, catalog errors and unknown names, rules, what waits "
+                  "for an admin); exit code 1 when there is a problem")
+@click.option("--json", "as_json", is_flag=True, help="The whole report as JSON")
+@with_appcontext
+def check_knowledge(as_json: bool) -> None:
+    from supagent.knowledge.audit import audit
+
+    out = audit()
+    if as_json:
+        click.echo(json.dumps(out, indent=2, default=str))
+    else:
+        p = out["pieces"]
+        click.echo(f"searchable pieces: {p['total']} ({', '.join(f'{k} {v}' for k, v in sorted(p['by_kind'].items()))})"
+                   f"; out of step: {p['out_of_step']}")
+        if out["vectors"]["model"]:
+            click.echo(f"without a vector of {out['vectors']['model']}: {out['vectors']['missing']}")
+        d, r = out["dictionary"], out["rules"]
+        click.echo(f"dictionary: {d['objects']} objects, {d['curated']} described by people, {d['to_verify']} AI "
+                   f"descriptions to verify; rules: {r['enabled']} ({r['in_instructions']} in the instructions); "
+                   f"Context pages: {out['context_pages']}")
+        click.echo("problems:" if out["problems"] else "no problem: everything the team put in is given to the agent")
+        for line in out["problems"]:
+            click.echo(f"- {line}")
+    if out["problems"]:
+        raise SystemExit(1)
 
 
 @supagent.command("agent-catalog", help="Let the agent write the catalog entries it is certain of now (formulas "

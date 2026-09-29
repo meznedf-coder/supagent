@@ -113,7 +113,8 @@ def gaps(days: int = 30, limit: int = 50) -> dict[str, list[str]]:
         seen.add(q)
         when = f"{m.created_at:%Y-%m-%d}" if m.created_at else ""
         if m.feedback == -1 and len(out["not_helpful"]) < limit:
-            out["not_helpful"].append(f"{when} {q[:160]}")
+            why = f" -- why: {m.feedback_reason[:200]}" if m.feedback_reason else ""
+            out["not_helpful"].append(f"{when} {q[:160]}{why}")
         elif m.status == "error" and len(out["failed"]) < limit:
             out["failed"].append(f"{when} {q[:160]} -> {(m.content or '')[:120]}")
         data_question = any((st or {}).get("tool") in DATA_TOOLS for st in (m.steps or []))

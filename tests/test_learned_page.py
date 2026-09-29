@@ -56,7 +56,7 @@ def test_only_helpful_ones_are_listed_and_admins_decide(world, app):
 def test_the_upgrade_sends_user_confirmed_answers_to_review(world):
     from superset.extensions import db
 
-    from supagent.models import Meta, Recipe, create_or_upgrade
+    from supagent.models import SCHEMA_VERSION, Meta, Recipe, create_or_upgrade
 
     db.session.query(Recipe).delete()
     db.session.commit()
@@ -65,9 +65,9 @@ def test_the_upgrade_sends_user_confirmed_answers_to_review(world):
     auto = _learned(world, "auto")
     db.session.get(Meta, "schema_version").value = "2"
     db.session.commit()
-    assert create_or_upgrade() == (2, 4)
+    assert create_or_upgrade() == (2, SCHEMA_VERSION)
     assert [db.session.get(Recipe, i).status for i in (by_users, by_admin, auto)] == ["helpful", "confirmed", "auto"]
-    assert create_or_upgrade() == (4, 4)
+    assert create_or_upgrade() == (SCHEMA_VERSION, SCHEMA_VERSION)
 
 
 def test_the_upgrade_stems_the_stored_words_again(world):
@@ -75,7 +75,7 @@ def test_the_upgrade_stems_the_stored_words_again(world):
     and the associations that become the same are merged."""
     from superset.extensions import db
 
-    from supagent.models import Association, Meta, Recipe, create_or_upgrade
+    from supagent.models import SCHEMA_VERSION, Association, Meta, Recipe, create_or_upgrade
 
     db.session.query(Association).delete()
     db.session.query(Recipe).delete()
@@ -87,7 +87,7 @@ def test_the_upgrade_stems_the_stored_words_again(world):
                                    uses=uses, messages=mids))
     db.session.get(Meta, "schema_version").value = "3"
     db.session.commit()
-    assert create_or_upgrade() == (3, 4)
+    assert create_or_upgrade() == (3, SCHEMA_VERSION)
     assert db.session.get(Recipe, rid).words == "category fail job"
     rows = {a.word: (a.uses, sorted(a.messages)) for a in db.session.query(Association)}
     assert rows == {"fail": (5, [1, 2, 3]), "job": (1, [4])}

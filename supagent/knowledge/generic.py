@@ -199,6 +199,13 @@ def merge_duplicates() -> int:
 
 
 def tidy_learned(llm: Any = None, limit: int = 50, deadline: float | None = None) -> dict[str, int]:
+    from supagent.llm import llm_task
+
+    with llm_task("tidy"):
+        return _tidy_learned(llm, limit, deadline)
+
+
+def _tidy_learned(llm: Any = None, limit: int = 50, deadline: float | None = None) -> dict[str, int]:
     """Rewrite the questions of the learned answers and the chat names that are not generic yet;
     a rewritten question that the LLM finds already kept joins it. Stops at `deadline` (the
     learning run's time limit): the next run goes on."""
@@ -253,7 +260,7 @@ def tidy_learned(llm: Any = None, limit: int = 50, deadline: float | None = None
         out["chats"] += 1
     out["merged"] += merge_duplicates()
     if out["answers"] or out["merged"]:
-        from supagent.knowledge.index import sync
+        from supagent.knowledge.index import embed_few, sync
 
-        sync(("recipe:",))
+        embed_few(sync(("recipe:",)))
     return out

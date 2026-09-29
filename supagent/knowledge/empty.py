@@ -130,8 +130,9 @@ def _time_hint(table: str, times: list[tuple[str, str, dt.datetime]], time_col: 
     return None
 
 
-def why_empty(database: Any, sql: str) -> str:
-    """"" or one line: why this SELECT on an osagg / promagg database found nothing."""
+def why_empty(database: Any, sql: str, counted: bool = False) -> str:
+    """"" or one line: why this SELECT on an osagg / promagg database found nothing (`counted`: its
+    aggregates are 0, not a row missing: a count over a value that does not exist)."""
     import sqlglot
     from sqlglot import exp
 
@@ -185,6 +186,12 @@ def why_empty(database: Any, sql: str) -> str:
             hints.append(h)
     if not hints:
         return ""
+    if counted:
+        hints = [h for h in hints if "is not a value" in h or "is written" in h]   # a 0 is an answer otherwise
+        if not hints:
+            return ""
+        return ("Nothing matched (0). From the data dictionary: " + "; ".join(hints[:4]) + ". Say that the value "
+                "does not exist in the data, rather than a count of 0.")
     return "No rows. From the data dictionary: " + "; ".join(hints[:4]) + "."
 
 

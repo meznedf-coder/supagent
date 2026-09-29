@@ -42,11 +42,11 @@ class Describer(threading.Thread):
         from supagent.knowledge.curated import apply_catalog
         from supagent.knowledge.enrich import enrich
         from supagent.knowledge.stopping import LearningStopped, watching
-        from supagent.llm import background
+        from supagent.llm import background, llm_task
 
         with self.app.app_context():
             try:
-                with background(), watching(self.run_id):
+                with background(), watching(self.run_id), llm_task("learn", run_id=self.run_id):
                     applied = 0.0
                     while not self.done.is_set() and time.time() < self.deadline:
                         if time.time() - applied >= CATALOG_S:

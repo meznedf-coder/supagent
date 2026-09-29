@@ -40,7 +40,10 @@ PROMPT = """You write a data dictionary for business users of Apache Superset.
 For each item of the JSON list, write what it measures or holds, in one or two short
 sentences: plain words, the unit when there is one, what a high or low value means when it
 is obvious. Use only what the name, the type, the labels, the values and the context show;
-when the meaning is a guess, start with "Probably". Never invent business rules. Do not
+when the meaning is a guess, start with "Probably". A unit only when the name spells it
+(_seconds, _bytes, _ms, _pct...) or the values prove it: a one-letter suffix (_d, _s, _h, _n)
+is not a unit (_d is often "double"), and a unit must fit the range of the values (a duration
+of 2 to 45,000 with an average of 318 is not in days). Never invent business rules. Do not
 repeat counts, ranges, dates or fill rates from the input: they are measured every day and
 shown next to the description.
 Also give a short category (one or two words, lower case, e.g. cpu, memory, disk, network,

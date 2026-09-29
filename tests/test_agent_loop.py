@@ -62,8 +62,8 @@ def agent_with(monkeypatch, replies: list, results=None, rich: bool = True):
         ran.append((name, args))
         return name, (results(name, args) if results else SQL_ROWS)
 
-    monkeypatch.setattr(Agent, "_system", lambda self, q: "SYSTEM")
-    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q: "")
+    monkeypatch.setattr(Agent, "_system", lambda self, q, shown=None: "SYSTEM")
+    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q, shown=None: "")
     monkeypatch.setattr(Agent, "_specs_for", lambda self, q: [])
     monkeypatch.setattr(Agent, "_call", fake_call)
     return a, ran
@@ -177,7 +177,7 @@ def _health(errors: dict) -> str:
 def test_all_clear_while_a_check_could_not_run_is_corrected(ctx, monkeypatch, answer, noted):
     a, _ran = agent_with(monkeypatch, [call("check_health", {"start": "a", "end": "b"}), say(answer)],
                          results=lambda n, args: _health({"cpu_saturation": "timeout"}))
-    out, _trace = a.ask("Were the servers saturated?")
+    out, _trace = a.ask("Were the servers saturated (srv-2 too)?")
     assert ("check cpu_saturation could not run" in out) is noted
 
 
@@ -318,3 +318,25 @@ def test_the_llm_profile_says_what_the_server_does(monkeypatch):
     out = client.profile()
     assert out["thinking"]["answered"] and out["tool_calls"]["works"] and out["prompt_cache"]["works"]
     assert out["prompt_cache"]["second"]["cached_tokens"] == 2988 and len(sent) == 5
+
+
+def test_an_unreadable_tool_call_is_sent_back_not_an_error(ctx, monkeypatch):
+    from supagent.llm import LLMError
+
+    bad = LLMError('LLM x/chat/completions: HTTP 500: {"error":{"message":"Failed to parse tool call arguments as '
+                   'JSON: parse error at line 1, column 53381"}}')
+    a, ran = agent_with(monkeypatch, [call("execute_sql", {"sql": "SELECT 1"}), bad, say("Done: 2 charts saved.")])
+    answer, _trace = a.ask("Make me a dashboard")
+    assert answer.startswith("Done: 2 charts saved.") and len(ran) == 1
+    assert "could not be read" in a.llm.seen[-1][-1]["content"]
+    b, _ran = agent_with(monkeypatch, [call("execute_sql", {"sql": "SELECT 1"}), bad, bad, bad,
+                                       say("One query ran; the charts are still to do.")])
+    answer, _trace = b.ask("Make me a dashboard")
+    assert answer.startswith("One query ran; the charts are still to do.")          # what was done, not an error
+
+
+def test_a_nested_aggregate_on_metrics_gets_the_way_to_write_it():
+    from supagent.tools_superset import NESTED_AGG
+
+    assert NESTED_AGG.search("PushdownError: AVG(100 * SUM(rate) FILTER(WHERE mode <> 'idle') / SUM(rate)): cannot")
+    assert not NESTED_AGG.search("PushdownError: WINDOW functions are not supported")

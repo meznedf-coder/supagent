@@ -23,7 +23,8 @@
   <nav class="tabs" aria-label="Chat">
     {% if nav.can_chat %}<a href="{{ url_for('ChatView.index') }}" class="{{ 'on' if nav.active == 'chat' }}">Chat</a>{% endif %}
     {% if nav.can_dictionary %}<a href="{{ url_for('KnowledgeView.index') }}" class="{{ 'on' if nav.active == 'dictionary' }}">Data dictionary</a>{% endif %}
-    {% if nav.is_admin %}<a href="{{ url_for('AdminView.index') }}" class="{{ 'on' if nav.active == 'admin' }}">Settings</a>{% endif %}
+    {% if nav.is_admin %}<a href="{{ url_for('AdminView.index') }}" class="{{ 'on' if nav.active == 'admin' }}">Settings</a>
+    <a href="{{ url_for('AdminView.usage') }}" class="{{ 'on' if nav.active == 'usage' }}">LLM usage</a>{% endif %}
   </nav>
   <span class="grow"></span>
   <span class="who" title="The agent acts with this account's permissions">{{ nav.user }}</span>

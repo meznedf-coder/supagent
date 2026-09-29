@@ -311,6 +311,13 @@ def trace_of(message: Any) -> list[dict]:
 
 
 def learn_from_helpful(message_id: int, llm: Any = None) -> int | None:
+    from supagent.llm import llm_task
+
+    with llm_task("helpful", message_id=message_id):
+        return _learn_from_helpful(message_id, llm)
+
+
+def _learn_from_helpful(message_id: int, llm: Any = None) -> int | None:
     """An answer marked Helpful -> a learned answer (or one more confirmation of the same one),
     under the generic question the LLM writes, as the user who asked; its id. Nothing when the
     Helpful was taken back meanwhile, or when the answer ran no query."""
@@ -494,7 +501,7 @@ def recipes_for(question: str, limit: int = 3) -> list[dict[str, Any]]:
             allowed[r.database_id] = d is not None and can_use_database(d)
         if not allowed[r.database_id]:
             continue
-        out.append({"question": r.question, "tool": r.tool, "database_id": r.database_id, "query": r.query,
+        out.append({"id": r.id, "question": r.question, "tool": r.tool, "database_id": r.database_id, "query": r.query,
                     "seconds": r.seconds, "rows": r.rows, "status": r.status, "uses": r.uses, "steps": r.steps})
         if len(out) >= limit:
             break

@@ -15,13 +15,20 @@ from superset import db
 
 from supagent.models import KObject, Source
 
+# said of the object itself: at the start of the description or of one of its sentences ("Not used",
+# "does not used: take X", "This field is deprecated", "Ce champ n'est plus utilisé"); never a word
+# inside an explanation ("mode idle = unused, the other modes = busy")
 NOT_USED = re.compile(
-    r"\b(not\s+(?:be\s+)?used|unused|do\s*n[o']?t\s+use|never\s+use|not\s+to\s+be\s+used|no\s+longer\s+used|"
-    r"deprecated|obsolete|ne\s+pas\s+utiliser|ne\s+plus\s+utiliser|non\s+utilis\w*|inutilis\w*|"
-    r"n['’]?\s*(?:est|sont)\s+plus\s+utilis\w*|obsol[eè]te\w*|d[ée]pr[ée]ci[ée]\w*)", re.I)
+    r"(?:^|[.;!?]\s+|\n)[\s\W]*"
+    r"(?:(?:this|the)\s+(?:field|metric|label|index|column)\s+(?:is\s+|are\s+)?|"
+    r"(?:ce|cette|le|la)\s+(?:champ|m[ée]trique|label|index|colonne)\s+)?"
+    r"(?:(?:does|do|is|are)\s+)?"
+    r"(not\s+(?:be\s+)?used|unused|no\s+longer\s+used|deprecated|obsolete|do\s*n[o']?t\s+use|never\s+use|"
+    r"not\s+to\s+be\s+used|n['’]?\s*(?:est|sont)\s+plus\s+utilis\w*|ne\s+pas\s+utiliser|ne\s+plus\s+utiliser|"
+    r"non\s+utilis\w*|inutilis\w*|obsol[eè]te\w*|d[ée]pr[ée]ci[ée]\w*|[àa]\s+ne\s+pas\s+utiliser)\b", re.I)
 CACHE_S = 60.0
 QUERY_KEYS = ("sql", "expr", "promql", "query", "excel_sql", "chart_sqls", "sqls")
-_CACHE: dict[str, Any] = {"at": 0.0, "items": []}
+_CACHE: dict[str, Any] = {"at": 0.0, "items": [], "stamp": ""}
 
 
 def says_not_used(obj: Any) -> bool:
@@ -32,8 +39,11 @@ def says_not_used(obj: Any) -> bool:
 
 def excluded() -> list[dict[str, Any]]:
     """Every object the team said not to use: kind, database id, parent (index or metric), name and
-    the team's words (read again every CACHE_S seconds)."""
-    if time.time() - _CACHE["at"] < CACHE_S:
+    the team's words (read again every CACHE_S seconds, and as soon as the knowledge changed)."""
+    from supagent.knowledge.freshness import stamp
+
+    changed = stamp()
+    if time.time() - _CACHE["at"] < CACHE_S and _CACHE["stamp"] == changed:
         return _CACHE["items"]
     items = []
     try:
@@ -47,7 +57,7 @@ def excluded() -> list[dict[str, Any]]:
         db.session.commit()
     except Exception:  # pylint: disable=broad-except   (tables not created yet)
         db.session.rollback()
-    _CACHE.update(at=time.time(), items=items)
+    _CACHE.update(at=time.time(), items=items, stamp=changed)
     return items
 
 

@@ -195,6 +195,7 @@ def changes_by_type(run_id: int, source_id: int) -> dict[str, int]:
 
 
 SCHEDULED_TRIES = 3          # a scheduled run stopped by a restart or an error is tried again, 3 times a day
+KINDS = ("learn", "context")  # runs that read the databases and use the LLM: never two at a time
 
 
 def running_run() -> Run | None:
@@ -207,12 +208,12 @@ def running_run() -> Run | None:
     now = dt.datetime.utcnow()
     limit = now - dt.timedelta(minutes=2 * int(settings.get("learn.max_minutes")) + 5)
     changed = False
-    for r in db.session.query(Run).filter(Run.kind == "learn", Run.status == "running", Run.started_at <= limit):
+    for r in db.session.query(Run).filter(Run.kind.in_(KINDS), Run.status == "running", Run.started_at <= limit):
         r.status, r.finished_at = "interrupted", now
         r.error = r.error or "the process stopped before the end of the run (a restart?)"
         changed = True
     stopping = None
-    for r in db.session.query(Run).filter(Run.kind == "learn", Run.status == "stopping").order_by(Run.id.desc()):
+    for r in db.session.query(Run).filter(Run.kind.in_(KINDS), Run.status == "stopping").order_by(Run.id.desc()):
         asked = asked_at(r)
         if asked is not None and (now - asked).total_seconds() < STOP_GRACE:
             stopping = stopping or r
@@ -222,12 +223,12 @@ def running_run() -> Run | None:
         changed = True
     if changed:
         db.session.commit()
-    running = (db.session.query(Run).filter(Run.kind == "learn", Run.status == "running", Run.started_at > limit)
+    running = (db.session.query(Run).filter(Run.kind.in_(KINDS), Run.status == "running", Run.started_at > limit)
                .order_by(Run.id.desc()).first())
     return running or stopping
 
 
-def _start_run(reason: str) -> int | None:
+def _start_run(reason: str, kind: str = "learn") -> int | None:
     """Create the run, unless another process (a worker, a web server, cron) started one
     meanwhile: the check and the insert hold a row lock, so only one of them starts it
     (PostgreSQL, MySQL; SQLite writes one at a time anyway). Called after running_run(), whose
@@ -244,12 +245,12 @@ def _start_run(reason: str) -> int | None:
             db.session.rollback()
     db.session.query(Meta).filter(Meta.key == START_LOCK).with_for_update().one()
     limit = dt.datetime.utcnow() - dt.timedelta(minutes=2 * int(settings.get("learn.max_minutes")) + 5)
-    busy = (db.session.query(Run.id).filter(Run.kind == "learn", Run.status.in_(("running", "stopping")),
+    busy = (db.session.query(Run.id).filter(Run.kind.in_(KINDS), Run.status.in_(("running", "stopping")),
                                             Run.started_at > limit).first())
     if busy is not None:
         db.session.rollback()                          # the lock ends
         return None
-    run = Run(kind="learn", reason=reason, status="running", stats={})
+    run = Run(kind=kind, reason=reason, status="running", stats={})
     db.session.add(run)
     db.session.commit()                                # the lock ends
     return run.id
@@ -259,9 +260,9 @@ def run_learning(reason: str = "manual", databases: list[str] | None = None, llm
                  max_minutes: int | None = None) -> dict[str, Any]:
     """Learn now; returns the run's summary (also stored in supagent_run). Its LLM calls wait
     while answers are being computed (supagent.priority)."""
-    from supagent.llm import background
+    from supagent.llm import background, llm_task
 
-    with background():
+    with background(), llm_task("learn"):
         return _run_learning(reason, databases, llm, max_minutes)
 
 

@@ -84,7 +84,8 @@ def test_entries_are_checked_versioned_and_restorable(clean):
     restore_entry(e.id, 1, by="alice")                                          # back to v1, undeleted
     assert load_catalog()["indices"]["jobs"]["description"] == "v1"
     save_entry({"title": "No UAT", "classification": "rule", "content": "Exclude UAT unless asked."}, by="alice")
-    assert rules() == [{"title": "No UAT", "category": "", "text": "Exclude UAT unless asked."}]
+    assert [{k: v for k, v in r.items() if k != "id"} for r in rules()] == [
+        {"title": "No UAT", "category": "", "text": "Exclude UAT unless asked."}]
 
 
 def test_two_entries_for_one_index_are_reported(clean):

@@ -67,8 +67,8 @@ def test_the_question_comes_last_after_what_was_found(ctx, monkeypatch):
     from supagent.agent import ChartGuard
 
     a.guard = ChartGuard(a)
-    monkeypatch.setattr(Agent, "_system", lambda self, q: "RULES")
-    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q: "Where the data is: metric x")
+    monkeypatch.setattr(Agent, "_system", lambda self, q, shown=None: "RULES")
+    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q, shown=None: "Where the data is: metric x")
     a.ask("How many?", history=[{"role": "user", "content": "Before"}, {"role": "assistant", "content": "Earlier."}])
     roles = [m["role"] for m in seen[0]]
     assert roles == ["system", "user", "assistant", "user"] and seen[0][0]["content"] == "RULES"
@@ -117,3 +117,53 @@ def test_the_words_people_use_reach_the_right_sections(question, expected):
     from supagent.agent import intents
 
     assert intents(question) == expected
+
+
+@pytest.mark.parametrize("question, tools", [
+    ("Save that query in SQL Lab as 'Failed jobs 23 Sep'", {"save_sql_query"}),
+    ("Open it in SQL Lab", {"open_sql_lab_with_context"}),
+    ("Give me a link to explore the failed jobs per node", {"generate_explore_link"}),
+    ("What does the chart 42 show? Give me its numbers", {"get_chart_data"}),
+])
+def test_superset_sql_lab_explore_and_chart_data_tools_are_offered_when_asked(ctx, question, tools):
+    from supagent.agent import TOOLS_OF, intents
+    from supagent.superset_mcp import TOOLS
+
+    assert tools <= set(TOOLS)                                        # asked of Superset's MCP service
+    found = intents(question)
+    offered = set().union(*(TOOLS_OF.get(k, set()) for k in found))
+    assert tools <= offered, (found, offered)
+
+
+def test_list_datasets_stays_offered_for_every_question():
+    from supagent.agent import INTENT_TOOLS
+
+    assert not {"list_datasets", "execute_sql", "describe_data", "get_dataset_info"} & INTENT_TOOLS
+
+
+@pytest.mark.parametrize("question", [
+    "What is happening now in production?",
+    "Is everything normal with the tenants gateway?",
+    "Any issue on the PAYROLL application right now?",
+    "Que se passe-t-il en ce moment sur les serveurs ?",
+])
+def test_a_status_question_gets_the_procedure_and_the_tools_to_check(ctx, question):
+    from supagent.agent import SECTIONS, TOOLS_OF, intents
+
+    found = intents(question)
+    assert "status" in found, found
+    offered = set().union(*(TOOLS_OF.get(k, set()) for k in found))
+    assert {"get_chart_data", "list_dashboards", "compare_to_usual", "chart_image"} <= offered
+    assert "compare with the usual" in SECTIONS["status"] and "check_health" in SECTIONS["status"]
+
+
+def test_a_follow_up_gets_the_tools_of_the_question_it_refers_to(ctx, monkeypatch):
+    from supagent.agent import Agent, intents
+
+    assert "read_charts" in intents("What charts are in it?")
+    a = _agent(True)
+    monkeypatch.setattr(Agent, "_question_blocks", lambda self, q, shown=None: "")
+    a.prompt("Save it as a line chart", history=[{"role": "user", "content": "Which dashboards do we have?"},
+                                               {"role": "assistant", "content": "Two."}])
+    offered = {s["function"]["name"] for s in a._specs_for("Save it as a line chart")}
+    assert "list_dashboards" in offered                            # the first question's (dashboards)

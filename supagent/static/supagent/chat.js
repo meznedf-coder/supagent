@@ -163,8 +163,10 @@
     };
     if (results.length > 1) {
       results.forEach(function (r, i) {
-        tabs.appendChild(el("button", { type: "button", role: "tab", text: "Result " + (i + 1) + " · " + S.num(r.row_count) + (r.row_count === 1 ? " row" : " rows"),
-                                        title: (r.sql || "").slice(0, 300), onclick: function () { show(i); } }));
+        var rows = S.num(r.row_count) + (r.row_count === 1 ? " row" : " rows");
+        tabs.appendChild(el("button", { type: "button", role: "tab", text: (r.title || "Result " + (i + 1)) + " · " + rows,
+                                        title: (r.title ? r.title + "\n" : "") + (r.sql || "").slice(0, 300),
+                                        onclick: function () { show(i); } }));
       });
       card.appendChild(tabs);
     }
@@ -180,7 +182,8 @@
     var measure = (p.nums || [])[0];
     var bar = el("div", { class: "viz-toolbar" });
     var body = el("div", { class: "viz-body" });
-    var caption = S.num(res.row_count) + " row" + (res.row_count === 1 ? "" : "s") + (res.database ? " · " + res.database : "") +
+    var caption = (res.title ? res.title + " · " : "") + S.num(res.row_count) + " row" + (res.row_count === 1 ? "" : "s") +
+                  (res.database ? " · " + res.database : "") +
                   (res.truncated ? " · first " + S.num((res.rows || []).length) + " rows here: ask for an Excel extract for all" : "");
     bar.appendChild(el("span", { class: "caption", text: caption }));
     var seg = el("span", { class: "seg", role: "group", "aria-label": "View" });
@@ -238,7 +241,27 @@
   }
 
   function feedbackView(m) {
-    var wrap = el("span", {});
+    var wrap = el("span", { class: "fb-wrap" });
+    var why = el("form", { class: "fb-why", hidden: true });
+    var input = el("input", { type: "text", maxlength: "1000", "aria-label": "What was wrong",
+      placeholder: "What was wrong? e.g. killed jobs count as failed too (optional)" });
+    why.appendChild(input);
+    why.appendChild(el("button", { type: "submit", class: "fb", text: "Send" }));
+    var said = el("span", { class: "fb-said muted" });
+    function showReason() {
+      said.textContent = m.feedback === -1 && m.feedback_reason ? "Your note: " + m.feedback_reason : "";
+      why.hidden = !(m.feedback === -1 && !m.feedback_reason);
+    }
+    why.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var reason = input.value.trim();
+      if (!reason) { why.hidden = true; return; }
+      S.chat("POST", "messages/" + m.id + "/feedback", { value: -1, reason: reason }).then(function (r) {
+        m.feedback_reason = r.feedback_reason;
+        showReason();
+        toast("Thank you: the admins see it, and the agent learns what it says about the data");
+      });
+    });
     [[1, "Helpful"], [-1, "Not helpful"]].forEach(function (p) {
       var b = el("button", { type: "button", class: "fb" + (m.feedback === p[0] ? " on" : ""), text: p[1],
         title: p[0] === 1 ? "Keep this answer's SQL as an example for similar questions" : "Mark this answer as not helpful",
@@ -246,13 +269,19 @@
           var value = m.feedback === p[0] ? 0 : p[0];
           S.chat("POST", "messages/" + m.id + "/feedback", { value: value }).then(function (r) {
             m.feedback = r.feedback;
+            m.feedback_reason = r.feedback_reason;
             wrap.querySelectorAll(".fb").forEach(function (x) { x.classList.remove("on"); });
             if (r.feedback === p[0]) b.classList.add("on");
             if (r.example_kept) toast("Kept as an example for similar questions");
+            showReason();
+            if (r.feedback === -1) input.focus();
           });
         } });
       wrap.appendChild(b);
     });
+    wrap.appendChild(why);
+    wrap.appendChild(said);
+    showReason();
     return wrap;
   }
 

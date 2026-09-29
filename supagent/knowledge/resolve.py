@@ -69,7 +69,7 @@ heure jour semaine mois annee aujourd hier maintenant plus moin evolution liste"
 GENERIC |= {stem(w) for w in GENERIC}
 
 _LOCK = threading.Lock()
-_CACHE: dict[Any, tuple[float, Any]] = {}
+_CACHE: dict[Any, tuple[float, Any, str]] = {}
 
 
 def norm(text: str) -> str:
@@ -94,15 +94,19 @@ def name_tokens(name: str) -> list[str]:
     return [stem(p) for p in (norm(p) for p in parts) if p]
 
 
-def _cached(key: Any, make: Any) -> Any:
-    now = time.time()
+def _cached(key: Any, make: Any, fresh: bool = True) -> Any:
+    """Kept TTL seconds; `fresh`: made again as soon as the knowledge changed (a description
+    written, a learning run: on any server, see freshness), not only after TTL."""
+    from supagent.knowledge.freshness import stamp
+
+    now, changed = time.time(), stamp() if fresh else ""
     with _LOCK:
         hit = _CACHE.get(key)
-        if hit and now - hit[0] < TTL:
+        if hit and now - hit[0] < TTL and hit[2] == changed:
             return hit[1]
     value = make()
     with _LOCK:
-        _CACHE[key] = (now, value)
+        _CACHE[key] = (now, value, changed)
     return value
 
 
@@ -117,7 +121,7 @@ def _metric_names(database: Any) -> list[tuple[str, list[str]]]:
         finally:
             conn.close()
 
-    return _cached(("metrics", database.id), make)
+    return _cached(("metrics", database.id), make, fresh=False)      # the live list: not the dictionary
 
 
 def _dictionary(source_ids: tuple[int, ...]) -> list[dict[str, Any]]:
@@ -136,6 +140,7 @@ def _dictionary(source_ids: tuple[int, ...]) -> list[dict[str, Any]]:
             out.append({"source_id": o.source_id, "kind": o.kind, "parent": o.parent or "", "name": o.name,
                         "words": set(terms(text)), "metric_type": o.metric_type, "unit": o.unit,
                         "data_type": o.data_type, "about": (o.description or o.backend_help or "")[:120],
+                        "ai": bool(o.description) and o.description_source == "llm" and not o.verified,
                         "series": st.get("series"), "labels": st.get("labels"), "values": st.get("values"),
                         "time_field": st.get("time_field")})
         return out
@@ -212,6 +217,27 @@ def _databases() -> list[Any]:
     from supagent.tools import agent_databases
 
     return agent_databases([d for d in db.session.query(Database).all() if can_use_database(d)])
+
+
+def tenants_of(database_id: int) -> list[str]:
+    """The Mimir tenants of a metrics database (values of its __tenant_id__ labels, learned)."""
+    from supagent.models import KObject, Source
+
+    def make() -> list[str]:
+        src = db.session.query(Source.id).filter(Source.database_id == database_id).first()
+        if src is None:
+            return []
+        values: set[str] = set()
+        for (st,) in (db.session.query(KObject.stats).filter(KObject.source_id == src[0], KObject.kind == "label",
+                                                              KObject.name == "__tenant_id__").limit(200)):
+            values |= set(map(str, (st or {}).get("values") or []))
+        return sorted(values)
+
+    try:
+        return _cached(("tenants", database_id), make)
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        return []
 
 
 def resolve(question: str) -> list[dict[str, Any]]:
@@ -398,8 +424,9 @@ def _sql(c: dict[str, Any]) -> str:
     return f'SELECT DATE_TRUNC(\'hour\', ts) AS t, {value} FROM "{name}" {where} GROUP BY 1 ORDER BY 1'
 
 
-def where_block(question: str) -> str:
-    """The candidates as a block of the system prompt ("" when nothing matches)."""
+def where_block(question: str, shown: set[str] | None = None) -> str:
+    """The candidates as a block of the system prompt ("" when nothing matches). `shown` gets the
+    titles of the knowledge pieces of the metrics and indices given with their details."""
     try:
         ranked = resolve(question)
     except Exception as ex:  # pylint: disable=broad-except
@@ -417,6 +444,8 @@ def where_block(question: str) -> str:
     lookups = 0
     for c in ranked[:DETAILED]:
         d = c["database"]
+        if shown is not None and c["kind"] in ("metric", "index"):
+            shown.add(f'{c["kind"]} {c["name"]}')
         where = f'database {d.id} "{d.database_name}" ({d.backend})'
         if c["kind"] == "metric":
             if not c.get("metric_type") and lookups < LIVE_LOOKUPS:
@@ -430,16 +459,20 @@ def where_block(question: str) -> str:
                 bits.append(f"{c['series']} series")
             if c.get("labels"):
                 bits.append("labels: " + ", ".join(map(str, c["labels"][:10])))
-            about = f' - {c["about"]}' if c.get("about") else ""
+            tenants = tenants_of(d.id) if "__tenant_id__" in map(str, c.get("labels") or []) else []
+            if len(tenants) > 1:
+                bits.append("tenants (__tenant_id__, each usually a different application or subject): "
+                            + ", ".join(tenants[:12]))
+            about = f' - {c["about"]}' + (" (AI-written, unverified)" if c.get("ai") else "") if c.get("about") else ""
             lines.append(f'- metric "{c["name"]}" ({"; ".join(bits) or "metric"}) in {where}{about}. SQL: {_sql(c)}')
         elif c["kind"] == "index":
             tf = f', time field "{c["time_field"]}"' if c.get("time_field") else ""
-            about = f' - {c["about"]}' if c.get("about") else ""
+            about = f' - {c["about"]}' + (" (AI-written, unverified)" if c.get("ai") else "") if c.get("about") else ""
             lines.append(f'- index "{c["name"]}"{tf} in {where}{about}')
         else:
             vals = c.get("values") or []
             v = f"; values: {', '.join(map(str, vals[:8]))}" if vals and len(vals) <= 20 else ""
-            about = f' - {c["about"]}' if c.get("about") else ""
+            about = f' - {c["about"]}' + (" (AI-written, unverified)" if c.get("ai") else "") if c.get("about") else ""
             lines.append(f'- field "{c["name"]}" ({c.get("data_type") or "field"}{v}) of index "{c["parent"]}" in '
                          f"{where}{about}")
         if c["kind"] in ("metric", "index"):

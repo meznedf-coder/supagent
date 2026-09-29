@@ -35,7 +35,11 @@ table") is not durable unless the user says it applies from now on, always, or t
 Answer with a JSON list only (empty list when nothing is durable):
 [{"text": "...", "scope": "personal" or "team", "kind": "preference" or "rule" or "fact",
   "category": "a short topic"}]
-scope "team" only when the user says it applies to everyone or states a business rule."""
+scope "team" only when the user says it applies to everyone or states a business rule.
+When the assistant asked the user what a word meant and the user answered, the answer is a
+definition worth keeping (team, fact, when it says what a business word or a field means). When
+the user marked the answer Not helpful and said why, keep what the reason says about the data or
+how to compute it (a rule or a definition: team), not a complaint."""
 
 
 def _norm(text: str) -> str:
@@ -51,19 +55,29 @@ def _similar(a: str, b: str) -> bool:
 
 def add(user_id: int, text: str, scope: str = "user", kind: str = "preference", category: str | None = None,
         source: str = "manual", message_id: int | None = None, approved_by: str | None = None) -> Memory | None:
-    """A memory (None when an equivalent one exists)."""
+    """A memory (None when an equivalent one exists). Never a second copy: a person writing again a
+    memory that was disabled brings it back (for the team: to approve again); one learned from a chat
+    that someone disabled stays disabled (it was refused)."""
     text = (text or "").strip()
     if not text:
         return None
     scope = "team" if scope in ("team", "everyone") else "user"
-    q = db.session.query(Memory).filter(Memory.status != "disabled")
+    q = db.session.query(Memory)
     q = q.filter(Memory.scope == "team") if scope == "team" else q.filter(Memory.scope == "user",
                                                                            Memory.user_id == user_id)
-    if any(_similar(m.text, text) for m in q.limit(2000)):
-        return None
+    same = [m for m in q.limit(5000) if _similar(m.text, text)]
     status = "active"
     if scope == "team" and settings.get("memory.team_approval") and not approved_by:
         status = "proposed"
+    if same:
+        kept = next((m for m in same if m.status != "disabled"), None)
+        if kept is not None or source != "manual":
+            return None
+        m = same[0]                                     # written again by a person: back, not a copy
+        m.status, m.text, m.approved_by = status, text[:1000], approved_by
+        m.kind = kind if kind in ("preference", "rule", "fact") else m.kind
+        db.session.commit()
+        return m
     m = Memory(scope=scope, user_id=user_id, kind=kind if kind in ("preference", "rule", "fact") else "preference",
                text=text[:1000], category=(category or None), status=status, source=source, message_id=message_id,
                approved_by=approved_by)
@@ -111,9 +125,19 @@ def learn_from_message(message_id: int, llm: Any = None) -> list[int]:
     if conv is None or question is None:
         return []
     exchange = f"USER: {question.content[:3000]}\nASSISTANT: {(answer.content or '')[:3000]}"
+    asked = asked_back(question)
+    if asked is not None:                              # the user answered a question of the assistant
+        first, back = asked
+        exchange = (f"USER: {first.content[:2000]}\nASSISTANT (asking what the user meant): {back.content[:1500]}\n"
+                    + exchange)
+    if answer.feedback == -1 and answer.feedback_reason:
+        exchange += f"\nUSER (marked this answer Not helpful): {answer.feedback_reason[:1000]}"
+    from supagent.llm import llm_task
+
     try:
-        msg = (llm or LLM()).chat([{"role": "system", "content": PROMPT}, {"role": "user", "content": exchange}],
-                                  max_tokens=600)
+        with llm_task("memory", user_id=conv.user_id, message_id=message_id):
+            msg = (llm or LLM()).chat([{"role": "system", "content": PROMPT}, {"role": "user", "content": exchange}],
+                                      max_tokens=600)
     except Exception as ex:  # pylint: disable=broad-except
         log.warning("supagent memory: %s", ex)
         return []
@@ -133,10 +157,25 @@ def learn_from_message(message_id: int, llm: Any = None) -> list[int]:
         if m is not None:
             made.append(m.id)
     if made:
-        from supagent.knowledge.index import sync
+        from supagent.knowledge.index import embed_few, sync
 
-        sync(("memory:",))
+        embed_few(sync(("memory:",)))
     return made
+
+
+def asked_back(question: Message) -> tuple[Message, Message] | None:
+    """(the user's question before, the assistant's question back) when `question` answers what
+    the assistant asked (rule 6 of the agent)."""
+    from supagent.agent import asks_back
+
+    back = (db.session.query(Message).filter(Message.conversation_id == question.conversation_id,
+                                             Message.id < question.id).order_by(Message.id.desc()).first())
+    if back is None or back.role != "assistant" or not asks_back(back.content or ""):
+        return None
+    first = (db.session.query(Message).filter(Message.conversation_id == question.conversation_id,
+                                              Message.id < back.id, Message.role == "user")
+             .order_by(Message.id.desc()).first())
+    return (first, back) if first is not None else None
 
 
 def memories_for(user_id: int | None, limit: int = 15) -> list[Memory]:
@@ -152,10 +191,11 @@ KIND_ORDER = {"rule": 0, "preference": 1, "fact": 2}
 ENTRY_CHARS = 400
 
 
-def prompt_block(user_id: int | None) -> str:
+def prompt_block(user_id: int | None, shown: set[str] | None = None) -> str:
     """The memories given with every question, within memory.prompt_chars: rules, then
     preferences, then facts (the user's own first, the newest first). Facts left out are still
-    found by the knowledge search when a question is about them."""
+    found by the knowledge search when a question is about them (`shown` gets the refs of the
+    ones given, not given twice)."""
     items = memories_for(user_id)
     if not items:
         return ""
@@ -175,4 +215,29 @@ def prompt_block(user_id: int | None) -> str:
             continue
         lines.append(line)
         used += len(line)
+        if shown is not None:
+            shown.add(f"memory:{m.id}")
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
+STATUS_RANK = {"active": 0, "catalog": 1, "proposed": 2, "disabled": 3}
+
+
+def merge_duplicates() -> int:
+    """Copies of a memory (the same words, the same scope and, for a personal one, the same user): one
+    stays (active first, then the newest), the others are deleted. Returns how many were deleted."""
+    groups: dict[tuple, list[Memory]] = {}
+    for m in db.session.query(Memory):
+        key = (m.scope, m.user_id if m.scope == "user" else None, _norm(m.text))
+        groups.setdefault(key, []).append(m)
+    gone = 0
+    for same in groups.values():
+        if len(same) < 2:
+            continue
+        same.sort(key=lambda m: (STATUS_RANK.get(m.status or "", 4), -(m.id or 0)))
+        for m in same[1:]:
+            db.session.delete(m)
+            gone += 1
+    if gone:
+        db.session.commit()
+    return gone

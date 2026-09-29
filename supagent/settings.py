@@ -59,6 +59,10 @@ SPECS: list[Spec] = [
     Spec("agent.now", "", "str", "A fixed 'now' (YYYY-MM-DD HH:MM) for demos on old data; empty: the clock"),
     Spec("agent.extra_instructions", "", "str", "More instructions added to the agent's prompt"),
     Spec("agent.disabled_tools", [], "list", "Tools the agent must not use (e.g. send_email)"),
+    Spec("usage.keep_days", 90, "int", "Days the record of every LLM call is kept (the LLM usage page); 0: kept"),
+    Spec("agent.check_numbers", True, "bool", "Every number of an answer must come from what the agent was given "
+         "(query results, their totals and rates, the question, the knowledge): the agent is asked once to take "
+         "the others from a query, then they are marked in the answer"),
     # ---- learning
     Spec("learn.enabled", True, "bool", "Learn once a day (at the hour below, on the days below)"),
     Spec("learn.hour", 2, "int", "Daily at this hour (0-23, server time): ONE run per day, not every N hours"),
@@ -93,6 +97,11 @@ SPECS: list[Spec] = [
          "the metrics or indices its successful queries read (used to find them for the next questions; Not helpful "
          "takes them back). Not listed with the learned answers"),
     Spec("learn.llm_descriptions", True, "bool", "Ask the LLM to describe what has no description (marked unverified)"),
+    Spec("context.enabled", True, "bool", "Build the Context every night: the system's functional and technical "
+         "documentation, from the documents, the catalog, the team memory, the data dictionary and the Helpful answers"),
+    Spec("context.hour", 4, "int", "Hour of the nightly Context build (after the day's learning run)"),
+    Spec("context.max_llm_calls", 12, "int", "LLM calls of a Context build at most (its summary pages: only the ones "
+         "whose sources changed are written again; the facts pages need no LLM)"),
     Spec("learn.agent_catalog", True, "bool", "The agent adds catalog entries when the evidence is certain: "
          "formulas used in answers confirmed as helpful, team rules and facts approved by an admin, definitions "
          "quoted word for word from the documents. Written as (agent): edit one to take it over; delete it and the "

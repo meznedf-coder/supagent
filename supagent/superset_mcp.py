@@ -22,8 +22,8 @@ from supagent.registry import _inline_refs
 
 log = logging.getLogger(__name__)
 TOOLS = ("get_chart_type_schema", "generate_chart", "update_chart", "update_chart_preview", "list_charts",
-         "get_chart_info", "generate_dashboard", "add_chart_to_existing_dashboard", "list_dashboards",
-         "get_dashboard_info")
+         "get_chart_info", "get_chart_data", "generate_dashboard", "add_chart_to_existing_dashboard", "list_dashboards",
+         "get_dashboard_info", "generate_explore_link", "save_sql_query", "open_sql_lab_with_context")
 
 
 def result_text(result: Any) -> str:

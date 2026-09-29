@@ -16,7 +16,7 @@ from superset.extensions import encrypted_field_factory
 
 from supagent.textsafe import SafeString, SafeText
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 
 def _now() -> dt.datetime:
@@ -143,6 +143,7 @@ class Message(db.Model):  # type: ignore[name-defined]
     files = sa.Column(sa.JSON)                 # files the answer made (images, Excel), by id
     results = sa.Column(sa.JSON)               # rows of the queries it ran (table / chart views of the page)
     feedback = sa.Column(sa.Integer)           # +1 / -1
+    feedback_reason = sa.Column(SafeText)      # what was wrong, said with Not helpful (for the admins, the memory)
     task_id = sa.Column(SafeString(64))
     created_at = sa.Column(sa.DateTime, default=_now)
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)   # last progress (steps saved)
@@ -362,6 +363,25 @@ class Document(db.Model):  # type: ignore[name-defined]
     updated_by = sa.Column(SafeString(255))
 
 
+class LLMCall(db.Model):  # type: ignore[name-defined]
+    """One call to the LLM (the admins' usage page): what it was for, for whom, its size and time."""
+    __tablename__ = "supagent_llm_call"
+    id = sa.Column(sa.Integer, primary_key=True)
+    at = sa.Column(sa.DateTime, default=_now, index=True)
+    task = sa.Column(SafeString(24), index=True)        # answer | learn | context | memory | helpful | tidy | catalog | test
+    user_id = sa.Column(sa.Integer, index=True)         # the person an answer was for (none for the nightly work)
+    message_id = sa.Column(sa.Integer)
+    run_id = sa.Column(sa.Integer)
+    model = sa.Column(SafeString(128))
+    prompt_tokens = sa.Column(sa.Integer)               # the context sent (instructions, chat, knowledge, results)
+    completion_tokens = sa.Column(sa.Integer)
+    cached_tokens = sa.Column(sa.Integer)               # of the prompt, from the LLM server's prompt cache
+    seconds = sa.Column(sa.Float)
+    tools = sa.Column(sa.Integer)                       # tools offered with the call
+    ok = sa.Column(sa.Boolean, default=True)
+    error = sa.Column(SafeString(300))
+
+
 class Usage(db.Model):  # type: ignore[name-defined]
     """What one answer took: its LLM calls (seconds, tokens, and how many prompt tokens the LLM
     server's prompt cache saved) and its tool calls (superset supagent stats)."""
@@ -382,8 +402,34 @@ class Usage(db.Model):  # type: ignore[name-defined]
     nudges = sa.Column(sa.Integer)                # answers sent back to the LLM (no tool used, a step announced)
 
 
+class ContextPage(db.Model):  # type: ignore[name-defined]
+    """A page of the Context: what the system is, functionally and technically, written every night
+    from the shared knowledge (documents, catalog, team memory, data dictionary, Helpful answers).
+    Facts pages are written without the LLM; summary pages by the LLM from the evidence only (marked
+    AI-written, with their sources). A page a person edited is never written over by the agent. It is
+    shown only to the users who may query every database it draws from (database_ids)."""
+
+    __tablename__ = "supagent_context"
+    __table_args__ = (sa.UniqueConstraint("section", "slug", name="uq_supagent_context_page"),)
+    id = sa.Column(sa.Integer, primary_key=True)
+    section = sa.Column(SafeString(16), nullable=False)      # functional | technical
+    slug = sa.Column(SafeString(128), nullable=False)
+    title = sa.Column(SafeString(255), nullable=False)
+    kind = sa.Column(SafeString(16), default="facts")         # facts (no LLM) | summary (LLM)
+    content = sa.Column(SafeText)                             # Markdown
+    sources = sa.Column(sa.JSON)                              # [{"ref": "doc:3", "title": ...}]
+    database_ids = sa.Column(sa.JSON)                         # the databases it draws from
+    input_hash = sa.Column(SafeString(64))                    # of its evidence: written again only when it changes
+    author = sa.Column(SafeString(255), default="agent")      # agent | the person who edited it
+    version = sa.Column(sa.Integer, default=1)
+    llm_calls = sa.Column(sa.Integer, default=0)
+    tokens = sa.Column(sa.Integer, default=0)
+    created_at = sa.Column(sa.DateTime, default=_now)
+    updated_at = sa.Column(sa.DateTime, default=_now)
+
+
 TABLES = [Meta, Setting, Source, KObject, Relation, Run, Change, Conversation, Message, File, Example, Document,
-          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association, Usage]
+          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association, Usage, ContextPage, LLMCall]
 
 
 def _add_missing_columns(engine: sa.engine.Engine) -> list[str]:

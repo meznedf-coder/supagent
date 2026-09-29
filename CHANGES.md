@@ -1,5 +1,148 @@
 # Changes
 
+## 0.5.0 (2026-09-29)
+
+* **Context**: every night (after the day's learning) the agent writes the system's documentation,
+  *Functional* and *Technical* (Data dictionary -> Context), from what the team shares (documents and
+  sites, catalog, team memory, data dictionary, Helpful answers; not the raw chats). Facts pages are
+  written without the LLM (each data source, each inventory of servers, services, applications,
+  environments, regions, clusters and teams, the glossary, the rules and facts); summary pages (how
+  the system works, the technical overview, one page per main application) by the LLM from the
+  evidence only, citing it, marked AI-written, and only when their evidence changed (at most
+  `context.max_llm_calls` calls per build). A page is shown only to the users who may query every
+  database it draws from; admins correct pages (never written over); the agent finds them in its
+  knowledge search, below the catalog and the documents. `superset supagent context --build`.
+  Tables: `superset supagent init` adds `supagent_context` (schema 5).
+* **Data dictionary**: a *Knowledge* tab (the catalog, the documents and sites, the team memory, read
+  only) and, in the *Learned* tab, what the agent learned by itself (its catalog entries with their
+  evidence, where the data of the questions was found, the relations measured, the AI descriptions
+  to verify), each filtered by the databases the user may query. The long lists (query timings,
+  changes, relations, and the runs of the settings page) come in pages, like Browse.
+* `superset supagent prompt "question" --user U`: what the LLM is given for a question (the team's
+  rules, the user's and the team's memory, where the data is with its descriptions, the knowledge
+  found: documents, catalog, Context, learned answers), without asking the LLM. A test checks, end
+  to end, that each of them reaches the LLM, and nothing the user may not see.
+* **Nothing the team puts in is missed, nothing given twice**:
+  * a description written in the Data dictionary, a catalog entry saved, deleted, restored or
+    imported is used by the next answer on every server (a knowledge stamp in Superset's database
+    makes each web server and worker read the dictionary, the catalog and what not to use again,
+    instead of after 1 to 5 minutes), and the agent's search finds it at once (its pieces written
+    and embedded straight away; before: at the next learning run). A description the catalog no
+    longer gives is taken back (unless a person wrote another one since);
+  * the team's words: the glossary terms of a question (their words, a code such as D-1 or W-4 that
+    their definition uses, the terms they name) are given in full with the question, before where
+    the data is; each term is also its own piece of the search (the whole glossary was one piece,
+    rarely found);
+  * the knowledge found with a question no longer repeats what the other parts give (a metric of
+    the same name in two databases, the metrics of "Where the data is", the learned answers, the
+    memories, the team's rules): its room goes to the catalog, the documents and the Context (a
+    Context page counted as found much lower than it was; now at most two, the page about a subject
+    of the question first);
+  * the columns the OpenSearch connector computes (the business-day label and time of osagg) are in
+    the dictionary with what they are, and the catalog's descriptions reach them;
+  * saving a memory or a document no longer reads the whole dictionary again.
+* `superset supagent check-knowledge`: is everything the team put in given to the agent? Pieces out
+  of step, pieces without a vector, catalog entries ignored (invalid) or in conflict, names the
+  catalog describes that the dictionary does not have (misspelled, or not learned: their text reaches
+  nothing), rules not given in full, what waits for an admin. Exit code 1 when there is a problem.
+* **Numbers checked**: every number of an answer must come from what the agent was given (a value
+  of a query result, as shown or rounded, a share as a percentage, seconds in minutes, bytes in GB, a
+  column's total or average, the total of its first rows, a row count, a rate within a row, a
+  duration between two times; the question's, the chat's and the knowledge's numbers). Otherwise the
+  agent is asked once to take it from a query (totals, rates, differences computed in the query),
+  and a number still made up is marked in the answer. Replayed on the lab's 271 stored answers, it
+  caught totals added up wrongly (7,014 or 6,461 failed jobs for 7,011). Setting
+  `agent.check_numbers` (on).
+* **The team's rules are applied**: in the lab the model ignored a catalog rule ("exclude UAT unless
+  asked") in 4 answers out of 4, although it was in its instructions. The rules now also come next
+  to the question (in full when short) and win over the learned answers; and a rule that filters on a
+  field or label and asks for it (exclude, only, unless, never...: `ENVIRONMENT_TYPE = 'UAT'`) is
+  checked on the queries: a query on data that has that field and does not use it sends the answer
+  back once, then the answer is marked (unless the question asks for the rule's value); a rule that
+  only says what a value means ("KO = failed") is never checked that way.
+* **Names too**: a server, host or other name with digits that the answer writes must come from what
+  the agent was given (in the lab it answered "srv-amer-000 through srv-amer-199" after seeing 25 of
+  the servers: the series was continued, and wrong).
+* **A value that does not exist** ("the jobs of ZEPHYR"): a count of 0 now comes with the
+  dictionary's note that the value is not one of the field's values, so the answer says so instead of
+  "0 jobs failed".
+* **LLM usage page** (admins: the *LLM usage* tab next to *Settings*): every call to the LLM is recorded
+  with what it was for (the answers in the chat, the daily learning, the Context, the memory, learned
+  answers, the agent catalog, tidying, tests), for whom, its model, its context size (tokens sent), the
+  tokens written, how much came from the LLM server's prompt cache, its time, and whether it failed. The
+  page shows them for a period (the last 24 hours, 7, 30 or 90 days, or dates; by hour or by day, in
+  the viewer's time zone): totals, tokens or calls over time by task, per person, per task, per model,
+  the answers (time, LLM and tool calls per answer, answers sent back by the checks, answers marked),
+  the biggest contexts and the slowest answers. Calls are kept `usage.keep_days` (90). Table
+  `supagent_llm_call` (schema 7: `superset supagent init`).
+* **Fixed**: a data source's Context page listed its links with the other data sources, naming their
+  metrics to users who may not query them; the links are now pages of their own, seen only by the users
+  who may query both databases.
+* **What is happening now**: "what is happening in production / with an application / on this metric,
+  chart or dashboard", "is everything normal" get a procedure and the tools for it: the dashboards and
+  charts about the subject (Superset's charts and dashboards are now part of the knowledge: what each
+  shows, its dataset, metrics, filters, the dashboards it is on; seen only by the users Superset lets
+  open the chart, or the dashboard and all its charts), their latest data (`get_chart_data`), the team's
+  checks and limits, the alerts
+  firing, the comparison with the usual (the same window of the previous weeks), and a screenshot of
+  a chart that shows a problem.
+* **Follow-ups get the tools they need**: "what charts are in it?" after a question about a dashboard
+  had no Superset tool (it named no chart nor dashboard); a question that refers back now gets the
+  tools and instructions of the one it refers to. A saved chart must have a name saying what it shows
+  and its period (Superset's automatic names repeated "Sum(x) by y" for two different charts).
+* **More of Superset's MCP tools**: save a query in SQL Lab (`save_sql_query`), a link that opens SQL
+  Lab with a query (`open_sql_lab_with_context`), a link to explore a dataset (`generate_explore_link`),
+  the data of an existing chart (`get_chart_data`), offered when a question asks for them; an answer
+  saying a query was saved in SQL Lab is checked like a chart or a dashboard. After a chart is saved or
+  changed, the agent is told what the saved chart returns (rows, first values), so that its answer
+  describes the chart, not the intent; a chart of a period on a table must filter that period.
+* **Mimir tenants**: `__tenant_id__` usually separates applications or subjects: the agent filters on
+  the tenant a question is about, groups by it to compare, never adds tenants up unless asked, and
+  names them; "Where the data is" lists a metric's tenants, and the Context inventory has a Tenants
+  section.
+* **The Context stays short with a big dictionary** (10,000 metrics, 80,000 labels): a data source's
+  page lists the 25 metrics and indices that matter (a person's description, the catalog, the ones the
+  answers used and the learned answers), the rest counted by domain, not every description.
+* **Results named, tries not shown**: an answer's results were shown as "Result 1", "Result 2"... with
+  nothing to tell them apart. A query run again in the same shape (the same table, columns and time
+  window: fixed after an error, a check or a rule) now replaces its earlier try (still listed in the
+  answer's tool calls) when it only adds conditions; other conditions (PROD, then UAT) are a comparison
+  and both stay. Each result is named by what it shows ("FAILED by APPLICATION · 23 Sep", "CPU busy %
+  over time · 23 Sep 00:00-08:00"); two results of the same name say what differs (their filters).
+* **A reply the LLM server cannot read** (a tool call of 53,000 characters, cut): the model is asked
+  once again with short arguments instead of the answer failing with an HTTP 500; after that, it says
+  what it did. An aggregate inside an aggregate on the metrics (`AVG(SUM(...))`) now comes with the way
+  to write it (the ratio of the two sums is already the share over the window; the 5 busiest with
+  ORDER BY ... LIMIT 5).
+* **Dashboards of several charts**: the agent has twice the tool calls when it builds charts and
+  dashboards, is told not to spend them re-checking the data, and when the calls run out it writes
+  what it saved (with the links) and what remains, instead of "stopped after too many tool calls".
+  A dataset on OpenSearch whose SQL has an ORDER BY could not be created (osagg turned the LIMIT 0
+  Superset adds into a top-0 request that OpenSearch refuses): the dataset's SQL is wrapped.
+* **AI descriptions**: a unit is written only when the name spells it or the values prove it (in the
+  lab a duration in seconds, named `..._d`, was described "in days"); in "Where the data is" an
+  unverified AI description is marked as such.
+* **The agent asks when a question can mean two things** that give different numbers (two fields or
+  metrics that fit, a term nobody defined): one short question naming the readings and the one it
+  would take, instead of guessing; otherwise it says in one line which reading it took. The user's
+  answer is learned (a team definition, for an admin to approve).
+* **No copies in the team's knowledge, and a real Delete**: writing again a memory that exists gave a
+  second one (removing a memory only disabled it, and the next one was a new copy); a catalog entry
+  could be created twice. Now a memory written again is the same one (brought back if a person writes
+  it after it was disabled; one learned again from a chat stays refused), Delete removes a memory for
+  good (the user's own, or any for an admin, with *Delete* in the settings' Team memory list; *Disable*
+  keeps one unused), `superset supagent init` merges the copies already there, and the catalog refuses
+  a second entry of the same title, or of the same classification and content ("edit that one").
+* **Not helpful, and why**: after Not helpful, the chat asks what was wrong (optional). The reason is
+  shown to the admins (`superset supagent gaps`) and what it says about the data is proposed to the
+  memory. Column `feedback_reason` (schema 6).
+* **The chat panel on Superset's pages**: with a long conversation open, the buttons Conversations,
+  New conversation and Memory scrolled out of sight (the panel's page grew with the conversation);
+  now only the messages scroll.
+* **Fixed (0.4.8)**: "not used" was also read inside an explanation ("mode idle = unused" in the
+  description of a CPU metric made the agent refuse that metric). It now counts only when the
+  description, or one of its sentences, starts by saying so.
+
 ## 0.4.8 (2026-09-29)
 
 * **Learning much faster on metric names with dots**: the batched Mimir requests (series counts,

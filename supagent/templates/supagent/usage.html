@@ -1,0 +1,54 @@
+{% extends "supagent/base.html" %}
+{% block title %}LLM usage{% endblock %}
+{% block content %}
+<div class="usage">
+  <section class="usage-head">
+    <div>
+      <h1>LLM usage</h1>
+      <p class="muted">Every call to the LLM: what it was for (the answers in the chat, the daily learning, the
+        Context, the memory...), for whom, how big its context was, how much came from the LLM server's prompt
+        cache, how long it took. Admins only.</p>
+    </div>
+    <form id="range" class="usage-range" autocomplete="off">
+      <label>Period
+        <select id="preset">
+          <option value="1">Last 24 hours</option>
+          <option value="7">Last 7 days</option>
+          <option value="30">Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="custom">Dates...</option>
+        </select>
+      </label>
+      <label class="custom" hidden>From <input type="datetime-local" id="from"></label>
+      <label class="custom" hidden>To <input type="datetime-local" id="to"></label>
+      <label>By
+        <select id="grain"><option value="auto">auto</option><option value="hour">hour</option>
+          <option value="day">day</option></select>
+      </label>
+      <button type="submit" class="btn primary">Show</button>
+    </form>
+  </section>
+  <div id="usage-note" class="muted" aria-live="polite"></div>
+  <section class="tiles" id="tiles"></section>
+  <section class="card">
+    <h2>Tokens over time, by task</h2>
+    <div class="viz-toolbar"><span class="caption" id="series-caption"></span>
+      <span class="seg" role="group" aria-label="Measure">
+        <button type="button" class="on" data-measure="tokens">Tokens</button>
+        <button type="button" data-measure="calls">Calls</button></span></div>
+    <div id="series" class="viz-body"></div>
+  </section>
+  <section class="tiles" id="answer-tiles"></section>
+  <div class="usage-cols">
+    <section class="card"><h2>By person</h2><div class="table-wrap"><table id="by-user"></table></div></section>
+    <section class="card"><h2>By task</h2><div class="table-wrap"><table id="by-task"></table></div></section>
+  </div>
+  <section class="card"><h2>By model</h2><div class="table-wrap"><table id="by-model"></table></div></section>
+  <div class="usage-cols">
+    <section class="card"><h2>The biggest contexts</h2><div class="table-wrap"><table id="biggest"></table></div></section>
+    <section class="card"><h2>The slowest answers</h2><div class="table-wrap"><table id="slowest"></table></div></section>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{ supagent_static('charts.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
+<script src="{{ supagent_static('usage.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

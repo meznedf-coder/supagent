@@ -30,7 +30,7 @@ from typing import Any
 
 import yaml
 
-_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "conflicts": [], "errors": []}
+_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "conflicts": [], "errors": [], "stamp": ""}
 _LOCK = threading.Lock()
 TTL = 60.0
 
@@ -58,21 +58,37 @@ class CatalogError(ValueError):
 # reading
 # --------------------------------------------------------------------------- #
 def invalidate() -> None:
+    """After a change of the entries: read again here, and by every other process at its next
+    question (the knowledge stamp)."""
     with _LOCK:
         _CACHE.update(at=0.0, data=None)
+    try:
+        from superset import db
+
+        from supagent.knowledge.freshness import touch
+
+        touch()
+        db.session.commit()
+    except Exception:  # pylint: disable=broad-except   (tables not created yet)
+        from superset import db
+
+        db.session.rollback()
 
 
 def load_catalog() -> dict[str, Any]:
     """The merged catalog (entries; else the old single document; else SUPAGENT_CATALOG)."""
+    from supagent.knowledge.freshness import stamp
+
+    changed = stamp()
     with _LOCK:
-        if _CACHE["data"] is not None and time.time() - _CACHE["at"] < TTL:
+        if _CACHE["data"] is not None and time.time() - _CACHE["at"] < TTL and _CACHE["stamp"] == changed:
             return _CACHE["data"]
         data, found_conflicts, errors = _from_entries()
         if data is None:
             data = _from_document()
         if data is None:
             data = _from_file()
-        _CACHE.update(at=time.time(), data=data, conflicts=found_conflicts, errors=errors)
+        _CACHE.update(at=time.time(), data=data, conflicts=found_conflicts, errors=errors, stamp=changed)
         return data
 
 
@@ -92,8 +108,8 @@ def _entries_of(classification: str) -> list[dict[str, str]]:
                 .order_by(Entry.category, Entry.title).all())
     except Exception:  # pylint: disable=broad-except
         return []
-    return [{"title": e.title, "category": e.category or "", "text": (e.content or "").strip()} for e in rows
-            if (e.content or "").strip()]
+    return [{"id": e.id, "title": e.title, "category": e.category or "", "text": (e.content or "").strip()}
+            for e in rows if (e.content or "").strip()]
 
 
 def rules() -> list[dict[str, str]]:
@@ -312,6 +328,7 @@ def save_entry(values: dict[str, Any], by: str, entry_id: int | None = None,
     fmt = str(values.get("fmt") or ("yaml" if classification in STRUCTURED else "text"))
     content = str(values.get("content") or "")
     parse_entry(classification, fmt, content)             # refuse a broken entry before saving it
+    _refuse_copy(title, classification, content, entry_id)
     if entry_id is None:
         e = Entry(title=title[:255], classification=classification, created_by=by, version=1)
         db.session.add(e)
@@ -337,6 +354,25 @@ def save_entry(values: dict[str, Any], by: str, entry_id: int | None = None,
     db.session.commit()
     invalidate()
     return e
+
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _refuse_copy(title: str, classification: str, content: str, entry_id: int | None) -> None:
+    """No second entry of the same title, nor of the same classification and content: edit that one."""
+    from superset import db
+
+    from supagent.models import Entry
+
+    for e in db.session.query(Entry).filter(Entry.deleted_at.is_(None)):
+        if e.id == entry_id:
+            continue
+        if _norm(e.title) == _norm(title):
+            raise CatalogError(f"an entry is already named {e.title!r} (#{e.id}): edit it, or choose another title")
+        if e.classification == classification and _norm(e.content) and _norm(e.content) == _norm(content):
+            raise CatalogError(f"the entry {e.title!r} (#{e.id}) already says exactly this: edit it instead")
 
 
 def delete_entry(entry_id: int, by: str, expected_version: int | None = None) -> None:

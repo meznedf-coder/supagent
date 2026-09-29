@@ -153,6 +153,30 @@ def test_a_run_shows_its_steps_and_the_one_it_was_doing_when_stopped(app, monkey
 # ---------------------------------------------------------------------------------------------- #
 # what the team said not to use
 # ---------------------------------------------------------------------------------------------- #
+_SAID: list = []
+
+
+@pytest.fixture(autouse=True)
+def _restore_descriptions(app):
+    """The descriptions a test changed are put back (the next tests read the same objects)."""
+    yield
+    if not _SAID:
+        return
+    from superset.extensions import db
+
+    from supagent.knowledge import excluded
+    from supagent.models import KObject
+
+    with app.app_context():
+        for oid, text, source in reversed(_SAID):
+            o = db.session.get(KObject, oid)
+            if o is not None:
+                o.description, o.description_source = text, source
+        db.session.commit()
+    _SAID.clear()
+    excluded._CACHE["at"] = 0.0
+
+
 def _say(obj_filter: dict, text: str, source: str = "curated"):
     from superset.extensions import db
 
@@ -160,6 +184,7 @@ def _say(obj_filter: dict, text: str, source: str = "curated"):
     from supagent.models import KObject
 
     o = db.session.query(KObject).filter_by(**obj_filter).one()
+    _SAID.append((o.id, o.description, o.description_source))
     o.description, o.description_source = text, source
     db.session.commit()
     excluded._CACHE["at"] = 0.0                                      # read again
@@ -170,9 +195,14 @@ def test_the_teams_not_used_is_understood_in_english_and_french(ctx):
     from supagent.knowledge.excluded import NOT_USED
 
     for text in ("does not used", "Not used anymore", "DEPRECATED: use NODE_NAME", "Obsolète", "ne pas utiliser",
-                 "Ce champ n'est plus utilisé", "unused since 2025", "do not use", "don't use it", "non utilisé"):
+                 "Ce champ n'est plus utilisé", "unused since 2025", "do not use", "don't use it", "non utilisé",
+                 "This field is not used anymore, take HOST", "Status of the run. Not used since 2024.",
+                 "[not used] old node name", "À ne pas utiliser"):
         assert NOT_USED.search(text), text
-    for text in ("The server that ran the job", "Number of used licences", "used by the billing team"):
+    for text in ("The server that ran the job", "Number of used licences", "used by the billing team",
+                 "CPU time spent per CPU and mode (counter); mode idle = unused, the other modes = busy",
+                 "idle means the CPU is unused", "Count of unused licences", "Replaces the obsolete field OLD_NODE",
+                 "Temps CPU; idle = non utilisé"):
         assert not NOT_USED.search(text), text
 
 

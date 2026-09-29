@@ -485,6 +485,13 @@ def definitions_from_docs(llm: Any = None) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- #
 def run(llm_docs: bool = True, parts: tuple[str, ...] = ("formulas", "team_memory", "documents")) -> dict[str, Any]:
+    from supagent.llm import llm_task
+
+    with llm_task("catalog"):
+        return _run(llm_docs, parts)
+
+
+def _run(llm_docs: bool = True, parts: tuple[str, ...] = ("formulas", "team_memory", "documents")) -> dict[str, Any]:
     """What the agent writes into the catalog this time (learn.agent_catalog)."""
     if not settings.get("learn.agent_catalog"):
         return {"note": "off (setting learn.agent_catalog)"}
@@ -518,9 +525,9 @@ def _run(llm_docs: bool, parts: tuple[str, ...]) -> dict[str, Any]:
             out[name] = {"error": f"{type(ex).__name__}: {str(ex)[:300]}"}
     if changed:
         try:
-            from supagent.knowledge.index import sync
+            from supagent.knowledge.index import embed_few, sync
 
-            sync(("entry:", "memory:"))
+            embed_few(sync(("entry:", "memory:")))
         except Exception:  # pylint: disable=broad-except
             db.session.rollback()
     return out

@@ -90,6 +90,8 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
                 elif backend == "osagg" and re.search(r"pushed down|cannot run in OpenSearch|JoinRefused|safety cap",
                                                       text):
                     text += STEPS_HINT
+                elif backend == "promagg" and NESTED_AGG.search(text):
+                    text += NESTED_HINT
                 elif backend in SQL_RULES and re.search(r"not possible|not supported|unsupported|cannot|refused",
                                                         text, re.I):
                     text += " What this database can run: " + SQL_RULES[backend]
@@ -99,11 +101,13 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
                    "rows": [{c: _plain(v) for c, v in zip(columns, r)} for r in rows],
                    "row_count": len(rows), "truncated": truncated, "seconds": round(time.time() - t0, 2),
                    "error": None}
-            if not rows or (len(rows) == 1 and all(v is None for v in rows[0])):   # nothing (an aggregate of
-                # no rows gives one row of NULLs): why, from the dictionary (no query)
+            zeros = len(rows) == 1 and all(v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)
+                                                         and v == 0) for v in rows[0])
+            if not rows or zeros:          # nothing (an aggregate of no rows: one row of NULLs, or a count
+                # of 0): why, from the dictionary (no query)
                 from supagent.knowledge.empty import why_empty
 
-                hint = why_empty(database, request.sql)
+                hint = why_empty(database, request.sql, counted=bool(rows))
                 if hint:
                     out["hint"] = hint
             return out
@@ -213,6 +217,30 @@ def _virtual_out(ds: Any, reused: bool = False) -> dict:
                     ", y = AVG of the value column, the finding's time range, save_chart=true"}
 
 
+NESTED_AGG = re.compile(r"\b(AVG|SUM|MIN|MAX|COUNT)\s*\([^)]*\b(SUM|AVG|RATE|INCREASE|MIN|MAX)\s*\(", re.I)
+NESTED_HINT = (" An aggregate inside another (AVG(SUM(...))) cannot be pushed to Prometheus: one level only. The busy "
+               "share of each server over the whole window is already 100 * SUM(rate) FILTER (WHERE mode <> 'idle') / "
+               "SUM(rate) grouped by \"node\" (no AVG around it); ORDER BY it DESC LIMIT 5 gives the busiest; per hour: "
+               "GROUP BY DATE_TRUNC('hour', ts), \"node\" with WHERE \"node\" IN (those 5).")
+
+
+def osagg_safe(sql: str, backend: str | None) -> str:
+    """A dataset's SQL for osagg: Superset reads the columns of a new dataset with the SQL + LIMIT 0,
+    and osagg (0.2.6) turns ORDER BY ... LIMIT 0 into a top-0 terms request that OpenSearch refuses
+    ("[terms] failed to parse field [size]"). Wrapped, the LIMIT 0 goes to the outer SELECT."""
+    if backend != "osagg" or not re.search(r"\border\s+by\b", sql, re.I):
+        return sql
+    try:
+        import sqlglot
+
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        if tree.args.get("order") is None:           # ORDER BY only inside: fine as it is
+            return sql
+    except Exception:  # pylint: disable=broad-except
+        pass
+    return f"SELECT * FROM ({sql}) AS agent_query"
+
+
 @mcp.tool
 def create_virtual_dataset(request: VirtualDatasetRequest) -> dict:
     """Save a query as a Superset dataset (a virtual dataset), to chart a finding that is a
@@ -240,6 +268,7 @@ def create_virtual_dataset(request: VirtualDatasetRequest) -> dict:
         if PROMQL_CALL.search(sql) and not TS_WINDOW.search(sql):   # else a chart grouped by a label fails
             return {"error": "a promql() dataset needs the finding's time window in its SQL: add WHERE ts >= "
                              "TIMESTAMP '<start>' AND ts < TIMESTAMP '<end>' after promql(...)"}
+        sql = osagg_safe(sql, database.backend)
         same = (db.session.query(SqlaTable)
                 .filter(SqlaTable.database_id == database.id, SqlaTable.table_name.like(name + "%")).all())
         for ds in same:                                  # asked again (a retry): the same dataset

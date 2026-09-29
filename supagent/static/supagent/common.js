@@ -80,12 +80,26 @@
     return '<span class="badge">' + esc(src) + "</span>";
   }
 
+  /* Previous · page 2 of 7 (321) · Next under a long list; st: {page (from 0), size, total} */
+  function pager(box, st, reload) {
+    box.innerHTML = "";
+    var pages = Math.max(1, Math.ceil((st.total || 0) / st.size));
+    if (st.page > pages - 1) st.page = pages - 1;
+    box.hidden = pages <= 1;
+    if (box.hidden) return;
+    box.appendChild(el("button", { type: "button", class: "btn", text: "Previous", disabled: st.page <= 0 ? "disabled" : null,
+      onclick: function () { st.page--; reload(); } }));
+    box.appendChild(el("span", { class: "muted", text: "page " + (st.page + 1) + " of " + pages + " (" + num(st.total) + ")" }));
+    box.appendChild(el("button", { type: "button", class: "btn", text: "Next", disabled: st.page >= pages - 1 ? "disabled" : null,
+      onclick: function () { st.page++; reload(); } }));
+  }
+
   var body = document.body.dataset;
   window.supagent = {
     chat: function (m, p, b) { return api(body.chatApi, m, p, b); },
     dict: function (m, p, b) { return api(body.dictionaryApi, m, p, b); },
     admin: function (m, p, b) { return api(body.adminApi, m, p, b); },
     isAdmin: body.admin === "yes",
-    esc: esc, el: el, when: when, whenFull: whenFull, num: num, bytes: bytes, sourceBadge: sourceBadge
+    esc: esc, el: el, when: when, whenFull: whenFull, num: num, bytes: bytes, sourceBadge: sourceBadge, pager: pager
   };
 })();

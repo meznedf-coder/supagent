@@ -13,8 +13,11 @@ Only `requests` is needed (it comes with Superset).
 
 from __future__ import annotations
 
+import contextvars
+import datetime
 import hashlib
 import json
+import logging
 import re
 import threading
 import time
@@ -38,8 +41,43 @@ class EmptyAnswer(LLMError):
     """The LLM answered nothing (no text, no tool call), even when asked again."""
 
 
+log = logging.getLogger(__name__)
 EMPTY_RETRIES = 2                # an empty answer is asked again this many times (the same request)
 _BACKGROUND = threading.local()
+_TASK: contextvars.ContextVar[dict | None] = contextvars.ContextVar("supagent_llm_task", default=None)
+
+
+@contextmanager
+def llm_task(task: str, user_id: int | None = None, message_id: int | None = None,
+             run_id: int | None = None) -> Iterator[None]:
+    """What the LLM calls made inside are for (the admins' usage page): an answer (for a person), the
+    daily learning, the Context, the memory... The innermost wins."""
+    token = _TASK.set({"task": task, "user_id": user_id, "message_id": message_id, "run_id": run_id})
+    try:
+        yield
+    finally:
+        _TASK.reset(token)
+
+
+def _record(model: str, usage: dict[str, Any] | None, seconds: float, tools: int, error: str | None) -> None:
+    """One row of supagent_llm_call, on its own connection (never in the caller's transaction); a
+    failure to write it never fails the call."""
+    try:
+        from superset import db
+
+        from supagent.models import LLMCall
+
+        who = _TASK.get() or {"task": "background" if getattr(_BACKGROUND, "on", False) else "other"}
+        u = usage or {}
+        with db.engine.begin() as conn:
+            conn.execute(LLMCall.__table__.insert().values(
+                at=datetime.datetime.utcnow(), task=who.get("task"), user_id=who.get("user_id"),
+                message_id=who.get("message_id"), run_id=who.get("run_id"), model=(model or "")[:128],
+                prompt_tokens=int(u.get("prompt_tokens") or 0), completion_tokens=int(u.get("completion_tokens") or 0),
+                cached_tokens=int(u.get("cached_tokens") or 0), seconds=round(seconds, 2), tools=tools,
+                ok=error is None, error=(error or None) and error[:300]))
+    except Exception as ex:  # pylint: disable=broad-except
+        log.debug("supagent: LLM call not recorded: %s", ex)
 
 
 @contextmanager
@@ -258,19 +296,25 @@ class LLM:
         for _attempt in range(EMPTY_RETRIES + 1):
             t0 = time.time()
             try:
-                r = self._request("POST", "/chat/completions", data=json.dumps(body))
+                try:
+                    r = self._request("POST", "/chat/completions", data=json.dumps(body))
+                except LLMError as ex:
+                    if "chat_template_kwargs" not in body or not re.search(r"HTTP (400|422)", str(ex)):
+                        raise
+                    _TEMPLATE_KWARGS[self.base] = False          # a gateway that refuses unknown fields
+                    body.pop("chat_template_kwargs")
+                    r = self._request("POST", "/chat/completions", data=json.dumps(body))
+                try:
+                    data = r.json()
+                    msg = data["choices"][0]["message"]
+                except (ValueError, KeyError, IndexError, TypeError) as ex:
+                    raise LLMError(f"unexpected LLM answer: {r.text[:300]}") from ex
             except LLMError as ex:
-                if "chat_template_kwargs" not in body or not re.search(r"HTTP (400|422)", str(ex)):
-                    raise
-                _TEMPLATE_KWARGS[self.base] = False          # a gateway that refuses unknown fields
-                body.pop("chat_template_kwargs")
-                r = self._request("POST", "/chat/completions", data=json.dumps(body))
-            try:
-                data = r.json()
-                msg = data["choices"][0]["message"]
-            except (ValueError, KeyError, IndexError, TypeError) as ex:
-                raise LLMError(f"unexpected LLM answer: {r.text[:300]}") from ex
-            self.last_usage = add_usage(self.last_usage or {}, _usage(data, time.time() - t0))
+                _record(body.get("model") or "", None, time.time() - t0, len(tools or []), str(ex))
+                raise
+            one = _usage(data, time.time() - t0)
+            _record(body.get("model") or "", one, time.time() - t0, len(tools or []), None)
+            self.last_usage = add_usage(self.last_usage or {}, one)
             text = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S)
             if text.strip() or msg.get("tool_calls"):
                 return msg

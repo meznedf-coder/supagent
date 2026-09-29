@@ -28,6 +28,12 @@ It adds:
     * **what changed** since the day before: new, gone or back objects, changed types or units,
       big changes in series counts.
 
+    Its tabs: *Browse*, *Relations*, *Changes*, *Learned* (what the agent learned by itself: its
+    catalog entries with their evidence, where the data of the questions was found, the relations it
+    measured, the AI descriptions still to verify; then the learned answers and the query timings),
+    *Knowledge* (the catalog, the documents and sites and the team memory, read only), *Context*
+    (below) and *Search*. Everyone sees only what concerns the databases they may query.
+
     Descriptions come from your catalog first, then from the source (the exporters' HELP
     texts), then from the LLM. LLM texts are marked *AI-written* until an admin approves or
     corrects them.
@@ -78,7 +84,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.4.8-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.5.0-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -316,8 +322,10 @@ and a metric whose data stopped now costs about 6 requests when its profile is d
 that path has not run in the lab yet, nothing being due for 7 days); a live metric about 3.
 
 **Not to be used**: a description written by a person (Data dictionary page, catalog) that says a
-field, label, metric or index is not used ("not used", "do not use", "deprecated", "obsolete", "ne
-pas utiliser", "n'est plus utilisé"...) is honoured: "where the data is" never proposes it and
+field, label, metric or index is not used, at its start or at the start of one of its sentences
+("Not used", "Deprecated: take HOST", "This field is no longer used", "Ne pas utiliser", "Ce champ
+n'est plus utilisé"...), is honoured (a word inside an explanation, such as "mode idle = unused", is
+not such a statement): "where the data is" never proposes it and
 lists it as *DO NOT USE* under its index or metric, `describe_data` and the dataset information
 mark it, and a query or a chart that uses it is refused with the team's words, so that the agent
 takes another field. A description written by the LLM never counts.
@@ -362,6 +370,36 @@ helpful*, another expression, the document removed), the agent takes its entry b
 person edits an agent entry it is theirs**: the agent never changes it again; delete it and the
 agent never writes it again. `superset supagent agent-catalog` runs this pass at once.
 
+## Context: the system, functionally and technically
+
+Every night (`context.hour`, 04:00, after the day's learning run) the agent writes the **Context**:
+the documentation of your system, in two parts, *Functional* and *Technical* (Data dictionary →
+Context). It is written from what the team shares: the documents and sites, the catalog, the team
+memory, the data dictionary (databases, domains, relations, and the values of the labels and fields
+that name servers, services, applications, environments, regions, clusters and teams) and the
+answers marked Helpful. Raw chats are not read: each was answered with its user's own permissions.
+
+* **Facts pages**, written without the LLM: each data source (engine, domains with their counts,
+  the 25 indices and metrics that matter most: described by people, in the catalog, used by the
+  answers and the learned answers; formulas, links with the other sources), each inventory (servers
+  and hosts, services and jobs, applications, environments, regions, clusters, Mimir tenants and
+  teams, with their values), the glossary, and the rules and facts of the team. With 10,000 metrics
+  and 80,000 labels a page stays short: it never lists every description (the Data dictionary has
+  them all).
+* **Summary pages**, written by the LLM from the evidence given only, citing it and marked
+  *AI-written*: how the system works, the technical overview, and a page per main application
+  (what it is, its chain, its data, what people ask about it). A summary page is written again only
+  when its evidence changed: a night with nothing new asks the LLM nothing. At most
+  `context.max_llm_calls` calls per build (12); the next night goes on. The steps, calls and tokens
+  of each build are in the runs list of the settings page (kind *context*); Stop stops it; it never
+  runs next to a learning run. `superset supagent context --build` builds it now, *Build now* in the
+  Context tab too.
+* **Who sees what**: a page is shown only to the users who may query every database it draws from
+  (the tab, and the agent's knowledge search, where it ranks below the catalog and the documents).
+* **Corrections**: an admin corrects a page in the tab; the agent then never writes over it (until
+  *Give it back to the agent*).
+* Code read through MCP servers can become one more source of evidence later.
+
 ## Questions about an earlier answer
 
 "Create the chart in Superset of that finding", "the same for srv-emea-001", "enregistre ce
@@ -394,6 +432,10 @@ straight to the right metric. The live list of metric names is used (cached five
 works while the dictionary is empty or still learning. Only the databases the agent may use
 (`agent.databases`, by default the osagg and promagg ones) and the user may query are searched.
 
+Under an answer, the chat shows the results it is based on, each named by what it shows ("FAILED by
+APPLICATION · 23 Sep"); a query the agent ran again in the same shape (fixed after an error, a check
+or a rule) replaces its earlier try, which stays in the answer's tool calls.
+
 The instructions are short and strict (the rules every answer needs; the sections on saving
 charts, investigations, files / e-mails / reports and images only when the question asks for
 them), and in the chat only the tools the question needs are offered. In the chat the page draws
@@ -407,7 +449,45 @@ question (in the lab: 3,188 of 4,700 prompt tokens from the cache, the first ste
 16 s faster). Words meet across their forms (failed, failure, failing) and a match on a rare
 word counts more than one on a word hundreds of names have (elasticsearch against node).
 
+**The team's words** come first: the glossary terms of the question (all the words of a term, or
+its rare word; a code such as `D-1` or `W-4` that its definition uses; the terms a found term names,
+or that name it) are given in full with the question, before where the data is. With the question,
+nothing is given twice: the knowledge found leaves out the metrics and indices already in "Where
+the data is" (and the same metric in another database), the learned answers, the memories and the
+rules already given, so that its room goes to the catalog, the documents and the Context.
+
+**What is happening now** ("in production", "with an application", "on this metric, chart or
+dashboard", "is everything normal"): the agent finds the dashboards and charts about the subject
+(Superset's charts and dashboards are part of its knowledge: what each shows, its dataset, metrics and
+filters, the dashboards it is on), reads their latest data, the team's checks and limits
+(`check_health`) and the alerts firing, compares with the same window of the previous weeks
+(`compare_to_usual`), and answers subject by subject (normal or not, value, usual, limit, since when),
+with a screenshot of a chart that shows a problem. It can also save a query in SQL Lab, give a link
+that opens SQL Lab or Explore, and read the data of an existing chart, when asked.
+
+Mimir tenants (`__tenant_id__`) usually separate applications or subjects: the agent filters on the
+tenant a question is about, compares by tenant, and never adds tenants up unless asked.
+
 While it answers, the agent:
+* **asks when the question can mean two things** that give different numbers (two fields or
+  metrics that fit, a term nobody defined, a period not said where no default applies), and
+  nothing given decides (the team's words, the memory, the learned answers, the chat): one short
+  question naming the readings and the one it would take; otherwise it answers and says in one
+  line which reading it took. The answer to that question is learned (see below);
+* **applies the team's rules**: they come again next to the question and win over the learned
+  answers; a rule that filters on a field or label ("ENVIRONMENT_TYPE = 'UAT'") is checked on its
+  queries: a query on data that has that field and does not use it sends the answer back once, then
+  the answer is marked (unless the question asks for the rule's value);
+* when its calls run out (twice `agent.max_steps` when it builds charts and dashboards), writes what
+  it did and saved and what remains, instead of stopping without an answer;
+* has **every number checked** (`agent.check_numbers`): a number of its answer must come from what
+  it was given: a value of a result as shown or rounded, a share as a percentage, seconds in
+  minutes or hours, bytes in kB to GB, a column's total or average, the total of its first rows, a
+  row count, a rate within a row, a duration between two times, or a number of the question, the
+  chat or the knowledge. Otherwise the answer goes back once ("compute totals, rates and
+  differences in the query"), and a number still made up is marked in the answer (*Check: these
+  numbers or names do not come from the results of this answer's queries*). Names with digits
+  (servers, hosts: `srv-amer-002`) are checked the same way: a series is never continued;
 * is told **why a result is empty**, from the data dictionary (no extra query): a value in the
   wrong case (`'failed' is written 'FAILED'`), not a value of the field or label (the closest
   ones), a time window before the data starts or after it stopped;
@@ -429,7 +509,7 @@ While it answers, the agent:
   agent writes (no ids, dates or names of one case; the user's own words are not kept). If the
   agent finds the same question already learned, the answer joins it (one more *Helpful*)
   instead of making a duplicate. It is listed as *helpful, to review*; an admin confirms or
-  rejects it in *Data dictionary → Learned answers*. *Not helpful* (or taking *Helpful* back)
+  rejects it in *Data dictionary → Learned*. *Not helpful* (or taking *Helpful* back)
   withdraws it, unless an admin confirmed it. A similar question of anyone in the team starts
   from the confirmed ones first, then the helpful ones, on the databases the user may query.
   The first answer of a chat names it the same way (a 2-6 word generic title).
@@ -441,7 +521,10 @@ While it answers, the agent:
   the learned answers; `learn.associations = false` switches this off. Learned answers and
   memories that name a metric or index that no longer exists are not given to the agent.
 * **What users state**: a message that tells something about the data ("KO means failed") is read
-  for durable facts and rules like the explicit ones below (team ones wait for an admin).
+  for durable facts and rules like the explicit ones below (team ones wait for an admin). So is
+  the answer to a question the agent asked back ("the killed jobs too": what the word meant), and
+  the reason given with *Not helpful* (the chat asks what was wrong, optional): the admins see the
+  reasons (`superset supagent gaps`), and what they say about the data is proposed to the memory.
 * **Query timings** per kind of query (values replaced by `?`) and table or metric: the agent is
   told which way is fast. The page shows each query whole, with its last error; admins also
   see the last one as it ran.
@@ -471,7 +554,15 @@ While it answers, the agent:
 
 ## Measuring it
 
-Nothing is added to the pages; the commands say:
+**LLM usage** (admins: the tab next to *Settings*): every call to the LLM, recorded with what it was for
+(the chat's answers, the daily learning, the Context, the memory, the learned answers, the agent
+catalog, tidying, tests), for whom, its model, its context size, the tokens written, the share from the
+LLM server's prompt cache, its time and whether it failed. For a period (24 hours, 7, 30 or 90 days, or
+dates; by hour or by day): totals, tokens or calls over time by task, per person, per task, per model,
+the answers (time, LLM and tool calls per answer, sent back by the checks, marked), the biggest
+contexts and the slowest answers. Kept `usage.keep_days` days (90).
+
+The commands also say:
 
 * `superset supagent stats [--days 7]`: where the time of the answers goes (LLM and tools), the
   LLM calls and tool calls per answer, the prompt sizes, the share the LLM server's prompt cache
@@ -489,8 +580,9 @@ Nothing is added to the pages; the commands say:
 
 Every question comes with the `search.top_k` pieces of knowledge that match it best (at most
 `search.prompt_chars` characters), and the agent can search more (`search_knowledge`). The
-pieces are the learned metrics and indices, the catalog's rules, notes, glossary and formulas,
-the learned answers, the memories and the documents. They are found:
+pieces are the learned metrics and indices, the catalog's rules, notes, glossary terms and formulas,
+the learned answers, the memories, the documents, the Context pages and Superset's charts and
+dashboards. They are found:
 
 * by **words**: PostgreSQL full-text search, built in (other databases: counted in Python);
 * by **meaning** when `embed.model` is set: vectors of an OpenAI-compatible embedding endpoint
@@ -504,8 +596,20 @@ and the two rankings are fused. A piece found by meaning only must be close enou
 at least, and within 0.2 of the closest piece): a weak neighbour is noise, not knowledge; each
 result of `search_knowledge` says which search found it. A user only finds what they may see: pieces about databases
 they may query, the team's pieces and their own memories; the filter is applied before
-ranking. Pieces follow their origin (a changed entry is indexed again, a deleted one removed);
-new vectors are computed after each learning run, `embed.per_run` at a time.
+ranking. Pieces follow their origin at once: a description written in the Data dictionary, a
+catalog entry saved, deleted, restored or imported, a memory, a document, a Context page: its
+pieces are written and their vectors computed straight away (more than 64 at once: at the next
+indexing, hourly, `embed.per_run` at a time). Each glossary term is its own piece. A change also
+makes every web server and worker read the dictionary, the catalog and what not to use again at
+its next question (a stamp in Superset's database). A description the catalog no longer gives is
+taken back from the dictionary, unless a person wrote another one since.
+
+`superset supagent check-knowledge` says whether everything the team put in is given to the agent:
+pieces out of step or without a vector, catalog entries ignored (invalid) or in conflict, names
+the catalog describes that the dictionary does not have (misspelled, or not learned yet: their text
+reaches nothing), rules not given in full (the first 30, 1,500 characters each, are in the
+instructions; the others are found by the search), team memories and learned answers waiting for
+an admin, documents that could not be read. Exit code 1 when there is a problem.
 
 ## Documents and sites
 
@@ -547,6 +651,8 @@ superset supagent settings [--set k=v] [--unset k]
 superset supagent test-llm [--profile]                                  the LLM (--profile: thinking, tools, cache)
 superset supagent stats [--days N] | evaluate | gaps [--days N]         where the time goes, resolver, gaps
 superset supagent learn [--database NAME] [--no-llm] [--minutes N] [--plan] [--stop]
+superset supagent context [--build] [--no-llm] [--force]                 the Context: its pages, or build it now
+superset supagent prompt "question" --user U [--full]                    what the LLM is given for a question
 superset supagent import-catalog FILE [--replace] | export-catalog
 superset supagent agent-catalog [--no-docs]                              entries the agent is certain of
 superset supagent tidy-learned [--limit N]                               generic questions, duplicates merged
@@ -554,6 +660,7 @@ superset supagent forget-learned [--database D] [--everything] [--yes]    learn 
                                                                           without --yes)
 superset supagent remove-auto-learned                                    answers 0.2.1 saved by themselves
 superset supagent index [--refresh-docs]                                 searchable pieces and vectors
+superset supagent check-knowledge [--json]                               is everything put in given to the agent?
 superset supagent search "words" [--user U]                              what the agent would find
 superset supagent knowledge [--changes DAYS]
 superset supagent describe "words" [--name INDEX_OR_METRIC] [--user U]   what the agent reads

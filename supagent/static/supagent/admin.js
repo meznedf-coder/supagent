@@ -13,7 +13,8 @@
     "llm.verify_tls": "Check TLS certificates", "llm.timeout": "Timeout (s)", "llm.temperature": "Temperature",
     "llm.thinking": "Reasoning (thinking) mode", "llm.extra_headers": "Extra HTTP headers (JSON)",
     "agent.max_steps": "Tool calls per question", "agent.now": "Fixed “now”", "agent.extra_instructions": "Extra instructions",
-    "agent.disabled_tools": "Disabled tools", "agent.executor": "Where answers run", "agent.celery_queue": "Celery queue",
+    "agent.disabled_tools": "Disabled tools", "agent.check_numbers": "Check the numbers of the answers",
+    "usage.keep_days": "Keep the LLM calls (days)", "agent.executor": "Where answers run", "agent.celery_queue": "Celery queue",
     "learn.enabled": "Learn once a day", "learn.hour": "Daily at (hour)", "learn.days": "On these days",
     "learn.user": "Learn as user", "learn.profile_every_days": "Statistics refreshed every (days)",
     "learn.max_requests_per_minute": "Requests per minute (each database)", "learn.request_timeout": "Request timeout (s)",
@@ -36,7 +37,9 @@
     "docs.allowed_domains": "Allowed domains for documents", "docs.max_kb": "Largest page or file (KB)",
     "memory.enabled": "Learn from the chats", "memory.team_approval": "Team memories need approval",
     "memory.prompt_chars": "Characters of memories per question", "chats.keep_days": "Keep chats (days, 0: always)",
-    "agent.queue_keep_days": "Keep delivered queue messages (days, 0: always)"
+    "agent.queue_keep_days": "Keep delivered queue messages (days, 0: always)",
+    "context.enabled": "Context every night", "context.hour": "Context hour",
+    "context.max_llm_calls": "LLM calls per Context build"
   };
 
   function status() {
@@ -182,8 +185,11 @@
     return box;
   }
 
+  var runsPage = { page: 0, size: 15, total: 0 };
   function runs() {
-    return S.admin("GET", "runs").then(function (d) {
+    return S.admin("GET", "runs?page=" + runsPage.page + "&size=" + runsPage.size).then(function (d) {
+      runsPage.total = d.total || 0;
+      S.pager($("runs-pager"), runsPage, runs);
       var tb = $("runs").querySelector("tbody");
       tb.innerHTML = "";
       var running = false;
@@ -219,11 +225,12 @@
           " left (the next run goes on)" : "") + (st.llm.error ? " (" + st.llm.error + ")" : ""));
         if (r.error && !/^stop asked at /.test(r.error)) parts.push(r.error);
         if (r.status === "running" || r.status === "stopping") running = true;
-        tb.appendChild(el("tr", {}, [el("td", { text: "#" + r.id }), el("td", { text: r.reason }), el("td", { text: S.when(r.started_at) }),
+        tb.appendChild(el("tr", {}, [el("td", { text: "#" + r.id }), el("td", { text: (r.kind === "context" ? "context · " : "") + r.reason }), el("td", { text: S.when(r.started_at) }),
           el("td", { text: secs }), el("td", { html: '<span class="badge ' + (r.status === "done" ? "ok" : r.status === "error" ? "bad" : "") + '">' + S.esc(r.status === "stopping" ? "stopping…" : r.status) + "</span>" }),
           el("td", { class: "num", text: S.num(r.changes) }), el("td", {}, [el("span", { text: parts.join(" · ") }), stepsBox(r)])]));
       });
       if (!(d.runs || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "muted", text: "No learning run yet." })]));
+      running = running || !!d.running;                    // on another page too
       $("learn-stop").hidden = !running;                   // Stop while a run is running
       if (running) setTimeout(runs, 5000);
     });
@@ -448,6 +455,10 @@
         } else {
         if (m.status !== "active") act("Approve", { status: "active" });
         if (m.status !== "disabled") act("Disable", { status: "disabled" });
+        acts.appendChild(el("button", { type: "button", class: "linkish", text: "Delete", onclick: function () {
+          if (this.dataset.sure) { S.chat("DELETE", "memory/" + m.id).then(teamMemory); }
+          else { this.dataset.sure = "1"; this.textContent = "Delete: sure?"; }
+        } }));
         acts.appendChild(el("button", { type: "button", class: "linkish", text: "Edit", onclick: function () {
           var ta = el("textarea", { rows: "2" }); ta.value = m.text;
           text.innerHTML = ""; text.appendChild(ta);

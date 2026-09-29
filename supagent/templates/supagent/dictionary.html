@@ -15,7 +15,9 @@
     <button type="button" role="tab" data-tab="browse" class="on">Browse</button>
     <button type="button" role="tab" data-tab="relations">Relations</button>
     <button type="button" role="tab" data-tab="changes">Changes</button>
-    <button type="button" role="tab" data-tab="learned">Learned answers</button>
+    <button type="button" role="tab" data-tab="learned">Learned</button>
+    <button type="button" role="tab" data-tab="knowledge">Knowledge</button>
+    <button type="button" role="tab" data-tab="context">Context</button>
     <button type="button" role="tab" data-tab="search">Search</button>
   </nav>
   <section id="tab-search" class="tab" hidden>
@@ -27,10 +29,37 @@
         <option value="index">Indices</option><option value="note">Notes</option><option value="rule">Rules</option>
         <option value="glossary">Glossary</option><option value="formula">Formulas</option>
         <option value="recipe">Learned answers</option>
-        <option value="memory">Memory</option><option value="doc">Documents</option></select>
+        <option value="memory">Memory</option><option value="doc">Documents</option>
+        <option value="context">Context</option></select>
       <button type="submit" class="btn primary">Search</button>
     </form>
     <div id="k-results" class="k-results"></div>
+  </section>
+  <section id="tab-context" class="tab" hidden>
+    <p class="muted">What the system is, functionally and technically, written every night from what the team
+      shares: the documents and sites, the catalog, the team memory, the data dictionary and the answers marked
+      Helpful. Pages marked <span class="badge llm">AI-written</span> are written by the LLM from the sources listed
+      under them; the others are facts taken from the dictionary and the catalog. An admin can correct a page: the
+      agent then never writes over it. You see the pages of the databases you may query.</p>
+    <div id="ctx-actions" class="agent-summary"></div>
+    <div class="context-cols">
+      <div><h2 class="section-title">Functional</h2><ul id="ctx-functional" class="plain-list"></ul></div>
+      <div><h2 class="section-title">Technical</h2><ul id="ctx-technical" class="plain-list"></ul></div>
+    </div>
+  </section>
+  <section id="tab-knowledge" class="tab" hidden>
+    <p class="muted">What the team gave the agent, read only (admins change it in Settings → Chat settings): the
+      catalog, the documents and sites, and the team memory. The agent reads them for every question.</p>
+    <h2 class="section-title">Catalog</h2>
+    <div class="table-wrap"><table class="grid" id="kn-entries">
+      <thead><tr><th>Entry</th><th>Classification</th><th>Category</th><th>By</th><th>Updated</th></tr></thead>
+      <tbody></tbody></table></div>
+    <h2 class="section-title">Documents and sites</h2>
+    <div class="table-wrap"><table class="grid" id="kn-docs">
+      <thead><tr><th>Document</th><th>Kind</th><th>Status</th><th class="num">Size</th><th>Read</th></tr></thead>
+      <tbody></tbody></table></div>
+    <h2 class="section-title">Team memory</h2>
+    <ul id="kn-memory" class="plain-list"></ul>
   </section>
   <section id="tab-browse" class="tab">
     <form id="filters" class="filters" autocomplete="off">
@@ -60,14 +89,28 @@
     <div class="table-wrap"><table class="grid" id="relations">
       <thead><tr><th>Relation</th><th>Origin</th><th class="num">Confidence</th><th></th></tr></thead><tbody></tbody>
     </table></div>
+    <div class="pager" id="rel-pager" hidden></div>
   </section>
   <section id="tab-changes" class="tab" hidden>
     <div class="filters"><label>Last <select id="c-days"><option>1</option><option selected>7</option><option>30</option></select> days</label></div>
     <div class="table-wrap"><table class="grid" id="changes">
       <thead><tr><th>When</th><th>Change</th><th>What</th><th>Database</th><th>Detail</th></tr></thead><tbody></tbody>
     </table></div>
+    <div class="pager" id="c-pager" hidden></div>
   </section>
   <section id="tab-learned" class="tab" hidden>
+    <h2 class="section-title">Learned by the agent</h2>
+    <p class="muted">What the agent learned by itself, on the databases you may query: the catalog entries it is
+      certain of (with their evidence), where the data of the questions was found, the relations it measured and the
+      descriptions it wrote that nobody verified yet.</p>
+    <div id="agent-summary" class="agent-summary"></div>
+    <div class="table-wrap"><table class="grid" id="agent-entries">
+      <thead><tr><th>Its catalog entries</th><th>Classification</th><th>From</th><th>Updated</th></tr></thead>
+      <tbody></tbody></table></div>
+    <div class="table-wrap"><table class="grid" id="associations">
+      <thead><tr><th>Word of the questions</th><th>Where the data was</th><th>Database</th><th class="num">Uses</th></tr></thead>
+      <tbody></tbody></table></div>
+    <h2 class="section-title">Learned answers</h2>
     <p class="muted">The answers users marked <strong>Helpful</strong> in the chat, under a short generic question
       the agent wrote, with the way to the result (the final query, or the chart that was saved) and how long it
       took. The agent starts from them for similar questions. <strong>helpful</strong>: waiting for an admin;
@@ -87,6 +130,7 @@
     <div class="table-wrap"><table class="grid" id="timings">
       <thead><tr><th>On</th><th>Kind of query</th><th class="num">Calls</th><th class="num">Average</th>
         <th class="num">Slowest</th><th class="num">Failed</th></tr></thead><tbody></tbody></table></div>
+    <div class="pager" id="t-pager" hidden></div>
   </section>
 </div>
 <div id="drawer" class="drawer" hidden>

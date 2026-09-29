@@ -70,6 +70,23 @@ def _ms_to_iso(v: Any, tz: Any = None) -> str | None:
     return t.astimezone(tz).strftime("%Y-%m-%d %H:%M")
 
 
+def computed_text(f: Any) -> str:
+    """What a column the connector computes is (osagg's business-date label and time)."""
+    kind, *args = str(f.virtual).split(":")
+    if kind == "shift" and len(args) >= 2:
+        return f"computed by the connector: {args[1]} moved onto the D-1 position date of {args[0]}"
+    return f"computed by the connector: the business-day label of {args[0] if args else 'a date'} (D, D-1, W-1, Y-1...)"
+
+
+def computed_fields(conn: Any, index: str) -> dict[str, dict[str, Any]]:
+    """The columns the connector computes for an index (none: no request)."""
+    if not (getattr(conn, "label_column", None) or getattr(conn, "label_time_column", None)):
+        return {}
+    meta = conn.table_meta(index)
+    return {f.name: {"type": f.sql_type.lower(), "computed": computed_text(f)}
+            for f in (meta.fields.values() if meta is not None else []) if f.virtual}
+
+
 def profile_index(conn: Any, index: str, meta: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     sample_docs = int(settings.get("learn.sample_docs"))
     per_request = max(5, int(settings.get("learn.fields_per_request")))
@@ -127,6 +144,9 @@ def profile_index(conn: Any, index: str, meta: Any) -> tuple[dict[str, Any], dic
         raise
     except Exception:  # pylint: disable=broad-except
         pass
+    for f in meta.fields.values():            # computed by the connector (osagg): usable in SQL, not stored
+        if f.virtual and f.name not in fstats:
+            fstats[f.name] = {"type": f.sql_type.lower(), "computed": computed_text(f)}
     dates = [f for f in fields if f.is_date]
     if dates:
         tf = next((f for f in dates if re.search(r"timestamp|time|date", f.name, re.I)), dates[0])
@@ -181,6 +201,19 @@ def learn_indices(run: Run, source: Source, database: Any, deadline: float, prog
                 if time.time() >= deadline:
                     out["complete"] = False
                 keep_fields(obj_name)
+                if old is not None and time.time() < deadline and not any(
+                        (f.stats or {}).get("computed") for f in db.session.query(KObject).filter_by(
+                            source_id=source.id, kind="field", parent=obj_name)):
+                    try:                               # learned before they were: at once, not at the next profile
+                        for fname, st in computed_fields(conn, index).items():
+                            ftype = st.pop("type", None)
+                            upsert(run, source, "field", obj_name, fname, {"data_type": ftype, "stats": st})
+                            seen_fields.add((obj_name, fname))
+                            out["fields"] += 1
+                    except SourceStopped:
+                        raise
+                    except Exception as ex:  # pylint: disable=broad-except
+                        log.info("supagent learn: computed columns of %s: %s", index, ex)
                 if old is None:
                     upsert(run, source, "index", "", obj_name, {"stats": _family_info(obj_name, families, index)})
                 else:

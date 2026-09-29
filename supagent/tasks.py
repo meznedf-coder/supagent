@@ -40,6 +40,18 @@ def learn_task(reason: str = "manual", databases: list[str] | None = None) -> di
     return run_learning(reason=reason, databases=databases)
 
 
+@celery_app.task(name="supagent.context", soft_time_limit=2 * 3600, time_limit=2 * 3600 + 300)
+def context_task(reason: str = "manual") -> dict:
+    from superset import db
+
+    from supagent.knowledge.context import build_context
+
+    try:
+        return build_context(reason=reason)
+    finally:
+        db.session.remove()
+
+
 @celery_app.task(name="supagent.remember", ignore_result=True, soft_time_limit=600, time_limit=660)
 def remember_task(message_id: int) -> None:
     from superset import db
@@ -69,12 +81,12 @@ def learn_helpful(message_id: int) -> None:
     the formulas that it may confirm (agent catalog)."""
     from supagent.knowledge.autocatalog import run as agent_catalog
     from supagent.knowledge.experience import learn_from_helpful
-    from supagent.knowledge.index import sync
+    from supagent.knowledge.index import embed_few, sync
     from supagent.llm import background
 
     with background():                     # the people waiting for an answer first
         if learn_from_helpful(message_id) is not None:
-            sync(("recipe:",))
+            embed_few(sync(("recipe:",)))    # found by the next similar question, by meaning too
             agent_catalog(llm_docs=False, parts=("formulas",))
 
 
@@ -126,6 +138,14 @@ def learn_tick() -> None:
             purge()                          # delivered queue messages, heartbeats of gone workers
         except Exception:  # pylint: disable=broad-except   (the learning goes on)
             log.exception("supagent: clean-up of the queue")
+        try:
+            from supagent import settings
+            from supagent.knowledge.usage import purge as purge_calls
+
+            purge_calls(int(settings.get("usage.keep_days") or 0))      # the LLM usage page's old calls
+        except Exception:  # pylint: disable=broad-except
+            db.session.rollback()
+            log.exception("supagent: clean-up of the LLM calls")
         if due_today():
             run_learning(reason="schedule")
         else:
@@ -134,6 +154,10 @@ def learn_tick() -> None:
 
             refresh_due()
             index_knowledge()
+        from supagent.knowledge.context import build_context, context_due
+
+        if context_due():                    # the nightly Context, after the day's learning
+            build_context(reason="schedule")
     finally:
         db.session.remove()
 
@@ -245,6 +269,21 @@ def dispatch_learning(reason: str = "manual", databases: list[str] | None = None
         except Exception as ex:  # pylint: disable=broad-except
             log.warning("supagent: Celery refused the learning run (%s), running it in the web server", ex)
     _in_thread(lambda: run_learning(reason=reason, databases=databases))
+    return "thread"
+
+
+def dispatch_context(reason: str = "manual") -> str:
+    from supagent import settings
+    from supagent.knowledge.context import build_context
+
+    mode = settings.get("agent.executor")
+    if mode == "celery" or (mode == "auto" and workers_alive()):
+        try:
+            context_task.apply_async(args=[reason], **_queue())
+            return "celery"
+        except Exception as ex:  # pylint: disable=broad-except
+            log.warning("supagent: Celery refused the context build (%s), running it in the web server", ex)
+    _in_thread(lambda: build_context(reason=reason))
     return "thread"
 
 

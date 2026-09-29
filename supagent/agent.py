@@ -21,7 +21,7 @@ import time
 from typing import Any, Callable
 
 from supagent import settings
-from supagent.llm import LLM, EmptyAnswer, add_usage
+from supagent.llm import LLM, EmptyAnswer, LLMError, add_usage
 
 log = logging.getLogger(__name__)
 MAX_TOOL_CHARS = 8000
@@ -40,7 +40,8 @@ tools only show and do what this user may see and do in Superset.
 
 Rules:
 1. Facts come from the tools: never invent a number, an id or a name, and never add numbers up yourself:
-   quote the column_sums of a result, or run a query. Answer in the language of the question, even when
+   quote the column_sums of a result, or run a query. Never write a list as a range ("srv-000 to srv-200"):
+   give its count and the names the result showed. Answer in the language of the question, even when
    the data, the dictionary or earlier answers use another language.
 2. When "Where the data is" is given below, start from it: it names the metrics, indices and fields that
    match the question, with their database id and a SQL to adapt. Use them as they are. Call
@@ -54,17 +55,24 @@ Rules:
    failures on the same step, answer with what you have and say what did not work.
 5. Say exactly what the tools did, never claim what a tool result does not show. If the data ends before
    "now", say so and use its last days. Timestamps are local time (never call them UTC); now is given
-   with the question."""
+   with the question.
+6. Know what the question means before you query: the team's words, the memory, the learned answers and
+   the chat decide first. If a word can still mean two things in the data that give different numbers
+   (two fields or metrics that fit, a term nobody defined, a period that is not said and has no usual
+   default), do not guess: answer only with ONE short question naming the readings you see (the field or
+   metric of each) and the one you would take, and stop there. Otherwise answer, and when you chose a
+   reading say it in one line at the start. Never ask what the question, the team's words or the chat
+   already say."""
 
 RICH = """
-6. The chat page shows the rows of every query you run (execute_sql, promql_query) under your answer as a
+7. The chat page shows the rows of every query you run (execute_sql, promql_query) under your answer as a
    table and a chart that the user can switch, copy and download: to show a chart or a time series, run
    the query; never draw charts in text and never make an image unless asked. Give the key figures in one
    or two sentences, at most a 10-row Markdown table, and the SQL you ran. Files and images you make
    appear under your answer by themselves: never write their paths, links or Markdown images."""
 
 PLAIN = """
-6. Report requests: run the SQL, then answer with one or two sentences and a Markdown table (at most 30
+7. Report requests: run the SQL, then answer with one or two sentences and a Markdown table (at most 30
    rows); for a ranking or a time series also call show_chart and put its output in the answer. Give the
    SQL you ran."""
 
@@ -99,8 +107,11 @@ SUM(increase) = count, never SUM or AVG of value; gauges: AVG(value), MIN(value)
 (*_bucket tables): HISTOGRAM_QUANTILE(0.95, SUM(RATE(value))); a condition on one label:
 SUM(rate) FILTER (WHERE mode <> 'idle'); CPU usage = busy %: 100 * SUM(rate) FILTER (WHERE mode <> 'idle') /
 SUM(rate) (SUM(rate) of every mode is the number of cores). Which servers had samples: GROUP BY node, COUNT(*).
-A database over several tenants has a column __tenant_id__. Two metrics together: aggregate each one in
-its own query, or promql_query (arithmetic between metrics, offsets, label_replace)."""
+Tenants (Mimir): a database over several tenants has a column __tenant_id__, and each tenant is usually a
+different application or subject: a question about one filters on its tenant (WHERE __tenant_id__ = '...'),
+a comparison groups by it, values of different tenants are never added up unless asked, and the answer
+names the tenants it covers. Two metrics together: aggregate each one in its own query, or promql_query
+(arithmetic between metrics, offsets, label_replace)."""
 
 SECTIONS = {
     "charts": """
@@ -118,7 +129,27 @@ finding uses the queries listed for that answer, with their time window. To chan
 creating another one. Chart filters are fixed values (no rolling time range): turn "last 7 days" into dates
 from "now"; a POSITION_LABEL filter and a date filter must not contradict each other. Charts cannot compare
 with an earlier period: to compare position dates use X = POSITION_TIME grouped by POSITION_LABEL. The chart
-under your answer in the chat is not saved in Superset: save with generate_chart / generate_dashboard.""",
+under your answer in the chat is not saved in Superset: save with generate_chart / generate_dashboard.
+A dashboard of several charts: make each chart at once (a query first only when a field or a value is not
+known), then generate_dashboard with their ids; do not spend calls re-checking the data. Name every saved chart
+with what it shows and its period ("<what it shows> - <its period>"), never twice the same name.""",
+    "status": """
+
+What is happening now ("in production", "with <an application>", "on <a metric, a chart or a dashboard>", "is
+everything normal"): 1) find the dashboards and charts about the subject (the knowledge found names them, with
+their ids; else list_dashboards / list_charts), 2) read their latest data (get_chart_data), the team's checks
+with their limits (check_health) and the alerts firing (list_alerts), 3) compare with the usual (compare_to_usual:
+the same window of the previous weeks), 4) answer subject by subject: normal or not, with the value, the usual,
+the limit and since when, and a screenshot of a chart that shows a problem (chart_image) when one is found. Say
+what could not be checked; "nothing unusual" only when it was checked.""",
+    "sqllab": """
+
+SQL Lab and Explore (asked here): save_sql_query saves a query in SQL Lab's Saved Queries (database_id, sql, a
+label); open_sql_lab_with_context gives a link that opens SQL Lab with a query ready (database_connection_id,
+sql, title); generate_explore_link gives a link to explore a dataset with a chart config, nothing saved
+(dataset_id, config as for generate_chart). Save or open the query that gave the finding the user means (the
+queries of the chat's earlier answers are listed with the question), and give the link or the saved query's
+name.""",
     "investigation": """
 
 Investigations ("why did the jobs fail", "was a server saturated"): 1) find where and when on the jobs index
@@ -159,14 +190,34 @@ INTENTS = {
     "usual": re.compile(r"\b(usual|unusual|abnormal\w*|anomal\w*|normal|baseline|habitu\w*|inhabituel\w*|"
                         r"anormal\w*)\b|\bcompared? (to|with) (last|previous|the same)|\bthan (usual|normal|last week)",
                         re.I),
+    "status": re.compile(r"\bwhat('?s| is| are) (happening|going on|wrong)\b|\b(status|state|health) of\b|"
+                         r"\bwhat('?s| is) the (status|state|health)\b|\bhealthy\b|"
+                         r"\bany (issues?|problems?|incidents?|anomal\w*|alerts?)\b|\bis (everything|all|it|that) (ok|"
+                         r"fine|normal|good|healthy)\b|\b(right now|happening now|currently|at the moment)\b|"
+                         r"\bque se passe|\ben ce moment\b|\bactuellement\b|\best-ce (normal|grave)\b|"
+                         r"\bdes (probl[èe]mes?|incidents?|alertes?)\b", re.I),
+    "read_charts": re.compile(r"\b(chart|graph|dashboard)\s*(id\s*)?#?\s*\d+\b|\b(saved|existing|superset) "
+                              r"(charts?|dashboards?)\b|\bwhat (does|do|is in) (the|this|that|my) (chart|dashboard)\b|"
+                              r"\b(numbers|data|values) (of|in|behind) (the|this|that|its) (charts?|dashboards?)\b|"
+                              r"\b(what|which|list|show)\b[^.?!\n]{0,20}\b(charts|graphs|graphiques)\b|"
+                              r"\bcharts? (are|is) (in|on)\b|\b(its|their) charts\b|\bthe charts (of|in|on)\b|"
+                              r"\bquels graphiques\b|\bles graphiques (du|de|des)\b", re.I),
+    "sqllab": re.compile(r"\bsql ?lab\b|\bsaved? (it|this|that|the|my|as)?\s*(sql|query|queries|requ[êe]te)\b|"
+                         r"\bexplore\b|\bexplorer\b|\b(link|lien|url)\b|\bopen (it|this|that|the (query|sql))\b|"
+                         r"\bouvr\w+ (la|cette) requ[êe]te\b", re.I),
 }
 TOOLS_OF = {
     "charts": {"get_chart_type_schema", "generate_chart", "update_chart", "update_chart_preview", "list_charts",
                "get_chart_info", "generate_dashboard", "add_chart_to_existing_dashboard", "list_dashboards",
-               "get_dashboard_info", "fix_chart_time_range", "chart_image", "create_virtual_dataset"},
+               "get_dashboard_info", "fix_chart_time_range", "chart_image", "create_virtual_dataset", "get_chart_data"},
     "files": {"export_excel", "send_email", "create_report", "list_reports"},
     "images": {"chart_from_sql", "chart_image"},
     "usual": {"compare_to_usual"},
+    "sqllab": {"save_sql_query", "open_sql_lab_with_context", "generate_explore_link"},
+    "read_charts": {"get_chart_data", "get_chart_info", "list_charts", "list_dashboards", "get_dashboard_info",
+                    "chart_image"},
+    "status": {"get_chart_data", "get_chart_info", "list_charts", "list_dashboards", "get_dashboard_info",
+               "chart_image", "compare_to_usual"},
     "investigation": {"compare_to_usual"},
 }
 INTENT_TOOLS = set().union(*TOOLS_OF.values())
@@ -290,6 +341,14 @@ def _refs(node: Any, path: str = "") -> list[tuple[str, dict]]:
     return out
 
 
+CONFIG_NAME = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_\s\-.]*$")     # a column name Superset's chart config accepts
+PERIOD = re.compile(r"\b(\d{1,2}(?:st|nd|rd|th|er)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|f[ée]v|"
+                    r"mars|avr|mai|juin|juil|ao[uû]|sept|d[ée]c)\w*|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+                    r"\w*\.?\s+\d{1,2}|\d{4}-\d{2}-\d{2}|yesterday|today|tonight|this (?:week|month|morning|night)|"
+                    r"last \d+ (?:hours?|days?|weeks?|months?)|hier|aujourd'hui|cette (?:nuit|semaine)|"
+                    r"\d+ derni[eè]res? (?:heures|jours|semaines))\b", re.I)
+
+
 class ChartGuard:
     def __init__(self, agent: "Agent") -> None:
         self.agent = agent
@@ -374,6 +433,55 @@ class ChartGuard:
                 "use another field" for where, ref in _refs(config)
                 if isinstance(ref.get("name"), str) and ref["name"] in banned]
 
+    def _period_missing(self, dataset_id: Any, config: dict) -> list[str]:
+        """The question is about a period and the chart, on a table (not a query with its dates), has no
+        filter on the table's time column: it would show every date while the answer speaks of one."""
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.extensions import db
+
+        question = getattr(self.agent, "question", "") or ""
+        if not PERIOD.search(question):
+            return []
+        try:
+            ds = db.session.get(SqlaTable, int(dataset_id))
+        except (TypeError, ValueError):
+            return []
+        if ds is None or (ds.sql or "").strip():           # a virtual dataset: the dates are in its SQL
+            return []
+        times = {c.column_name for c in ds.columns if c.is_dttm} | ({ds.main_dttm_col} if ds.main_dttm_col else set())
+        if not times:
+            return []
+        used = {f.get("column") for f in config.get("filters") or [] if isinstance(f, dict)}
+        if used & times:
+            return []
+        col = ds.main_dttm_col or sorted(times)[0]
+        if not CONFIG_NAME.match(col):                  # "@timestamp_date": a chart filter cannot name it
+            return [f'the question is about a period, and this chart would show every date: its time column "{col}" '
+                    "cannot be used in a chart filter. Save the query of the finding, with its dates in the WHERE, as a "
+                    "dataset (create_virtual_dataset) and chart that dataset"]
+        return [f'the question is about a period, and this chart has no filter on the time column "{col}": it '
+                f'would show every date. Add the period of the question as two filters: {{"column": "{col}", "op": '
+                f'">=", "value": "<start of the period, YYYY-MM-DD HH:MM>"}} and {{"column": "{col}", "op": "<", '
+                '"value": "<end of the period>"}} (dates from the question and from now)']
+
+    def shows(self, chart_id: Any) -> str:
+        """What a saved chart returns now (rows, first ones): the answer describes that chart, not the
+        intent (a row limit a chart type ignores, a filter that did not apply)."""
+        if not getattr(getattr(self.agent, "superset", None), "available", False):
+            return ""
+        try:
+            text = self.agent.superset.call("get_chart_data", {"request": {"identifier": int(chart_id), "limit": 12}})
+            data = json.loads(text)
+        except Exception:  # pylint: disable=broad-except
+            return ""
+        rows = data.get("data") or data.get("rows") or []
+        total = data.get("row_count") or data.get("total_rows") or len(rows)
+        if not isinstance(rows, list):
+            return ""
+        first = "; ".join(", ".join(f"{k}={v}" for k, v in list(r.items())[:4]) if isinstance(r, dict) else str(r)
+                          for r in rows[:5])
+        return f"\n(the saved chart {chart_id} returns {total} row(s) now; first: {first[:600]})"
+
     def _dry_run(self, dataset_id: Any, config: dict) -> str | None:
         text = self.agent.superset.call("generate_chart", {"request": {
             "dataset_id": dataset_id, "config": config, "save_chart": False, "preview_formats": ["table"]}})
@@ -394,6 +502,11 @@ class ChartGuard:
         req = args.get("request", args)
         if name not in CHART_TOOLS or not isinstance(req, dict):
             return name, args, None
+        if name == "update_chart" and req.get("dataset_id") is not None:
+            return name, args, json.dumps({"success": False, "error": "update_chart cannot change the dataset of a chart "
+                                           "(it would keep the old one and its dates). Make a new chart on the new "
+                                           "dataset (generate_chart with a chart_name), put it on the dashboard "
+                                           "(add_chart_to_existing_dashboard), and say that it is a new chart"})
         config = req.get("config")
         if isinstance(config, dict) and config.get("chart_type") == "table":
             for key in ("sort_by", "order_by_cols", "order_by"):
@@ -415,6 +528,13 @@ class ChartGuard:
                 errors += self._check(config, *(known or (None, None)))
             if not errors and ds is not None:
                 errors += self._not_used(ds, config)
+            saving_now = (name == "generate_chart" and req.get("save_chart")) or name == "update_chart"
+            if not errors and ds is not None and saving_now:
+                errors += self._period_missing(ds, config)
+            if not errors and name == "generate_chart" and req.get("save_chart") and \
+                    not str(req.get("chart_name") or "").strip():
+                errors.append("a saved chart needs a chart_name that says what it shows and its period (Superset's "
+                              "automatic names repeat: \"Sum(x) by y\" for two different charts)")
             if errors and "create_virtual_dataset" in self.agent.names and any(
                     k in e for e in errors for k in ("unknown column", "is not a saved metric", "cannot run")):
                 errors.append("a calculation (a percentage, a ratio, PromQL) is not a field of this dataset: save "
@@ -455,6 +575,9 @@ class ChartGuard:
                 fixed = {}
             if fixed.get("time_range"):
                 content += f"\n(the date filters were saved as the chart's time range: {fixed['time_range']})"
+        chart_id = chart.get("id") or (args.get("request", args).get("identifier") if name == "update_chart" else None)
+        if chart_id and data.get("success") is not False and not data.get("error"):
+            content += self.shows(chart_id)
         return content
 
 
@@ -570,9 +693,22 @@ CHART_CLAIM = re.compile(r"\b(chart|graph)\b[^.\n]{0,40}\b(has been|was|is)\s+(c
                          r"\bgraphique\b[^.\n]{0,40}\b(a [ée]t[ée]|est)\s+(cr[ée][ée]|enregistr[ée])", re.I)
 
 
+DASHBOARD_CLAIM = re.compile(r"\b(dashboard)\b[^.\n]{0,60}\b(has been|was|is)\s+(created|saved|updated|changed)|"
+                             r"\b(added|ajout[ée]e?s?)\b[^.\n]{0,60}\b(to|au|dans le)\s+(the\s+)?(dashboard|tableau de bord)|"
+                             r"\btableau de bord\b[^.\n]{0,60}\b(a [ée]t[ée]|est)\s+(cr[ée][ée]|enregistr[ée]|modifi[ée])",
+                             re.I)
+DASHBOARD_TOOLS = ("generate_dashboard", "add_chart_to_existing_dashboard", "update_dashboard")
+SQLLAB_CLAIM = re.compile(r"\b(saved|enregistr[ée]e?)\b[^.\n]{0,60}\b(sql ?lab|saved quer(y|ies)|requ[êe]tes? "
+                          r"enregistr[ée]es?)\b", re.I)
+
+
 def saved_chart(trace: list[dict]) -> bool:
     return any((t.get("called") or t["tool"]) in ("generate_chart", "update_chart", "generate_dashboard")
                and t.get("status") == "done" for t in trace)
+
+
+def saved_dashboard(trace: list[dict]) -> bool:
+    return any((t.get("called") or t["tool"]) in DASHBOARD_TOOLS and t.get("status") == "done" for t in trace)
 
 
 def claims_check(answer: str, trace: list[dict]) -> str:
@@ -595,6 +731,11 @@ def claims_check(answer: str, trace: list[dict]) -> str:
             notes.append("the e-mail was sent without an attachment")
     if CHART_CLAIM.search(answer) and not saved_chart(trace):
         notes.append("no Superset chart was saved (only an image or the result shown here); ask again to save one")
+    if DASHBOARD_CLAIM.search(answer) and not saved_dashboard(trace):
+        notes.append("no Superset dashboard was created or changed in this answer; ask again to do it")
+    if SQLLAB_CLAIM.search(answer) and not any((t.get("called") or t["tool"]) == "save_sql_query" and
+                                               t.get("status") == "done" for t in trace):
+        notes.append("no query was saved in SQL Lab in this answer; ask again to save it")
     return ("\n\n(Check: " + "; ".join(dict.fromkeys(notes)) + ".)") if notes else ""
 
 
@@ -607,17 +748,56 @@ TABLE_WITH_NUMBERS = re.compile(r"^\s*\|[^\n]*\d[^\n]*\|\s*$", re.M)
 NO_TOOL_NUDGE = ("(Check before answering: you called no tool. The knowledge given with the question is only a "
                  "summary, not an answer. Call describe_data for what the data contains and its fields, and run "
                  "the query (execute_sql, promql_query...) for any number or list. If the question really needs "
-                 "no data, give the same answer again. Either way write the whole answer for the user: they did "
-                 "not see the one above.)")
+                 "no data, give the same answer again. Either way "
+                 "write the whole answer for the user as if for the first time: they see neither the one above nor this check, so never mention it, apologise or say what changed.)")
+NUMBERS_NUDGE = ("(Check before answering: these numbers or names of your answer are in none of the results "
+                 "above: {numbers}. Take every number and name from a query result: compute totals, rates, "
+                 "averages and differences in the query itself (execute_sql, promql_query), list only the names "
+                 "and rows a result gave (never continue a series; the page shows every row of a result, so a "
+                 "table of at most 10 rows is enough), or leave them out. Then "
+                 "write the whole answer for the user as if for the first time: they see neither the one above nor this check, so never mention it, apologise or say what changed.)")
+NUMBERS_NOTE = ("\n\n(Check: these numbers or names do not come from the results of this answer's queries: "
+                "{numbers}.)")
+BAD_TOOL_CALL = re.compile(r"parse tool call|tool call arguments|invalid tool call|failed to parse", re.I)
+UNREADABLE_CALL = ("(Your last reply could not be read: the arguments of its tool call were not valid JSON (too long, "
+                   "or cut). Call the tool again with short arguments: a chart config names columns and aggregates, "
+                   "never the data rows. Or write the answer with what you have.)")
+OUT_OF_STEPS = ("(No tool call is left for this answer. Write the answer for the user now, from the results "
+                "above: what was done (the charts, datasets and dashboards saved, with their links), what the "
+                "results show, and what remains to do. Do not claim anything the tools did not do.)")
+RULES_NUDGE = ("(Check before answering: the team's rule \"{rule}\" applies to the data you queried, and your query "
+               "does not apply it. Run the query again applying it, or, if the question asks otherwise, say so in "
+               "one line. Then "
+               "write the whole answer for the user as if for the first time: they see neither the one above nor this check, so never mention it, apologise or say what changed.)")
+RULES_NOTE = "\n\n(Check: the team's rule \"{rule}\" was not applied in this answer's queries.)"
 NO_QUERY_NUDGE = ("(Check before answering: your answer shows results or says that a query ran, but no query ran "
                   "in this answer. Run it now (execute_sql, promql_query...) and answer from its result: never "
-                  "show numbers or rows that no tool returned. Then write the whole answer for the user: they did "
-                  "not see the one above.)")
+                  "show numbers or rows that no tool returned. Then "
+                  "write the whole answer for the user as if for the first time: they see neither the one above nor this check, so never mention it, apologise or say what changed.)")
+
+
+def _has_data(answer: str) -> bool:
+    """Numbers or names with digits in the answer's text: results, not only a question."""
+    from supagent.grounding import answer_names, answer_numbers
+
+    return bool(answer_numbers(answer) or answer_names(answer))
+
+
+def asks_back(answer: str) -> bool:
+    """The answer is a question to the user (what they meant): short, ends with a question, no
+    result in it (rule 6)."""
+    text = (answer or "").strip()
+    last = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
+    return bool(text) and len(text) <= 1200 and last.rstrip("*_ )").endswith("?") and \
+        not TABLE_WITH_NUMBERS.search(text) and "```" not in text
 
 
 def unsupported_answer(answer: str, trace: list[dict]) -> str | None:
     """A reminder when an answer was written without the tools: no tool called at all, or
-    results shown (a JSON block, "SQL run", a table of numbers) with no query run."""
+    results shown (a JSON block, "SQL run", a table of numbers) with no query run. A question
+    back to the user (what they meant) is an answer."""
+    if asks_back(answer) and not _has_data(answer):   # a question back, not results with an offer at the end
+        return None
     done = {t.get("called") or t["tool"] for t in trace if t.get("status") == "done"}
     if not trace:
         return NO_TOOL_NUDGE
@@ -656,7 +836,23 @@ ANNOUNCE = re.compile(
     r"cr[ée]er|interroger|calculer|r[ée]cup[ée]rer|envoyer|exporter|enregistrer|tracer)\b)[^.!?\n]*[.:!…]?\s*$", re.I)
 ANNOUNCE_NUDGE = ("(Check before answering: your text ends by announcing a step (\"{step}\") but you called no "
                   "tool. Take that step now with the tool, or, if it is not needed, write the final answer without "
-                  "announcing anything. The user did not see the text above.)")
+                  "announcing anything. The user sees neither the text above nor this check: never mention it.)")
+APOLOGY = re.compile(r"^\s*(you'?re right|you are right|i apologi[sz]e|(my )?apologies|sorry|good catch|thanks? for "
+                     r"(pointing|the)|i (included|made up|invented|fabricated)|vous avez raison|d[ée]sol[ée]|je m'excuse)\b"
+                     r"[^\n]{0,240}?(?:[.!:](?:\s|$)|\n)", re.I)
+
+
+def without_apology(answer: str) -> str:
+    """An answer written again after a check: its first words for the check ("You're right, I included
+    fabricated numbers...") are not for the user, who never saw it."""
+    text = answer or ""
+    for _ in range(2):                                   # "You're right. Let me provide the correct answer."
+        m = APOLOGY.match(text)
+        if not m:
+            break
+        text = text[m.end():].lstrip()
+        text = re.sub(r"^(let me|here is|here's|voici)\b[^\n]{0,160}?[.:]\s*", "", text, flags=re.I)
+    return text if text.strip() else answer
 
 
 def announces_action(answer: str) -> str | None:
@@ -721,9 +917,14 @@ def honesty_note(answer: str, trace: list[dict]) -> str:
     return f"\n\n(Check: {', '.join(missing[:6])} could not run in this answer: what it covers was not checked.)"
 
 
+RULES_GIVEN = 30         # the team's rules in the instructions (the next ones are found by the search)
+RULES_NEAR_CHARS = 1500  # the rules given again next to the question, in full, up to this size
+RULE_CHARS = 1500        # of each (a longer rule: its parts are also found by the search)
+
+
 def rule_line(rule: dict[str, str]) -> str:
     """A catalog rule for the prompt; its title is not repeated when the text begins with it."""
-    body = rule["text"][:600]
+    body = rule["text"][:RULE_CHARS]
     return body if body.startswith(rule["title"].rstrip("\u2026")) else f"{rule['title']}: {body}"
 
 
@@ -770,22 +971,24 @@ class Agent:
         query result is already shown as a table and a chart): fewer tools, fewer wrong calls."""
         if not self.rich:
             return self.specs
+        question = getattr(self, "intent_text", None) or question
         wanted = set().union(*(TOOLS_OF.get(k, set()) for k in intents(question))) if intents(question) else set()
         if self.wants_saved_chart:
             wanted |= TOOLS_OF["charts"]
         return [s for s in self.specs if s["function"]["name"] not in INTENT_TOOLS or s["function"]["name"] in wanted]
 
-    def _system(self, question: str) -> str:
+    def _system(self, question: str, shown: set[str] | None = None) -> str:
         """The instructions: the same for every user and every question of a kind, so that the LLM
         server keeps them and the tools (which follow them) in its prompt cache from one question
         to the next; what is found for this question and user goes with the question
-        (_question_blocks)."""
+        (_question_blocks). `shown` gets the team's rules given in full here."""
         text = CORE + (RICH if self.rich else PLAIN) + OSAGG_RULES + PROMAGG_RULES
-        found = intents(question) | ({"charts"} if self.wants_saved_chart else set())
+        found = intents(getattr(self, "intent_text", None) or question) | (
+            {"charts"} if self.wants_saved_chart else set())
         if not self.rich:
             found |= {"files", "images"}
-        for k in ("charts", "investigation", "files", "images", "usual"):
-            if k in found and not (k == "usual" and "investigation" in found):
+        for k in ("charts", "status", "sqllab", "investigation", "files", "images", "usual"):
+            if k in found and not (k == "usual" and ("investigation" in found or "status" in found)):
                 text += SECTIONS[k]
         text += "\n\nReminder: answer in the language of the question below."
         if not self.superset.available:
@@ -797,50 +1000,83 @@ class Agent:
         try:
             from supagent.knowledge.catalog import rules
 
-            team_rules = rules()[:30]
+            team_rules = rules()[:RULES_GIVEN]
         except Exception:  # pylint: disable=broad-except
             team_rules = []
         if team_rules:
             text += "\n\nRules of the team (from the catalog: always follow them):"
             for r in team_rules:
                 text += "\n- " + rule_line(r)
+                if shown is not None and len(r["text"]) <= RULE_CHARS:
+                    shown.add(f"entry:{r['id']}")
         return text
 
-    def _question_blocks(self, question: str) -> str:
+    def _rules_reminder(self) -> str:
+        """The team's rules again next to the question (the instructions have them all; a model follows
+        what is near the question better): in full when they are short, else a line naming them."""
+        try:
+            from supagent.knowledge.catalog import rules
+
+            team_rules = rules()[:RULES_GIVEN]
+        except Exception:  # pylint: disable=broad-except
+            return ""
+        if not team_rules:
+            return ""
+        lines = [rule_line(r) for r in team_rules]
+        if sum(len(x) for x in lines) <= RULES_NEAR_CHARS:
+            return ("\n\nThe team's rules, for every query of this answer (they win over the learned answers "
+                    "below; apply one unless the question asks otherwise):\n" + "\n".join(f"- {x}" for x in lines))
+        return ("\n\nApply the team's rules of the instructions to every query of this answer (they win over the "
+                "learned answers below).")
+
+    def _question_blocks(self, question: str, shown: set[str] | None = None) -> str:
         """What is found for this question and this user, given with the question: their memories,
-        where the data is, the knowledge that matches, the learned answers."""
+        the team's words (glossary), where the data is, the knowledge that matches, the learned
+        answers. Nothing twice: the knowledge found leaves out what the instructions (`shown`) and
+        the other blocks give."""
+        shown = set() if shown is None else shown
         text = ""
         try:
             from flask import g
 
             from supagent.knowledge.memory import prompt_block
 
-            text += prompt_block(getattr(getattr(g, "user", None), "id", None))
+            text += prompt_block(getattr(getattr(g, "user", None), "id", None), shown)
         except Exception:  # pylint: disable=broad-except
             pass
+        text += self._rules_reminder()
+        try:
+            from supagent.knowledge.glossary import glossary_block
+
+            text += glossary_block(question, shown)   # the team's words, before where the data is
+        except Exception:  # pylint: disable=broad-except
+            log.warning("supagent: the team's words: not given", exc_info=True)
         try:
             from supagent.knowledge.resolve import where_block
 
-            text += where_block(question)            # where the data is, found without the LLM
+            text += where_block(question, shown)     # where the data is, found without the LLM
         except Exception:  # pylint: disable=broad-except
             log.warning("supagent: where the data is: not found", exc_info=True)
-        if settings.get("search.enabled"):
-            try:
-                from supagent.knowledge.search import knowledge_block
-
-                text += knowledge_block(question)
-            except Exception:  # pylint: disable=broad-except
-                pass
         try:
             from supagent.knowledge.experience import recipes_for
 
             recipes = recipes_for(question)
         except Exception:  # pylint: disable=broad-except
             recipes = []
+        shown |= {f"recipe:{r['id']}" for r in recipes}
+        if settings.get("search.enabled"):
+            try:
+                from supagent.knowledge.search import knowledge_block
+
+                about = intents(getattr(self, "intent_text", None) or question)
+                text += knowledge_block(question, shown, with_charts=bool(about & {"status", "read_charts", "charts"}))
+            except Exception:  # pylint: disable=broad-except
+                log.warning("supagent: knowledge found: not given", exc_info=True)
         if recipes:
             text += ("\n\nWays that answered similar questions before (helpful = marked Helpful by a user, "
                      "confirmed = also approved by an admin). Start "
-                     "from them, adapting dates, filters and names to this question, and run the query again: "
+                     "from them, adapting dates, filters and names to this question and to the team's rules (a "
+                     "rule wins over a learned query), and run the query again: "
                      "their results are not kept and are not the answer:")
             for r in recipes:
                 where = f" on database id {r['database_id']}" if r.get("database_id") else ""
@@ -886,14 +1122,19 @@ class Agent:
             content = f"(a chart with this name was already saved: {called} was used)\n" + content
         return called, content
 
-    def ask(self, question: str, history: list[dict] | None = None) -> tuple[str, list[dict]]:
-        self.guard.saved = {}
+    def prompt(self, question: str, history: list[dict] | None = None) -> list[dict]:
+        """What the LLM is given for this question, before any tool call: the instructions (with the
+        team's rules), the chat so far, then with the question what is known for it (memory, where
+        the data is, the knowledge found: dictionary, catalog, documents, Context, learned answers).
+        `superset supagent prompt` shows it."""
         self.wants_saved_chart = bool(SAVED_CHART_ASK.search(question or ""))
-        self.redirected_chart = False
-        failed: dict[str, str] = {}
-        charts: list[str] = []
-        emailed: list[str] = []
-        messages: list[dict] = [{"role": "system", "content": self._system(question)}]
+        self.question = question                          # the chart guard checks its period
+        before = next((str(h["content"]) for h in reversed(history or [])
+                       if h.get("role") == "user" and h.get("content")), "")
+        # "what charts are in it?": the tools and instructions of the question it refers to, too
+        self.intent_text = f"{before}\n{question}" if before and refers_back(question) else question
+        shown: set[str] = set()                          # given once: not again in the knowledge found
+        messages: list[dict] = [{"role": "system", "content": self._system(question, shown)}]
         recent = (history or [])[-HISTORY_MESSAGES:]
         for h in recent:
             if h.get("content"):
@@ -903,18 +1144,33 @@ class Agent:
         previous = next((str(h["content"]) for h in reversed(history or [])
                          if h.get("role") == "user" and h.get("content")), "")
         # "create a chart of that finding": where the data is, from the question it refers to
-        blocks = self._question_blocks(f"{previous}\n{question}" if previous and refers_back(question) else question)
+        blocks = self._question_blocks(f"{previous}\n{question}" if previous and refers_back(question) else question,
+                                       shown)
         behind = queries_note(recent)                   # what "that finding" was computed from
         if behind:
             blocks = f"{blocks}\n\n{behind}" if blocks else behind
         messages.append({"role": "user", "content": (blocks + "\n\n" if blocks else "") +
                          f"(Now: {now():%A %Y-%m-%d %H:%M}.{hint})\n{question}"})
+        return messages
+
+    def ask(self, question: str, history: list[dict] | None = None) -> tuple[str, list[dict]]:
+        self.guard.saved = {}
+        self.redirected_chart = False
+        failed: dict[str, str] = {}
+        charts: list[str] = []
+        emailed: list[str] = []
+        messages = self.prompt(question, history)
+        asked_at = len(messages)                       # what the LLM was given, before its own words
         trace: list[dict] = []
-        nudged = announced = False
+        nudged = announced = numbers_asked = rules_asked = False
         done: set[str] = set()                         # identical successful calls: not run twice
+        saved_calls: set[str] = set()                   # identical saving calls: not run again either
         self.usage = {}
         specs = self._specs_for(question)
-        for _ in range(self.max_steps):
+        building = "charts" in intents(question) or self.wants_saved_chart
+        steps = self.max_steps * (2 if building else 1)   # several charts and a dashboard: more calls
+        unreadable = 0
+        for _ in range(steps):
             self._check_stop()
             try:
                 msg = self.llm.chat(messages, tools=specs)
@@ -924,6 +1180,15 @@ class Agent:
                 if fallback is None:
                     raise
                 return fallback, trace
+            except LLMError as ex:
+                if not BAD_TOOL_CALL.search(str(ex)) or unreadable >= 2:
+                    if unreadable and trace:           # it did things before: say what, not an error
+                        return self._out_of_steps(messages, trace), trace
+                    raise
+                unreadable += 1                        # the server could not read the model's tool call
+                log.info("supagent: unreadable tool call sent back (%s)", str(ex)[:200])
+                messages.append({"role": "user", "content": UNREADABLE_CALL})
+                continue
             add_usage(self.usage, self.llm.last_usage)
             messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
             calls = msg.get("tool_calls") or []
@@ -943,6 +1208,24 @@ class Agent:
                     log.info("supagent: answer sent back (announced step): %r", step)
                     messages.append({"role": "user", "content": ANNOUNCE_NUDGE.format(step=step)})
                     continue
+                missed = self._unapplied(question, trace)      # every answer (a question back has no query)
+                if missed and not rules_asked:         # once: a rule of the team not applied
+                    rules_asked = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (rule not applied): %r", missed[0][:200])
+                    messages.append({"role": "user", "content": RULES_NUDGE.format(rule=missed[0][:300])})
+                    continue
+                unknown = self._ungrounded(answer, messages[:asked_at] + [
+                    m if m["role"] == "tool" else {"role": "assistant", "tool_calls": m["tool_calls"]}
+                    for m in messages[asked_at:-1] if m["role"] == "tool" or m.get("tool_calls")])
+                if unknown and not numbers_asked:      # once: numbers the model wrote itself
+                    numbers_asked = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (numbers not in the results): %s", unknown)
+                    messages.append({"role": "user", "content": NUMBERS_NUDGE.format(numbers=", ".join(unknown[:12]))})
+                    continue
+                if nudged or announced or numbers_asked or rules_asked:
+                    answer = without_apology(answer)   # written again after a check the user never saw
                 missing = [c for c in charts if c.splitlines()[-1].strip() not in answer]
                 if missing:
                     answer += "".join(f"\n\n```\n{c}\n```" for c in missing)
@@ -954,6 +1237,10 @@ class Agent:
                     if any(t.get("full") for t in trace):
                         answer = trim_tables(answer)   # every row is in the page's result view
                 note = unsupported_note(answer, trace) if nudged else ""
+                if unknown:                            # still there after asking: marked
+                    note += NUMBERS_NOTE.format(numbers=", ".join(unknown[:12]))
+                if missed:
+                    note += RULES_NOTE.format(rule=missed[0][:300])
                 return answer + claims_check(answer, trace) + honesty_note(answer, trace) + note, trace
             for tc in calls:
                 self._check_stop()
@@ -981,7 +1268,7 @@ class Agent:
                 elif call_key in failed:
                     content = (f"You already made exactly this call and it failed: {failed[call_key][:600]}. "
                                "Change the arguments as the error says, or answer the user.")
-                elif call_key in done:
+                elif call_key in done or call_key in saved_calls:
                     content = REPEAT_NOTE
                 else:
                     called, content = self._call(name, args)
@@ -995,8 +1282,9 @@ class Agent:
                     if called == "send_email" and '"sent_to"' in content:
                         emailed.append(content[:300])
                     if content is not REPEAT_NOTE:
-                        if called in SAVING_TOOLS:     # something changed: reading it again is not a repeat
-                            done.clear()
+                        if called in SAVING_TOOLS:     # something changed: reading it again is not a repeat,
+                            done.clear()               # saving the very same thing again is
+                            saved_calls.add(call_key)
                         else:
                             done.add(call_key)
                 if called in RESULT_TOOLS and step["status"] == "done" and content is not REPEAT_NOTE:
@@ -1011,7 +1299,46 @@ class Agent:
                 step.update(called=called, seconds=round(time.time() - t0, 1), result=content[:4000])
                 self._report(trace)
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", name), "content": content})
-        return "(stopped after too many tool calls: ask a narrower question)", trace
+        return self._out_of_steps(messages, trace), trace
+
+    def _out_of_steps(self, messages: list[dict], trace: list[dict]) -> str:
+        """No calls left: the LLM says, without tools, what was done (what is saved, with its links) and
+        what remains, instead of an answer that only says it stopped."""
+        messages.append({"role": "user", "content": OUT_OF_STEPS})
+        try:
+            msg = self.llm.chat(messages, tools=None)
+            add_usage(self.usage, self.llm.last_usage)
+            text = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S).strip()
+        except Exception:  # pylint: disable=broad-except
+            log.warning("supagent: the summary after the last call failed", exc_info=True)
+            text = ""
+        if not text:
+            return "(stopped after too many tool calls: ask a narrower question)"
+        if self.rich:
+            text = local_links(text)
+        return text + claims_check(text, trace) + "\n\n(Stopped: the tool calls of one answer were used up.)"
+
+    def _unapplied(self, question: str, trace: list[dict]) -> list[str]:
+        """The team's rules a query of this answer should have applied (a filter on a field it has)."""
+        try:
+            from supagent.knowledge.rulecheck import unapplied
+
+            return unapplied(question, trace)
+        except Exception:  # pylint: disable=broad-except   (never an answer lost for a check)
+            log.warning("supagent: the team's rules not checked", exc_info=True)
+            return []
+
+    def _ungrounded(self, answer: str, given: list[dict]) -> list[str]:
+        """The numbers of the answer that nothing the LLM was given supports (agent.check_numbers)."""
+        if not settings.get("agent.check_numbers"):
+            return []
+        try:
+            from supagent.grounding import ungrounded
+
+            return ungrounded(answer, given)
+        except Exception:  # pylint: disable=broad-except   (never an answer lost for a check)
+            log.warning("supagent: numbers of the answer not checked", exc_info=True)
+            return []
 
     def _empty_fallback(self, trace: list[dict]) -> str | None:
         """The LLM wrote nothing, even when asked again: the last query result, said plainly (None
