@@ -78,7 +78,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.4.7-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.4.8-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -256,14 +256,26 @@ leaves its time to the next), and the **AI descriptions are written during the l
 the LLM describes what has none yet, as the objects are learned: the catalog first (what people
 wrote always wins), then metrics and indices, fields and labels (100 objects at a time, 10 per
 LLM call, each call saved at once; a label is described once per database for every metric that
-has it; exporters' HELP texts and catalog texts count as descriptions; marked *AI-written*). A
+has it, and the labels of that name found later take that description without an LLM call, a
+person's first; exporters' HELP texts and catalog texts count as descriptions; marked *AI-written*). A
 database of thousands of metrics that takes two hours to learn gets its descriptions during
 those two hours, not after them. Every osagg and promagg database is learned, except the ones
 `learn.databases` leaves out and the ones the learning user (`learn.user`) may not read: each
 run lists those, with the reason (settings page, and `superset supagent learn --plan`). While a
-run is going, the runs list shows the database being learned, the ones still to come ("now:
-Mimir; next: logs, jobs"), the ones left out with the reason, and how many objects it learned
-and described so far.
+run is going, the runs list shows the database being learned and what it does there ("profiles:
+1,200 of 4,904 due, 1,300 requests"), the ones still to come ("next: logs, jobs"), the ones left
+out with the reason, the new objects found so far and the AI descriptions written meanwhile (LLM
+calls and tokens, apart from the ones copied from a label of the same name).
+
+**Steps of a run**: *steps* under each run lists everything it did, with the time it started and
+how long it took: per database the objects listed, new, due and profiled, the requests and
+errors, the batches read one metric at a time (with their first error), the history lookups, the
+changes by type (new, gone, back, type, unit, cardinality) and the search update; then the
+descriptions written while reading, the wait for the last ones, the relations, the catalog, the
+categories, the descriptions still missing, the agent's catalog entries, the generic questions,
+the search index and its embeddings, and the check of "where the data is". A run that is stopped
+keeps the step it was doing, marked. Each step is also written in the server log
+(`supagent learn: run 9: read the database (Mimir): 4190.2 s {...}`).
 
 Once every database is read, it measures the **relations** between them all (a metric label and
 an index field hold the same values; the evidence is kept; a relation an admin marked **Wrong**
@@ -302,6 +314,13 @@ checked once: 5 requests to OpenSearch and 1,451 to Mimir (about 23 per metric),
 no error; 27 minutes with 40 LLM descriptions. The history is checked again only once a month,
 and a metric whose data stopped now costs about 6 requests when its profile is due (an estimate:
 that path has not run in the lab yet, nothing being due for 7 days); a live metric about 3.
+
+**Not to be used**: a description written by a person (Data dictionary page, catalog) that says a
+field, label, metric or index is not used ("not used", "do not use", "deprecated", "obsolete", "ne
+pas utiliser", "n'est plus utilisé"...) is honoured: "where the data is" never proposes it and
+lists it as *DO NOT USE* under its index or metric, `describe_data` and the dataset information
+mark it, and a query or a chart that uses it is refused with the team's words, so that the agent
+takes another field. A description written by the LLM never counts.
 
 ## The catalog
 

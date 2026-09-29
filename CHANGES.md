@@ -1,5 +1,25 @@
 # Changes
 
+## 0.4.8 (2026-09-29)
+
+* **Learning much faster on metric names with dots**: the batched Mimir requests (series counts,
+  depth of the history) escaped a dot in a way PromQL refuses ("unknown escape sequence"), and every
+  batch with such a name fell back to one request per metric (the history: about 7 per metric).
+* **No more paying twice for label descriptions**: labels found on newly profiled metrics take the
+  description of the same name in the same database (a person's first) without an LLM call; the
+  descriptions show the LLM calls and tokens apart from the copies.
+* **Steps of a run**: every run lists what it did, step by step (per database: listed, new, due,
+  profiled, requests, errors, batches read one at a time with their first error, history, changes
+  by type; then descriptions, relations, catalog, categories, agent catalog, generic questions,
+  search index, check), with times and durations, also for a run in progress and for the step a
+  stopped run was doing; each step is also in the server log. "Objects learned or updated" (which
+  counted every object seen again) is replaced by the new objects found.
+* **The search index no longer embeds every metric again after each run**: its text had the series
+  count and sampled label values, which change every run.
+* **"Not used" is honoured**: a person's description saying a field, label, metric or index is not
+  used keeps the agent from proposing it and from querying it (a query or chart that uses it is
+  refused with the team's words).
+
 ## 0.4.7 (2026-09-29)
 
 * **Questions about an earlier answer**: "create the chart in Superset of that finding" was

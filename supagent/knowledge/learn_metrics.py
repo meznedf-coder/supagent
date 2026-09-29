@@ -51,6 +51,24 @@ DAY_MS = 86_400_000
 SYNC_EVERY = 500                  # profiled metrics between two updates of the knowledge search
 
 
+RE2_SPECIAL = re.compile(r"([\\.+*?()|\[\]{}^$])")
+
+
+def name_regex(names: list[str]) -> str:
+    """An alternation of metric names for a PromQL regex matcher, inside a double-quoted string:
+    RE2 metacharacters escaped (a dot in "http.server.duration"), then every backslash doubled for
+    the string (PromQL refuses "\." as an unknown escape sequence)."""
+    rx = "|".join(RE2_SPECIAL.sub(r"\\\1", n) for n in names)
+    return rx.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _failed(failed: dict[str, Any] | None, phase: str, ex: Exception) -> None:
+    """A batch that fell back to one request per metric: counted, with its first error."""
+    if failed is not None:
+        item = failed.setdefault(phase, {"batches": 0, "first_error": str(ex)[:300]})
+        item["batches"] += 1
+
+
 def _sync_search() -> None:
     try:
         from supagent.knowledge.index import sync
@@ -249,19 +267,19 @@ def _label_stats(series: list[Any], complete: bool) -> dict[str, dict[str, Any]]
     return out
 
 
-def batch_counts(conn: Any, names: list[str], t_ms: int) -> dict[str, int] | None:
+def batch_counts(conn: Any, names: list[str], t_ms: int, failed: dict[str, Any] | None = None) -> dict[str, int] | None:
     """Series with a sample now, for many metrics in one query ({name: count}, 0 when not live);
     None when the query failed (each metric is then counted alone)."""
     if not names:
         return {}
-    rx = "|".join(re.escape(n) for n in names)
     try:
-        res = conn.client.query(f'count by (__name__) ({{__name__=~"{rx}"}})', t_ms,
+        res = conn.client.query(f'count by (__name__) ({{__name__=~"{name_regex(names)}"}})', t_ms,
                                 timeout=int(settings.get("learn.request_timeout")))
     except SourceStopped:
         raise
     except Exception as ex:  # pylint: disable=broad-except
         log.info("supagent learn: series counts of %d metrics: %s", len(names), ex)
+        _failed(failed, "series counts", ex)
         return None
     found: dict[str, int] = {}
     for s in res or []:
@@ -312,12 +330,12 @@ def batch_labels(conn: Any, counts: dict[str, int], end_ms: int) -> dict[str, tu
 HISTORY_DAYS = (60, 45, 30, 21, 14, 7, 3, 1)       # window starts, in days before the end of the data
 
 
-def batch_history(conn: Any, names: list[str], end_ms: int) -> dict[str, int] | None:
+def batch_history(conn: Any, names: list[str], end_ms: int, failed: dict[str, Any] | None = None) -> dict[str, int] | None:
     """About when the data of many metrics starts (series index only): for windows between 60
     days before `end_ms` and `end_ms`, the metric names that have series there, one label-index
     request per window for up to BATCH metrics; {name: start of its first window} (60 days =
     at least 60 days). None when a request failed (each metric is then bisected alone)."""
-    rx = "|".join(re.escape(n) for n in names)
+    rx = name_regex(names)
     bounds = [end_ms - d * DAY_MS for d in HISTORY_DAYS] + [end_ms]
     first: dict[str, int] = {}
     for a, b in zip(bounds, bounds[1:]):
@@ -327,6 +345,7 @@ def batch_history(conn: Any, names: list[str], end_ms: int) -> dict[str, int] | 
             raise
         except Exception as ex:  # pylint: disable=broad-except
             log.info("supagent learn: history of %d metrics: %s", len(names), ex)
+            _failed(failed, "history", ex)
             return None
         for n in present or []:
             first.setdefault(n, a)
@@ -335,7 +354,8 @@ def batch_history(conn: Any, names: list[str], end_ms: int) -> dict[str, int] | 
     return first
 
 
-def learn_history(conn: Any, source: Source, deadline: float) -> dict[str, int]:
+def learn_history(conn: Any, source: Source, deadline: float, failed: dict[str, Any] | None = None,
+                  progress: Any = None) -> dict[str, int]:
     """The depth of the history of the metrics that need it, with the time left: never measured
     first, then the oldest. Metrics whose data is live share requests (batch_history, about 8
     for 50 metrics); a metric whose data stopped is bisected alone (about 7 lookups)."""
@@ -365,7 +385,7 @@ def learn_history(conn: Any, source: Source, deadline: float) -> dict[str, int]:
         if time.time() >= deadline:
             break
         chunk = [x[3] for x in live[i:i + BATCH]]
-        found = batch_history(conn, [o.name for o in chunk], now)
+        found = batch_history(conn, [o.name for o in chunk], now, failed)
         if found is None:
             alone += live[i:i + BATCH]
             continue
@@ -373,6 +393,8 @@ def learn_history(conn: Any, source: Source, deadline: float) -> dict[str, int]:
             save(o, found.get(o.name))
             done += 1
         db.session.commit()
+        if progress is not None:
+            progress(phase="history", history=done, history_pending=len(todo) - done)
     for _c, _d, name, o in alone:
         if time.time() >= deadline:
             break
@@ -380,10 +402,14 @@ def learn_history(conn: Any, source: Source, deadline: float) -> dict[str, int]:
         save(o, _first_sample(conn, '{__name__="%s"}' % name, end - 60 * DAY_MS, end))
         db.session.commit()
         done += 1
+        if progress is not None and done % 25 == 0:
+            progress(phase="history (one metric at a time)", history=done, history_pending=len(todo) - done)
     return {"history": done, "history_pending": len(todo) - done}
 
 
-def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> dict[str, Any]:
+def learn_metrics(run: Run, source: Source, database: Any, deadline: float, progress: Any = None) -> dict[str, Any]:
+    """Learn the metrics of a promagg database until `deadline`; `progress(**counts)` is told what
+    it does as it goes (the run's steps on the settings page)."""
     from supagent.tools import _promagg_connection
 
     include, exclude = settings.get("learn.metrics"), settings.get("learn.metrics_exclude")
@@ -396,8 +422,15 @@ def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> d
     conn.client = Proxy(conn.client, throttle, ("query", "query_range", "series", "label_values", "metadata",
                                                 "label_names", "tenants"))
     out: dict[str, Any] = {"metrics": 0, "profiled": 0, "labels": 0, "not_due": 0, "complete": True}
+    fallbacks: dict[str, Any] = {}                     # batches that fell back to one request per metric
     today = dt.date.today()
+
+    def report(**counts: Any) -> None:
+        if progress is not None:
+            progress(**counts, **throttle.stats(), **({"fallbacks": fallbacks} if fallbacks else {}))
+
     try:
+        report(phase="listing the metrics")
         names = [n for n in conn.list_tables() if matches(n, include, exclude)]
         listed_all = len(names) <= limit
         if not listed_all:
@@ -416,6 +449,8 @@ def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> d
         families: dict[str, list[KObject]] = {}
         due_names = [n for n in names if due(n, known[n].stats if n in known else None, every, today)]
         out["due"] = len(due_names)
+        out["new"] = sum(1 for n in names if n not in known)
+        report(phase="profiles", listed=len(names), new=out["new"], due=out["due"], profiled=0)
         due_set = set(due_names)
         counted: dict[str, int] = {}                  # live series counts, batch by batch
         sampled: dict[str, tuple[dict[str, dict[str, Any]], bool]] = {}
@@ -427,7 +462,7 @@ def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> d
             chunk = [n for n in due_names[i:i + BATCH] if n not in prepared]
             prepared.update(chunk)
             big = {n for n in chunk if n in known and ((known[n].stats or {}).get("series") or 0) > BIG_METRIC}
-            counts = batch_counts(conn, [n for n in chunk if n not in big], conn.now_ms())
+            counts = batch_counts(conn, [n for n in chunk if n not in big], conn.now_ms(), fallbacks)
             if counts is None:
                 return                                 # counted one by one
             counted.update(counts)
@@ -492,6 +527,8 @@ def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> d
                 if not labels:
                     keep_labels(name)
             out["metrics"] += 1
+            if out["metrics"] % 50 == 0:
+                report(phase="profiles", listed=len(names), new=out["new"], due=out["due"], profiled=out["profiled"])
             base = re.sub(r"_(bucket|sum|count)$", "", name)
             if base != name:
                 families.setdefault(base, []).append(obj)
@@ -503,7 +540,8 @@ def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> d
                 p.name.endswith("_bucket") for p in parts) else "summary", "stats": {"parts": sorted(p.name for p in parts)}})
             for p in parts:
                 relate(fam, p, "family_part", {"family": base}, 1.0)
-        out.update(learn_history(conn, source, deadline))     # with the time left
+        report(phase="history", listed=len(names), new=out["new"], due=out["due"], profiled=out["profiled"])
+        out.update(learn_history(conn, source, deadline, fallbacks, report))     # with the time left
         out["gone"] = 0
         if listed_all:                                # every metric was listed, even if not all profiled
             out["gone"] += mark_gone(run, source, "metric", seen_metrics)
@@ -515,4 +553,6 @@ def learn_metrics(run: Run, source: Source, database: Any, deadline: float) -> d
     finally:
         conn.close()
     out.update(throttle.stats())
+    if fallbacks:
+        out["fallbacks"] = fallbacks
     return out

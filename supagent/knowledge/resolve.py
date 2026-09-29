@@ -406,6 +406,10 @@ def where_block(question: str) -> str:
         log.warning("supagent resolve: %s", ex)
         db.session.rollback()
         return ""
+    from supagent.knowledge.excluded import is_excluded, of_table
+
+    ranked = [c for c in ranked                           # what the team said not to use is never proposed
+              if not is_excluded(c["kind"], c["database"].id, c["name"], c.get("parent") or "")]
     if not ranked:
         return ""
     lines = ["\n\nWhere the data is (found for this question on names, descriptions and earlier answers, in the "
@@ -438,6 +442,10 @@ def where_block(question: str) -> str:
             about = f' - {c["about"]}' if c.get("about") else ""
             lines.append(f'- field "{c["name"]}" ({c.get("data_type") or "field"}{v}) of index "{c["parent"]}" in '
                          f"{where}{about}")
+        if c["kind"] in ("metric", "index"):
+            banned = of_table(d.id, c["name"])
+            if banned:
+                lines[-1] += " DO NOT USE (the team): " + "; ".join(f'"{x["name"]}" ({x["why"][:80]})' for x in banned[:8])
         if c.get("elsewhere"):
             lines[-1] += f' (also in database {", ".join(map(str, sorted(set(c["elsewhere"]))[:4]))})'
         if c.get("used_for"):

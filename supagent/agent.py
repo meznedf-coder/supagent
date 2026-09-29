@@ -354,6 +354,26 @@ class ChartGuard:
                 errors.append(f"{where}: unknown column '{name}' (columns: {', '.join(sorted(cols))[:800]})")
         return errors
 
+    def _not_used(self, dataset_id: Any, config: dict) -> list[str]:
+        """Chart fields the team said not to use (their description), on this dataset's table."""
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.extensions import db
+
+        from supagent.knowledge.excluded import of_table, violations
+
+        try:
+            ds = db.session.get(SqlaTable, int(dataset_id))
+        except (TypeError, ValueError):
+            return []
+        if ds is None:
+            return []
+        if ds.sql:                                       # a virtual dataset: its query
+            return [f"this dataset uses {p}" for p in violations([ds.sql])]
+        banned = {x["name"]: x["why"] for x in of_table(ds.database_id, ds.table_name)}
+        return [f"{where}: the team marked \"{ref['name']}\" as not to be used (\"{banned[ref['name']]}\"): "
+                "use another field" for where, ref in _refs(config)
+                if isinstance(ref.get("name"), str) and ref["name"] in banned]
+
     def _dry_run(self, dataset_id: Any, config: dict) -> str | None:
         text = self.agent.superset.call("generate_chart", {"request": {
             "dataset_id": dataset_id, "config": config, "save_chart": False, "preview_formats": ["table"]}})
@@ -393,6 +413,8 @@ class ChartGuard:
                 config["time_grain"] = "PT1H"      # metrics (promagg): time buckets, never raw samples
             if not errors:
                 errors += self._check(config, *(known or (None, None)))
+            if not errors and ds is not None:
+                errors += self._not_used(ds, config)
             if errors and "create_virtual_dataset" in self.agent.names and any(
                     k in e for e in errors for k in ("unknown column", "is not a saved metric", "cannot run")):
                 errors.append("a calculation (a percentage, a ratio, PromQL) is not a field of this dataset: save "
@@ -829,6 +851,11 @@ class Agent:
 
     def _call(self, name: str, args: dict) -> tuple[str, str]:
         """(tool really called, its result text)."""
+        from supagent.knowledge.excluded import query_texts, refusal, violations
+
+        problems = violations(query_texts(args))        # what the team said not to use
+        if problems:
+            return name, refusal(problems)
         if name in SAVING_TOOLS:                  # names and texts saved in Superset's own tables
             from supagent.textsafe import db_codec, fold_all
 

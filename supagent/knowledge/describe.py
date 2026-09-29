@@ -28,6 +28,10 @@ METRICS_SQL = (
 
 
 def marker(obj: KObject) -> str:
+    from supagent.knowledge.excluded import says_not_used
+
+    if says_not_used(obj):
+        return " (DO NOT USE: the team's description)"
     if obj.description_source == "llm" and not obj.verified:
         return " (AI-written, unverified)"
     return ""

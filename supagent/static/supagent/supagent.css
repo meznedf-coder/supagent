@@ -332,3 +332,8 @@ details.sql summary { cursor: pointer; color: var(--ink-2); }
 .embed .conv-list { display: none; flex-basis: 100%; max-height: 40vh; overflow: auto; margin: 0; }
 .embed .convs.open .conv-list { display: block; }
 .embed .msg.user .bubble { max-width: 92%; }
+/* the steps of a learning run (settings page, runs list) */
+details.steps { margin-top: 4px; }
+details.steps summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+details.steps ol { margin: 4px 0 0 18px; padding: 0; font-size: 12px; color: var(--ink-2); }
+details.steps li { margin: 2px 0; }

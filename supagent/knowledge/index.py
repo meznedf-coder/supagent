@@ -71,19 +71,20 @@ def _object_pieces() -> Iterator[dict[str, Any]]:
             lines.append("also called: " + ", ".join(map(str, o.synonyms)))
         if o.category:
             lines.append(f"category: {o.category}")
-        if st.get("series") is not None:
-            lines.append(f"{st['series']} series")
-        if st.get("docs") is not None:
-            lines.append(f"{st['docs']} documents, time field {st.get('time_field')}")
+        # no counts here (series, documents: they change every run, and a changed text is embedded
+        # again): the text changes when the meaning does
+        if st.get("time_field"):
+            lines.append(f"time field {st['time_field']}")
         kid_word = "labels" if o.kind == "metric" else "fields"
         described = []
         for k in sorted(kids, key=lambda x: x.name)[:120]:
             item = k.name
             if k.description:
                 item += f" ({k.description[:120]})"
-            vals = (k.stats or {}).get("values") or []
-            if vals and len(vals) <= 20:
-                item += ": " + ", ".join(map(str, vals[:8]))
+            kst = k.stats or {}
+            vals = kst.get("values") or []
+            if vals and len(vals) <= 20 and not kst.get("partial"):     # every value, not a sample
+                item += ": " + ", ".join(sorted(map(str, vals))[:8])
             described.append(item)
         if described:
             lines.append(f"{kid_word}: " + "; ".join(described))

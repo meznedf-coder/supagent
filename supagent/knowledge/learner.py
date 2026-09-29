@@ -22,6 +22,7 @@ One run at a time for all the web servers and workers: starting a run holds a ro
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import time
 import traceback
@@ -84,6 +85,19 @@ def databases_to_learn(only: list[str] | None = None, why: dict[str, str] | None
     return out
 
 
+def _flat(res: Any) -> dict[str, Any]:
+    """A step's result as counts (nested results one level down: {"sync": {"added": 3}} -> sync.added)."""
+    if not isinstance(res, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in res.items():
+        if isinstance(v, dict):
+            out.update({f"{k}.{kk}": vv for kk, vv in v.items() if not isinstance(vv, (dict, list))})
+        elif not isinstance(v, list):
+            out[k] = v
+    return out
+
+
 def in_order(targets: list[Any]) -> list[Any]:
     """The databases never learned first (by id), then the others (by id)."""
     from supagent.models import Source
@@ -102,6 +116,82 @@ def _publish(run_id: int, stats: dict[str, Any]) -> None:
         db.session.commit()
     except Exception:  # pylint: disable=broad-except   (the page shows it at the end)
         db.session.rollback()
+
+
+class Steps:
+    """What a run does, step by step (the settings page's runs list and the server log): name,
+    database, start (UTC), seconds and counts of each step. The step in progress is published as
+    it goes (at most every PUBLISH_S seconds) and kept, marked, when the run stops or fails; the
+    descriptions written meanwhile by the describer thread are shown with it ("during")."""
+    PUBLISH_S = 15.0
+
+    def __init__(self, run_id: int, stats: dict[str, Any]) -> None:
+        self.run_id, self.stats = run_id, stats
+        self.items: list[dict[str, Any]] = stats.setdefault("steps", [])
+        self.current: dict[str, Any] | None = None
+        self.t0 = 0.0
+        self.published = 0.0
+        self.describer: Any = None
+
+    def begin(self, name: str, database: str | None = None) -> None:
+        self.end()
+        self.current = {"step": name, "at": dt.datetime.utcnow().isoformat(timespec="seconds")}
+        if database:
+            self.current["database"] = database
+        self.items.append(self.current)
+        self.t0 = time.time()
+        self.publish()
+
+    def update(self, **counts: Any) -> None:
+        if self.current is not None:
+            self.current.update({k: v for k, v in counts.items() if v not in (None, {}, [])})
+            if time.time() - self.published >= self.PUBLISH_S:
+                self.publish()
+
+    def end(self, **counts: Any) -> None:
+        step = self.current
+        if step is None:
+            return
+        step.update({k: v for k, v in counts.items() if v not in (None, {}, [])})
+        step.pop("phase", None)
+        step["seconds"] = round(time.time() - self.t0, 1)
+        self.current = None
+        shown = {k: v for k, v in step.items() if k not in ("step", "at", "database", "seconds")}
+        log.info("supagent learn: run %s: %s%s: %s s %s", self.run_id, step["step"],
+                 f" ({step['database']})" if step.get("database") else "", step["seconds"],
+                 json.dumps(shown, default=str)[:600])
+        self.publish()
+
+    def interrupted(self, why: str) -> None:
+        if self.current is not None:
+            self.current["interrupted"] = why[:300]
+            self.end()
+
+    def publish(self) -> None:
+        if self.describer is not None:                  # the descriptions written meanwhile
+            out = self.describer.out
+            self.stats["during"] = {k: out.get(k, 0) for k in ("written", "copied", "requests", "tokens")}
+        self.published = time.time()
+        _publish(self.run_id, self.stats)
+
+
+def step_counts(res: dict[str, Any]) -> dict[str, Any]:
+    """What a database step shows of its result."""
+    keys = ("metrics", "indices", "labels", "fields", "families", "new", "due", "profiled", "not_due", "history",
+            "history_pending", "gone", "requests", "errors", "last_error", "fallbacks", "complete", "stopped",
+            "error", "changes")
+    return {k: res[k] for k in keys if k in res and res[k] not in (None, {}, [])}
+
+
+def changes_by_type(run_id: int, source_id: int) -> dict[str, int]:
+    """The changes this run recorded on one database, by type (new, gone, back, type, unit, cardinality)."""
+    from sqlalchemy import func
+
+    from supagent.models import Change, KObject
+
+    rows = (db.session.query(Change.change, func.count(Change.id)).join(KObject, KObject.id == Change.object_id)
+            .filter(Change.run_id == run_id, KObject.source_id == source_id).group_by(Change.change).all())
+    return {str(c): int(n) for c, n in rows}
 
 
 SCHEDULED_TRIES = 3          # a scheduled run stopped by a restart or an error is tried again, 3 times a day
@@ -200,12 +290,14 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
     stats: dict[str, Any] = {"databases": {}}
     status, error = "done", None
     t0 = time.time()
+    steps = Steps(run_id, stats)
 
-    def index_now() -> None:                      # the search finds what was learned now, not at the end
+    def index_now() -> dict[str, Any]:            # the search finds what was learned now, not at the end
         try:
-            sync(("object:",))
+            return sync(("object:",))
         except Exception:  # pylint: disable=broad-except
             db.session.rollback()
+            return {}
 
     describer = None
     if describe:                                  # the descriptions while the databases are read
@@ -215,6 +307,7 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
 
         describer = Describer(current_app._get_current_object(), run_id, deadline)
         describer.start()
+        steps.describer = describer
 
     def descriptions_so_far() -> dict[str, Any]:
         if describer is None:
@@ -237,16 +330,16 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                 for i, database in enumerate(targets):
                     check(force=True)
                     stats["now"] = database.database_name
-                    _publish(run_id, stats)                    # the page: this one now, the next ones
+                    steps.begin("read the database", database.database_name)   # the page: this one now
                     source = source_for(database)
                     db.session.commit()
                     t1 = time.time()
                     share = t1 + max(0.0, deadline - t1) / (len(targets) - i)   # a fair share of the time left
                     try:
                         if database.backend == "promagg":
-                            res = learn_metrics(run, source, database, share)
+                            res = learn_metrics(run, source, database, share, progress=steps.update)
                         else:
-                            res = learn_indices(run, source, database, share)
+                            res = learn_indices(run, source, database, share, progress=steps.update)
                     except Exception as ex:  # pylint: disable=broad-except
                         db.session.rollback()
                         log.exception("supagent learn: database %s", database.database_name)
@@ -256,24 +349,46 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                     source.stats = res
                     source.last_learned_at = dt.datetime.utcnow()
                     db.session.commit()
+                    res["changes"] = changes_by_type(run_id, source.id)
                     stats["databases"][database.database_name] = res
                     if not res.get("complete", True) or res.get("error") or res.get("errors"):
                         status = "partial"
-                    index_now()
+                    steps.end(**step_counts(res))
+                    steps.begin("update the search", database.database_name)
+                    steps.end(**index_now())
                 stats["now"] = FINISHING
-                _publish(run_id, stats)
+                if describer is not None:
+                    steps.begin("wait for the descriptions in progress")
                 during = descriptions_so_far()                  # every database read: the thread ends
+                if describer is not None:
+                    steps.end()
+                    steps.items.append({"step": "AI descriptions while reading", "at": dt.datetime.utcfromtimestamp(
+                        describer.started).isoformat(timespec="seconds"), "seconds": round(
+                        time.time() - describer.started, 1), **{k: during.get(k) for k in (
+                            "written", "copied", "requests", "tokens", "error", "stopped") if during.get(k)}})
+                    steps.items.sort(key=lambda x: x.get("at") or "")   # it ran next to the reading
+                    steps.describer = None
+                    stats.pop("during", None)
                 check(force=True)
+                steps.begin("relations")
                 stats["relations"] = learn_relations()          # between all the databases: at the end
+                steps.end(**stats["relations"])
+                steps.begin("catalog")
                 stats["catalog"] = apply_catalog()
+                steps.end(**(stats["catalog"] if isinstance(stats["catalog"], dict) else {}))
+                steps.begin("categories")
                 stats["categories"] = infer_categories()
+                steps.end(categories=stats["categories"])
                 if describe:
                     llm_out = {"written": during.get("written", 0), "requests": during.get("requests", 0)}
                     by_source = dict(during.get("by_source") or {})
                     if during.get("error"):
                         llm_out["error"] = during["error"]
                     if time.time() < llm_deadline and not during.get("still_running") and not during.get("error"):
+                        steps.begin("AI descriptions (what is still missing)")
                         more = enrich(run, llm_deadline)        # what is still missing, with the time left
+                        steps.end(**{k: more[k] for k in ("written", "copied", "requests", "tokens", "left",
+                                                          "stopped", "error") if more.get(k)})
                         llm_out["written"] += more.get("written", 0)
                         llm_out["requests"] += more.get("requests", 0)
                         llm_out.update({k: more[k] for k in ("left", "stopped", "error") if k in more})
@@ -294,17 +409,24 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                 from supagent.knowledge.index import index_knowledge
 
                 check(force=True)
+                steps.begin("agent catalog")
                 stats["agent_catalog"] = agent_catalog(llm_docs=llm)   # entries the agent is certain of
+                steps.end(**_flat(stats["agent_catalog"]))
                 if llm:
                     from supagent.knowledge.generic import tidy_learned
 
+                    steps.begin("generic questions of the learned answers")
                     try:
                         stats["generic_questions"] = tidy_learned(limit=50, deadline=llm_deadline)   # older ones
                     except Exception as ex:  # pylint: disable=broad-except
                         db.session.rollback()
                         stats["generic_questions"] = {"error": str(ex)[:300]}
+                    steps.end(**_flat(stats["generic_questions"]))
                 check(force=True)
+                steps.begin("search index and embeddings")
                 stats["index"] = index_knowledge()
+                steps.end(**_flat(stats["index"]))
+                steps.begin("check of \"where the data is\"")
                 try:                                  # does "Where the data is" find the Helpful answers' data?
                     from supagent.knowledge.quality import evaluate_resolver
 
@@ -312,14 +434,17 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                 except Exception as ex:  # pylint: disable=broad-except
                     db.session.rollback()
                     stats["resolver"] = {"error": str(ex)[:300]}
+                steps.end(**_flat(stats["resolver"]))
     except LearningStopped:
         db.session.rollback()
         status, error = "stopped", "stopped by an admin"
+        steps.interrupted("stopped by an admin")   # what the step in progress did, kept
         index_now()                               # what was learned before the stop is searchable
     except Exception as ex:  # pylint: disable=broad-except
         db.session.rollback()
         log.exception("supagent learn: run %s failed", run_id)
         status, error = "error", "".join(traceback.format_exception_only(type(ex), ex))[-2000:]
+        steps.interrupted(error)
     finally:
         if describer is not None and describer.is_alive():
             describer.finish(timeout=5)           # a stop or a failure: the thread ends after its LLM call
@@ -327,6 +452,7 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
         stats["llm"] = {"written": describer.out["written"], "requests": describer.out["requests"]}
     stats["seconds"] = round(time.time() - t0, 1)
     stats.pop("now", None)
+    stats.pop("during", None)
     run = db.session.get(Run, run_id)
     run.status = status
     run.error = error

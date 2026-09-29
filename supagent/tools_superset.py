@@ -178,10 +178,15 @@ def get_dataset_info(request: DatasetInfoRequest) -> dict:
         ds = db.session.get(SqlaTable, int(request.identifier))
         if ds is None or not security_manager.can_access_datasource(ds) or not agent_databases([ds.database]):
             return {"error": f"dataset {request.identifier} not found or not allowed"}
+        from supagent.knowledge.excluded import of_table
+
+        banned = {} if ds.sql else {x["name"]: x["why"] for x in of_table(ds.database_id, ds.table_name)}
         return {"id": ds.id, "table_name": ds.table_name, "database_id": ds.database_id,
                 "database": ds.database.database_name, "main_dttm_col": ds.main_dttm_col,
                 "columns": [{"column_name": c.column_name, "type": c.type, "is_dttm": bool(c.is_dttm),
-                             "description": c.description or ""} for c in ds.columns],
+                             "description": c.description or "",
+                             **({"do_not_use": f"the team: {banned[c.column_name]}"} if c.column_name in banned else {})}
+                            for c in ds.columns],
                 "metrics": [{"metric_name": m.metric_name, "expression": m.expression,
                              "description": m.description or ""} for m in ds.metrics]}
 

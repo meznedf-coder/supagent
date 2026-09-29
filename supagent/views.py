@@ -988,11 +988,10 @@ class AdminView(BaseView):
         counts = dict(db.session.query(Change.run_id, func.count(Change.id))
                       .filter(Change.run_id.in_([r.id for r in rows] or [-1])).group_by(Change.run_id).all())
         progress = {}
-        for r in rows:                                   # a run in progress: what it did so far
+        for r in rows:                                   # a run in progress: what it found so far
             if r.status in ("running", "stopping") and r.started_at is not None:
-                since = db.session.query(KObject).filter(KObject.updated_at >= r.started_at)
-                progress[r.id] = {"objects": since.count(),
-                                  "ai_descriptions": since.filter(KObject.description_source == "llm").count()}
+                progress[r.id] = {"new_objects": db.session.query(KObject)
+                                  .filter(KObject.first_seen >= r.started_at).count()}
         return _json({"runs": [{"id": r.id, "reason": r.reason, "status": r.status, "started_at": r.started_at,
                                 "finished_at": r.finished_at, "stats": r.stats or {}, "error": r.error,
                                 "changes": counts.get(r.id, 0), "progress": progress.get(r.id)} for r in rows]})

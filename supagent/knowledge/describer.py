@@ -27,11 +27,12 @@ class Describer(threading.Thread):
         super().__init__(name=f"supagent-describe-{run_id}", daemon=True)
         self.app, self.run_id, self.deadline, self.llm = app, run_id, deadline, llm
         self.done = threading.Event()               # the learner read every database
-        self.out: dict[str, Any] = {"written": 0, "requests": 0, "by_source": {}}
+        self.out: dict[str, Any] = {"written": 0, "requests": 0, "tokens": 0, "copied": 0, "by_source": {}}
+        self.started = time.time()
 
     def _add(self, res: dict[str, Any]) -> None:
-        self.out["written"] += res.get("written", 0)
-        self.out["requests"] += res.get("requests", 0)
+        for key in ("written", "requests", "tokens", "copied"):
+            self.out[key] += int(res.get(key) or 0)
         for sid, n in (res.get("by_source") or {}).items():
             self.out["by_source"][sid] = self.out["by_source"].get(sid, 0) + n
 

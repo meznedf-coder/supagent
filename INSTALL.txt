@@ -1,8 +1,8 @@
-supagent 0.4.7 - the AI agent inside Apache Superset
+supagent 0.4.8 - the AI agent inside Apache Superset
 =====================================================
 
 What is in this folder
-  supagent-0.4.7-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
+  supagent-0.4.8-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
@@ -10,7 +10,7 @@ What is in this folder
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.4.7-py3-none-any.whl
+   $PY -m pip install supagent-0.4.8-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
    Superset 6.0 (no pydantic there): pip installs pydantic; offline, unzip the pydantic
    wheelhouse next to the wheel and add:  --no-index --find-links ./wheelhouse-pydantic

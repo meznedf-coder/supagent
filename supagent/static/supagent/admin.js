@@ -137,6 +137,51 @@
 
   function loadSettings() { return S.admin("GET", "settings").then(function (d) { renderSettings(d.settings || []); }); }
 
+  var STEP_WORDS = { listed: "listed", "new": "new", due: "due", profiled: "profiled", not_due: "not due", metrics: "metrics",
+    indices: "indices", labels: "labels", fields: "fields", families: "families", requests: "requests", errors: "errors",
+    history: "history done", history_pending: "history left", gone: "gone", written: "written by the LLM",
+    copied: "copied from the same name", tokens: "LLM tokens", left: "left", same_values: "relations",
+    categories: "categories", added: "added", changed: "changed", removed: "removed", unchanged: "unchanged",
+    "sync.added": "search pieces added", "sync.changed": "search pieces changed", "sync.removed": "search pieces removed",
+    "sync.unchanged": "search pieces unchanged", "embed.embedded": "embedded", "embed.left": "left to embed",
+    answers: "Helpful answers checked", hit_at_1: "share found first", hit_at_3: "share found in the first 3",
+    mrr: "mean reciprocal rank", curated: "catalog descriptions", relations: "catalog relations",
+    "documents.documents_read": "documents read", "documents.refused": "definitions refused" };
+  var STEP_SKIP = ["step", "at", "database", "seconds", "phase", "fallbacks", "changes", "interrupted", "last_error",
+    "complete", "error", "stopped"];
+  function stepText(x) {
+    var bits = [];
+    Object.keys(x).forEach(function (k) {
+      var v = x[k];
+      if (STEP_SKIP.indexOf(k) >= 0 || v === null || v === undefined || typeof v === "object" || v === 0) return;
+      bits.push((typeof v === "number" ? S.num(v) : String(v)) + " " + (STEP_WORDS[k] || k.replace(/_/g, " ")));
+    });
+    Object.keys(x.fallbacks || {}).forEach(function (k) {
+      var f = x.fallbacks[k];
+      bits.push(k + ": " + S.num(f.batches) + " batches read one metric at a time (" + f.first_error + ")");
+    });
+    if (x.changes && Object.keys(x.changes).length) bits.push("changes: " + Object.keys(x.changes).map(function (k) {
+      return S.num(x.changes[k]) + " " + k; }).join(", "));
+    ["error", "stopped", "last_error", "interrupted"].forEach(function (k) { if (x[k]) bits.push(k.replace("_", " ") + ": " + x[k]); });
+    return bits.join(", ");
+  }
+  var openSteps = {};                                  // runs whose steps are shown (kept across refreshes)
+  function stepsBox(r) {
+    var steps = (r.stats || {}).steps || [];
+    if (!steps.length) return null;
+    var box = el("details", { class: "steps", open: openSteps[r.id] ? "open" : null,
+      ontoggle: function () { openSteps[r.id] = box.open; } }, [el("summary", { text: "steps (" + steps.length + ")" })]);
+    var list = el("ol", {});
+    steps.forEach(function (x) {
+      var when = x.at ? new Date(x.at + "Z").toLocaleTimeString() : "";
+      var took = x.seconds !== undefined ? S.num(Math.round(x.seconds)) + " s" : "running" + (x.phase ? " (" + x.phase + ")" : "");
+      list.appendChild(el("li", { text: [when, x.step + (x.database ? ": " + x.database : ""), took, stepText(x)]
+        .filter(Boolean).join(" · ") }));
+    });
+    box.appendChild(list);
+    return box;
+  }
+
   function runs() {
     return S.admin("GET", "runs").then(function (d) {
       var tb = $("runs").querySelector("tbody");
@@ -160,10 +205,14 @@
         });
         if (st.now && (r.status === "running" || r.status === "stopping")) {       // the run in progress
           var next = (st.plan || []).filter(function (n) { return n !== st.now && !(st.databases || {})[n]; });
-          parts.unshift("now: " + st.now + (next.length ? "; next: " + next.join(", ") : ""));
+          var cur = (st.steps || []).filter(function (x) { return x.seconds === undefined; })[0];
+          var doing = cur ? " (" + (cur.phase || cur.step) + (stepText(cur) ? ": " + stepText(cur) : "") + ")" : "";
+          parts.unshift("now: " + st.now + doing + (next.length ? "; next: " + next.join(", ") : ""));
         }
-        if (r.progress) parts.push("so far: " + S.num(r.progress.objects) + " objects learned or updated, " +
-          S.num(r.progress.ai_descriptions) + " AI descriptions");
+        if (r.progress) parts.push("so far: " + S.num(r.progress.new_objects) + " new objects");
+        if (st.during) parts.push("AI descriptions while reading: " + S.num(st.during.written) + " written by the LLM in " +
+          S.num(st.during.requests) + " calls (" + S.num(st.during.tokens) + " tokens), " + S.num(st.during.copied) +
+          " copied from the same name");
         Object.keys(st.skipped || {}).forEach(function (name) { parts.push(name + ": not learned: " + st.skipped[name]); });
         if (st.relations) parts.push("relations: " + (st.relations.same_values || 0) + " measured");
         if (st.llm) parts.push("AI descriptions: " + (st.llm.written || 0) + (st.llm.left ? ", " + st.llm.left +
@@ -172,7 +221,7 @@
         if (r.status === "running" || r.status === "stopping") running = true;
         tb.appendChild(el("tr", {}, [el("td", { text: "#" + r.id }), el("td", { text: r.reason }), el("td", { text: S.when(r.started_at) }),
           el("td", { text: secs }), el("td", { html: '<span class="badge ' + (r.status === "done" ? "ok" : r.status === "error" ? "bad" : "") + '">' + S.esc(r.status === "stopping" ? "stopping…" : r.status) + "</span>" }),
-          el("td", { class: "num", text: S.num(r.changes) }), el("td", { text: parts.join(" · ") })]));
+          el("td", { class: "num", text: S.num(r.changes) }), el("td", {}, [el("span", { text: parts.join(" · ") }), stepsBox(r)])]));
       });
       if (!(d.runs || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "muted", text: "No learning run yet." })]));
       $("learn-stop").hidden = !running;                   // Stop while a run is running

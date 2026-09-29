@@ -137,7 +137,7 @@ def profile_index(conn: Any, index: str, meta: Any) -> tuple[dict[str, Any], dic
     return info, fstats
 
 
-def learn_indices(run: Run, source: Source, database: Any, deadline: float) -> dict[str, Any]:
+def learn_indices(run: Run, source: Source, database: Any, deadline: float, progress: Any = None) -> dict[str, Any]:
     from supagent.tools import _connection
 
     include, exclude = settings.get("learn.indices"), settings.get("learn.indices_exclude")
@@ -148,6 +148,8 @@ def learn_indices(run: Run, source: Source, database: Any, deadline: float) -> d
     conn = _connection(database, extract=False)
     conn.transport = Proxy(conn.transport, throttle, ("search", "count", "get_mapping", "list_tables"))
     out: dict[str, Any] = {"indices": 0, "profiled": 0, "fields": 0, "not_due": 0, "complete": True}
+    if progress is not None:
+        progress(phase="indices and fields")
     today = dt.date.today()
     families: dict[str, list[str]] = {}
     try:

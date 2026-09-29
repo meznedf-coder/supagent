@@ -157,6 +157,38 @@ def _chunks(kind: str, source_id: int | None = None) -> Any:
         after = ids[-1]
 
 
+def inherit_label_descriptions(source_id: int | None = None) -> int:
+    """Labels found since a name was described (on metrics profiled later) take the description of
+    the same name in the same database, without an LLM call: a person's first, else the LLM's,
+    with its source and whether it was verified. How many labels got one."""
+    pending = {(s, n) for s, n in _undescribed("label", source_id)
+               .with_entities(KObject.source_id, KObject.name).distinct()}
+    if not pending:
+        return 0
+    rank = {"curated": 0, "backend": 1, "inferred": 2, "llm": 3}     # a person's (or the catalog's) first
+    best: dict[tuple[int, str], tuple[int, str, str, bool]] = {}
+    names = sorted({n for _s, n in pending})
+    for i in range(0, len(names), 500):
+        rows = (db.session.query(KObject.source_id, KObject.name, KObject.description, KObject.description_source,
+                                 KObject.verified)
+                .filter(KObject.kind == "label", KObject.name.in_(names[i:i + 500]),
+                        KObject.description.isnot(None), KObject.description != ""))
+        for sid, name, text, how, verified in rows:
+            key = (sid, name)
+            if key not in pending:
+                continue
+            r = rank.get(how or "", 3)
+            if key not in best or r < best[key][0]:
+                best[key] = (r, text, how or "llm", bool(verified))
+    n = 0
+    for (sid, name), (_r, text, how, verified) in best.items():
+        n += (_undescribed("label").filter(KObject.source_id == sid, KObject.name == name)
+              .update({"description": text, "description_source": how, "verified": verified},
+                      synchronize_session=False))
+    db.session.commit()
+    return int(n)
+
+
 def _label_context(obj: KObject) -> dict[str, Any]:
     """A label for every metric that has it: its values and a few of its metrics."""
     siblings = (db.session.query(KObject.parent).filter(KObject.source_id == obj.source_id, KObject.kind == "label",
@@ -194,7 +226,8 @@ def enrich(run: Run | None, deadline: float, llm: Any = None, source_id: int | N
     from supagent.knowledge.stopping import check
     from supagent.llm import LLM
 
-    out: dict[str, Any] = {"written": 0, "requests": 0, "by_source": {}}
+    out: dict[str, Any] = {"written": 0, "requests": 0, "tokens": 0, "copied": 0, "by_source": {}}
+    out["copied"] = inherit_label_descriptions(source_id)     # names already described: no LLM call
     try:
         llm = llm or LLM()
     except Exception as ex:  # pylint: disable=broad-except
@@ -224,6 +257,8 @@ def enrich(run: Run | None, deadline: float, llm: Any = None, source_id: int | N
                     out["left"] = left_to_describe(source_id)
                     return out
                 out["requests"] += 1
+                usage = getattr(llm, "last_usage", None) or {}
+                out["tokens"] += int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
                 batch = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(list(batch)))}
                 for entry in _parse(msg.get("content") or ""):
                     try:

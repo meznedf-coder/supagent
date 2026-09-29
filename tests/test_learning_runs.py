@@ -77,7 +77,7 @@ def _fake_steps(monkeypatch, calls: list, stop_at: str | None = None):
         with lock:
             calls.append(item)
 
-    def learn(run, source, database, deadline):
+    def learn(run, source, database, deadline, progress=None):
         note("learn", database.database_name)
         if database.database_name == stop_at:      # an admin presses Stop while this database is learned
             from supagent.knowledge.stopping import check, request_stop
@@ -162,7 +162,7 @@ def test_descriptions_are_written_while_a_database_is_still_being_read(four, mon
             events.append(("llm", threading.current_thread().name, _time.time(), [i["name"] for i in items]))
             return {"content": json.dumps([{"id": i["id"], "description": f"About {i['name']}"} for i in items])}
 
-    def slow_metrics(run, source, database, deadline):                   # 3 batches, a pause after each
+    def slow_metrics(run, source, database, deadline, progress=None):                   # 3 batches, a pause after each
         for b in range(3):
             for k in range(4):
                 upsert(run, source, "metric", "", f"slow_{b}_{k}", {"metric_type": "gauge", "stats": {"series": 1}})
@@ -175,7 +175,7 @@ def test_descriptions_are_written_while_a_database_is_still_being_read(four, mon
     monkeypatch.setattr(L, "LLM", FakeLLM)
     monkeypatch.setattr(describer, "IDLE_S", 0.05)
     monkeypatch.setattr(learn_metrics, "learn_metrics", slow_metrics)
-    monkeypatch.setattr(learn_indices, "learn_indices", lambda run, source, database, deadline: {"complete": True})
+    monkeypatch.setattr(learn_indices, "learn_indices", lambda run, source, database, deadline, progress=None: {"complete": True})
     monkeypatch.setattr(relations, "learn_relations", lambda: events.append(("relations", _time.time())) or {})
     monkeypatch.setattr(autocatalog, "run", lambda llm_docs=True: {})
     monkeypatch.setattr(generic, "tidy_learned", lambda limit=50, deadline=None: {})
@@ -325,7 +325,7 @@ def test_a_run_in_progress_shows_what_it_did_so_far(four, app):
         login(c, "admin")
         runs = c.get("/supagent/admin/api/runs").get_json()["runs"]
     mine = next(r for r in runs if r["id"] == run.id)
-    assert mine["progress"]["objects"] >= 3 and mine["progress"]["ai_descriptions"] >= 1
+    assert mine["progress"]["new_objects"] >= 3              # found by this run (not the ones only seen again)
     run.status = "done"
     db.session.commit()
 
@@ -354,7 +354,7 @@ def test_a_new_database_comes_first_and_each_gets_a_fair_share_of_the_time(four,
     _learned_before({"jobs", "metrics"})
     shares: dict[str, float] = {}
 
-    def learn(run, source, database, deadline):
+    def learn(run, source, database, deadline, progress=None):
         shares[database.database_name] = deadline - _time.time()
         return {"complete": True}
 
@@ -385,7 +385,7 @@ def test_the_page_shows_the_database_being_learned_and_the_next_ones(four, monke
             value = conn.execute(sa.text("SELECT stats FROM supagent_run WHERE id = :i"), {"i": run_id}).scalar()
         return json.loads(value) if isinstance(value, str) else value
 
-    def learn(run, source, database, deadline):
+    def learn(run, source, database, deadline, progress=None):
         seen.append(read_stats(run.id))
         return {"complete": True, "fields": 3}
 
@@ -475,7 +475,7 @@ def test_stop_ends_the_wait_for_the_last_descriptions(four, app, monkeypatch):
 
     left = [len(_in_learning_order())]
 
-    def learn(run, source, database, deadline):
+    def learn(run, source, database, deadline, progress=None):
         left[0] -= 1
         if not left[0]:                                           # the last database: Stop in a moment
             def press():
