@@ -5,7 +5,7 @@ It adds:
 
 * **a chat** (the **Chat** tab of Superset's top bar opens it as a panel on the right of the page:
   the dashboard, chart, dataset or SQL Lab page stays beside it, and a link in an answer opens
-  there while the chat stays open; Ctrl+click, or the panel's ⤢ button, opens it as a full page).
+  there while the chat stays open; Ctrl+click on the tab, or the panel's ⤢ button, opens the full page).
   A user asks a question in plain words; the agent
   works with **that user's Superset permissions**, runs the queries, and answers with the key
   figures. Every query result is shown under the answer as a **table and a chart** (bars for
