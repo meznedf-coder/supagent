@@ -30,6 +30,9 @@ class Throttle:
         self._lock = threading.Lock()
 
     def wait(self) -> None:
+        from supagent.knowledge.stopping import check
+
+        check()                                   # an admin stopped the run: not one more request
         with self._lock:
             now = time.monotonic()
             if now < self._next:

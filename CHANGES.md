@@ -1,5 +1,22 @@
 # Changes
 
+## 0.4.3 (2026-09-29)
+
+* **Every database is learned, and a run says which ones it left out and why**: each run lists
+  the osagg and promagg databases it did not learn, with the reason (not in `learn.databases`,
+  or the learning user `learn.user` may not read it), and the names of `learn.databases` that
+  match no database; so does `superset supagent learn --plan`. (A run learns every osagg and
+  promagg database the learning user may read, unless `learn.databases` lists some.)
+* **Descriptions during the learning, database by database**: each database is learned then
+  described by the LLM (after the catalog), with a fair share of the time left, before the next
+  database; the relations between them all are measured at the end, and the time left goes to
+  the descriptions a database's share did not reach. The runs list shows each database's
+  descriptions.
+* **Stop learning**: a button on the settings page (and `superset supagent learn --stop`) stops the
+  running run at its next step; it keeps what it learned and ends as "stopped", and *Learn now*
+  starts a new one as soon as it stopped (a run whose process died does not block the next one
+  for more than a minute and a half).
+
 ## 0.4.2 (2026-09-29)
 
 * The chat panel's ⤢ button opens the full chat page again (in 0.4.1 it closed the panel: it was

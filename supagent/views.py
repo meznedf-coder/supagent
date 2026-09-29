@@ -762,7 +762,7 @@ class AdminView(BaseView):
     default_view = "index"
     class_permission_name = ADMIN_VIEW
     method_permission_name = {"index": "read", "get_settings": "read", "put_settings": "write", "test_llm": "write",
-                              "learn": "write", "runs": "read", "put_catalog": "write", "status": "read",
+                              "learn": "write", "stop_learning": "write", "runs": "read", "put_catalog": "write", "status": "read",
                               "entries": "read", "create_entry": "write", "update_entry": "write",
                               "delete_entry": "write", "entry_history": "read", "restore_entry": "write",
                               "export_catalog": "read", "team_memory": "read", "set_memory": "write",
@@ -957,9 +957,22 @@ class AdminView(BaseView):
 
         busy = running_run()
         if busy is not None:
-            return _json({"error": f"learning run {busy.id} is still running"}, 409)
+            what = "is stopping: try again in a moment" if busy.status == "stopping" else "is still running"
+            return _json({"error": f"learning run {busy.id} {what}", "running": busy.id}, 409)
         databases = _body().get("databases") or None
         return _json({"started": dispatch_learning("manual", databases)})
+
+    @expose("/api/learn/stop", methods=("POST",))
+    @has_access_api
+    def stop_learning(self) -> Response:
+        """Stop the running learning run: it ends at its next step (a few seconds, or the LLM
+        request in progress), keeping what it learned; then a new run can start."""
+        from supagent.knowledge.stopping import request_stop
+
+        run_id = request_stop()
+        if run_id is None:
+            return _json({"error": "no learning run is running"}, 409)
+        return _json({"stopping": run_id})
 
     @expose("/api/runs", methods=("GET",))
     @has_access_api

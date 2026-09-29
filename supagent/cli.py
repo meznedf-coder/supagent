@@ -171,16 +171,27 @@ def test_llm(profile: bool) -> None:
 @click.option("--no-llm", is_flag=True, help="No LLM descriptions this time")
 @click.option("--minutes", type=int, default=None, help="Time limit (default: learn.max_minutes)")
 @click.option("--plan", is_flag=True, help="Only estimate today's work (objects due, requests, minutes); learn nothing")
+@click.option("--stop", is_flag=True, help="Stop the running learning run (it keeps what it learned)")
 @with_appcontext
-def learn(databases: tuple[str, ...], no_llm: bool, minutes: int | None, plan: bool) -> None:
+def learn(databases: tuple[str, ...], no_llm: bool, minutes: int | None, plan: bool, stop: bool) -> None:
     from supagent.knowledge.learner import learning_username, plan_learning, run_learning
 
+    if stop:
+        from supagent.knowledge.stopping import request_stop
+
+        run_id = request_stop()
+        click.echo(f"stopping learning run {run_id}: it ends at its next step" if run_id else
+                   "no learning run is running")
+        return
     if plan:
         from supagent.security import acting_as
 
         with acting_as(learning_username()):
             rows = plan_learning(list(databases) or None)
         for r in rows:
+            if r.get("skipped"):
+                click.echo(f"{r['database']}: not learned: {r['skipped']}")
+                continue
             if r.get("error"):
                 click.echo(f"{r['database']}: {r['error']}")
                 continue

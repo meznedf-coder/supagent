@@ -1,6 +1,9 @@
 """One learning run: every osagg and promagg database (or the ones of learn.databases) is read
-as the learning user, what changed since the last run is recorded, the relations are measured
-again, the catalog is applied, and the LLM describes what nobody described.
+as the learning user, one after the other: what changed since the last run is recorded, the
+catalog is applied and the LLM describes what nobody described in that database (with a fair share
+of the time left, so that the next databases get theirs); then the relations between them all are
+measured. The databases left out, and why, are in the run's statistics. An admin can stop a run
+(the Stop button): it ends as "stopped", keeping what it learned.
 
 Runs every day at learn.hour (Celery beat, task supagent.learn_tick), from the admin page
 ("Learn now") or with `superset supagent learn`. A run stops after learn.max_minutes; the
@@ -38,19 +41,34 @@ def learning_username() -> str:
     return users[0].username
 
 
-def databases_to_learn(only: list[str] | None = None) -> list[Any]:
+def databases_to_learn(only: list[str] | None = None, why: dict[str, str] | None = None) -> list[Any]:
+    """The osagg and promagg databases to learn: all of them, or those of learn.databases (or of
+    `only`), that the current (learning) user may read. `why` receives the ones left out, with
+    the reason, and the names of learn.databases that match no such database."""
+    from flask import g
     from superset.extensions import security_manager
     from superset.models.core import Database
 
     wanted = [str(x) for x in (only or settings.get("learn.databases") or [])]
-    out = []
+    source = "the databases asked for" if only else "learn.databases"
+    out, matched = [], set()
     for d in db.session.query(Database).order_by(Database.id):
         if d.backend not in BACKENDS:
             continue
         if wanted and str(d.id) not in wanted and d.database_name not in wanted:
+            if why is not None:
+                why[d.database_name] = f"not in {source} ({', '.join(wanted)})"
             continue
+        matched |= {str(d.id), d.database_name}
         if security_manager.can_access_database(d):
             out.append(d)
+        elif why is not None:
+            user = getattr(getattr(g, "user", None), "username", None) or "the learning user"
+            why[d.database_name] = f"{user} (learn.user) may not read it: give that user access to it"
+    if why is not None:
+        for w in wanted:
+            if w not in matched:
+                why[w] = f"named in {source}, but no osagg or promagg database has this name or id"
     return out
 
 
@@ -58,17 +76,33 @@ SCHEDULED_TRIES = 3          # a scheduled run stopped by a restart or an error 
 
 
 def running_run() -> Run | None:
-    """A run started less than twice learn.max_minutes ago and not finished. An older one never
-    finished (its process was stopped: a restart, a deployment) and is marked interrupted."""
-    limit = dt.datetime.utcnow() - dt.timedelta(minutes=2 * int(settings.get("learn.max_minutes")) + 5)
-    stale = db.session.query(Run).filter(Run.kind == "learn", Run.status == "running", Run.started_at <= limit).all()
-    for r in stale:
-        r.status, r.finished_at = "interrupted", dt.datetime.utcnow()
+    """A run started less than twice learn.max_minutes ago and not finished, or asked to stop less
+    than STOP_GRACE seconds ago (it ends at its next step). An older one never finished (its
+    process was stopped: a restart, a deployment) and is marked interrupted; one asked to stop
+    longer ago is marked stopped."""
+    from supagent.knowledge.stopping import STOP_GRACE, asked_at
+
+    now = dt.datetime.utcnow()
+    limit = now - dt.timedelta(minutes=2 * int(settings.get("learn.max_minutes")) + 5)
+    changed = False
+    for r in db.session.query(Run).filter(Run.kind == "learn", Run.status == "running", Run.started_at <= limit):
+        r.status, r.finished_at = "interrupted", now
         r.error = r.error or "the process stopped before the end of the run (a restart?)"
-    if stale:
+        changed = True
+    stopping = None
+    for r in db.session.query(Run).filter(Run.kind == "learn", Run.status == "stopping").order_by(Run.id.desc()):
+        asked = asked_at(r)
+        if asked is not None and (now - asked).total_seconds() < STOP_GRACE:
+            stopping = stopping or r
+            continue
+        r.status, r.finished_at = "stopped", r.finished_at or now
+        r.error = "stopped by an admin"
+        changed = True
+    if changed:
         db.session.commit()
-    return (db.session.query(Run).filter(Run.kind == "learn", Run.status == "running", Run.started_at > limit)
-            .order_by(Run.id.desc()).first())
+    running = (db.session.query(Run).filter(Run.kind == "learn", Run.status == "running", Run.started_at > limit)
+               .order_by(Run.id.desc()).first())
+    return running or stopping
 
 
 def run_learning(reason: str = "manual", databases: list[str] | None = None, llm: bool = True,
@@ -90,80 +124,124 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
     from supagent.knowledge.store import source_for
     from supagent.security import acting_as
 
+    from supagent.knowledge.index import sync
+    from supagent.knowledge.stopping import LearningStopped, check, watching
+
     busy = running_run()
     if busy is not None:
-        return {"run": busy.id, "status": "skipped", "reason": f"run {busy.id} is still running"}
+        return {"run": busy.id, "status": "skipped", "reason": f"run {busy.id} is still {busy.status}"}
     run = Run(kind="learn", reason=reason, status="running", stats={})
     db.session.add(run)
     db.session.commit()
     run_id = run.id
     minutes = int(max_minutes or settings.get("learn.max_minutes"))
     deadline = time.time() + 60 * minutes
+    llm_deadline = deadline + 600                 # descriptions may take ten more minutes
+    describe = llm and settings.get("learn.llm_descriptions")
     stats: dict[str, Any] = {"databases": {}}
     status, error = "done", None
     t0 = time.time()
+
+    def index_now() -> None:                      # the search finds what was learned now, not at the end
+        try:
+            sync(("object:",))
+        except Exception:  # pylint: disable=broad-except
+            db.session.rollback()
+
     try:
-        username = learning_username()
-        stats["user"] = username
-        with acting_as(username):
-            run = db.session.get(Run, run_id)
-            targets = databases_to_learn(databases)
-            if not targets:
-                stats["note"] = "no osagg or promagg database to learn (or none this user may read)"
-            for database in targets:
-                source = source_for(database)
-                db.session.commit()
-                t1 = time.time()
-                try:
-                    if database.backend == "promagg":
-                        res = learn_metrics(run, source, database, deadline)
+        with watching(run_id):
+            username = learning_username()
+            stats["user"] = username
+            with acting_as(username):
+                run = db.session.get(Run, run_id)
+                skipped: dict[str, str] = {}
+                targets = databases_to_learn(databases, why=skipped)
+                if skipped:
+                    stats["skipped"] = skipped
+                if not targets:
+                    stats["note"] = "no osagg or promagg database to learn (or none this user may read)"
+                for i, database in enumerate(targets):
+                    check(force=True)
+                    source = source_for(database)
+                    db.session.commit()
+                    t1 = time.time()
+                    try:
+                        if database.backend == "promagg":
+                            res = learn_metrics(run, source, database, deadline)
+                        else:
+                            res = learn_indices(run, source, database, deadline)
+                    except Exception as ex:  # pylint: disable=broad-except
+                        db.session.rollback()
+                        log.exception("supagent learn: database %s", database.database_name)
+                        res = {"error": f"{type(ex).__name__}: {str(ex)[:500]}", "complete": False}
+                    res["seconds"] = round(time.time() - t1, 1)
+                    source = db.session.merge(source)
+                    source.stats = res
+                    source.last_learned_at = dt.datetime.utcnow()
+                    db.session.commit()
+                    stats["databases"][database.database_name] = res
+                    if not res.get("complete", True) or res.get("error") or res.get("errors"):
+                        status = "partial"
+                    index_now()
+                    if describe:                  # this database's descriptions now, with a fair share of the time
+                        check(force=True)
+                        apply_catalog()           # people's texts first: the LLM never describes what they did
+                        share = max(0.0, llm_deadline - time.time()) / (len(targets) - i)
+                        res["llm"] = enrich(run, min(llm_deadline, time.time() + share), source_id=source.id)
+                        source = db.session.merge(source)
+                        source.stats = dict(res)
+                        db.session.commit()
+                        if res["llm"].get("error"):
+                            status = "partial"
+                        index_now()
+                check(force=True)
+                stats["relations"] = learn_relations()          # between all the databases: at the end
+                stats["catalog"] = apply_catalog()
+                stats["categories"] = infer_categories()
+                if describe:
+                    parts = [x.get("llm") or {} for x in stats["databases"].values()]
+                    llm_out = {"written": sum(p.get("written", 0) for p in parts),
+                               "requests": sum(p.get("requests", 0) for p in parts)}
+                    if time.time() < llm_deadline:              # time left: what a database's share left
+                        more = enrich(run, llm_deadline)
+                        llm_out["written"] += more.get("written", 0)
+                        llm_out["requests"] += more.get("requests", 0)
+                        llm_out.update({k: more[k] for k in ("left", "stopped", "error") if k in more})
                     else:
-                        res = learn_indices(run, source, database, deadline)
+                        from supagent.knowledge.enrich import left_to_describe
+
+                        llm_out["left"] = left_to_describe()
+                    if any(p.get("error") for p in parts) and "error" not in llm_out:
+                        llm_out["error"] = next(p["error"] for p in parts if p.get("error"))
+                    stats["llm"] = llm_out
+                    if llm_out.get("error"):
+                        status = "partial"
+                from supagent.knowledge.autocatalog import run as agent_catalog
+                from supagent.knowledge.index import index_knowledge
+
+                check(force=True)
+                stats["agent_catalog"] = agent_catalog(llm_docs=llm)   # entries the agent is certain of
+                if llm:
+                    from supagent.knowledge.generic import tidy_learned
+
+                    try:
+                        stats["generic_questions"] = tidy_learned(limit=50, deadline=llm_deadline)   # older ones
+                    except Exception as ex:  # pylint: disable=broad-except
+                        db.session.rollback()
+                        stats["generic_questions"] = {"error": str(ex)[:300]}
+                check(force=True)
+                stats["index"] = index_knowledge()
+                try:                                  # does "Where the data is" find the Helpful answers' data?
+                    from supagent.knowledge.quality import evaluate_resolver
+
+                    stats["resolver"] = evaluate_resolver(limit=100, seconds=60)
                 except Exception as ex:  # pylint: disable=broad-except
                     db.session.rollback()
-                    log.exception("supagent learn: database %s", database.database_name)
-                    res = {"error": f"{type(ex).__name__}: {str(ex)[:500]}", "complete": False}
-                res["seconds"] = round(time.time() - t1, 1)
-                source = db.session.merge(source)
-                source.stats = res
-                source.last_learned_at = dt.datetime.utcnow()
-                db.session.commit()
-                stats["databases"][database.database_name] = res
-                if not res.get("complete", True) or res.get("error") or res.get("errors"):
-                    status = "partial"
-                try:                                  # the search finds this database now, not at the end of the run
-                    from supagent.knowledge.index import sync
-
-                    sync(("object:",))
-                except Exception:  # pylint: disable=broad-except
-                    db.session.rollback()
-            stats["relations"] = learn_relations()
-            stats["catalog"] = apply_catalog()
-            stats["categories"] = infer_categories()
-            if llm and settings.get("learn.llm_descriptions"):
-                stats["llm"] = enrich(run, deadline + 600)          # descriptions may take ten more minutes
-                if stats["llm"].get("error"):
-                    status = "partial"
-            from supagent.knowledge.autocatalog import run as agent_catalog
-            from supagent.knowledge.index import index_knowledge
-
-            stats["agent_catalog"] = agent_catalog(llm_docs=llm)   # entries the agent is certain of
-            if llm:
-                from supagent.knowledge.generic import tidy_learned
-
-                try:
-                    stats["generic_questions"] = tidy_learned(limit=50, deadline=deadline + 600)   # older ones
-                except Exception as ex:  # pylint: disable=broad-except
-                    db.session.rollback()
-                    stats["generic_questions"] = {"error": str(ex)[:300]}
-            stats["index"] = index_knowledge()
-            try:                                      # does "Where the data is" find the Helpful answers' data?
-                from supagent.knowledge.quality import evaluate_resolver
-
-                stats["resolver"] = evaluate_resolver(limit=100, seconds=60)
-            except Exception as ex:  # pylint: disable=broad-except
-                db.session.rollback()
-                stats["resolver"] = {"error": str(ex)[:300]}
+                    stats["resolver"] = {"error": str(ex)[:300]}
+    except LearningStopped:
+        db.session.rollback()
+        status, error = "stopped", "stopped by an admin"
+        index_now()                               # what was learned before the stop is searchable
     except Exception as ex:  # pylint: disable=broad-except
         db.session.rollback()
         log.exception("supagent learn: run %s failed", run_id)
@@ -216,7 +294,10 @@ def plan_learning(databases: list[str] | None = None) -> list[dict[str, Any]]:
     fields_per_request = max(5, int(settings.get("learn.fields_per_request")))
     today = dt.date.today()
     out = []
-    for database in databases_to_learn(databases):
+    skipped: dict[str, str] = {}
+    targets = databases_to_learn(databases, why=skipped)
+    out += [{"database": name, "skipped": reason} for name, reason in skipped.items()]
+    for database in targets:
         source = source_for(database)
         known = {o.name: o for o in db.session.query(KObject).filter(
             KObject.source_id == source.id, KObject.kind.in_(("metric", "index")))}

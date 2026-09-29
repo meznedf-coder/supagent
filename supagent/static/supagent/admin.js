@@ -151,18 +151,21 @@
           if (x.history_pending) bits.push(S.num(x.history_pending) + " history lookups left for the next runs");
           if (x.skipped_unchanged) bits.push(S.num(x.skipped_unchanged) + " unchanged today");
           if (x.error) bits.push("error: " + x.error);
+          if (x.llm) bits.push(S.num(x.llm.written || 0) + " AI descriptions" + (x.llm.left ? " (" + S.num(x.llm.left) + " left)" : ""));
           parts.push(name + ": " + (bits.join(", ") || "nothing"));
         });
+        Object.keys(st.skipped || {}).forEach(function (name) { parts.push(name + ": not learned: " + st.skipped[name]); });
         if (st.relations) parts.push("relations: " + (st.relations.same_values || 0) + " measured");
         if (st.llm) parts.push("AI descriptions: " + (st.llm.written || 0) + (st.llm.left ? ", " + st.llm.left +
           " left (the next run goes on)" : "") + (st.llm.error ? " (" + st.llm.error + ")" : ""));
-        if (r.error) parts.push(r.error);
-        if (r.status === "running") running = true;
+        if (r.error && !/^stop asked at /.test(r.error)) parts.push(r.error);
+        if (r.status === "running" || r.status === "stopping") running = true;
         tb.appendChild(el("tr", {}, [el("td", { text: "#" + r.id }), el("td", { text: r.reason }), el("td", { text: S.when(r.started_at) }),
-          el("td", { text: secs }), el("td", { html: '<span class="badge ' + (r.status === "done" ? "ok" : r.status === "error" ? "bad" : "") + '">' + S.esc(r.status) + "</span>" }),
+          el("td", { text: secs }), el("td", { html: '<span class="badge ' + (r.status === "done" ? "ok" : r.status === "error" ? "bad" : "") + '">' + S.esc(r.status === "stopping" ? "stopping…" : r.status) + "</span>" }),
           el("td", { class: "num", text: S.num(r.changes) }), el("td", { text: parts.join(" · ") })]));
       });
       if (!(d.runs || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "muted", text: "No learning run yet." })]));
+      $("learn-stop").hidden = !running;                   // Stop while a run is running
       if (running) setTimeout(runs, 5000);
     });
   }
@@ -204,6 +207,16 @@
       res.textContent = r.error || "started (" + r.started + ")";
       res.className = "result " + (r.error ? "bad" : "good");
       setTimeout(runs, 1500);
+    });
+  });
+  $("learn-stop").addEventListener("click", function () {
+    var res = $("learn-result"), btn = $("learn-stop");
+    btn.disabled = true;
+    S.admin("POST", "learn/stop", {}).then(function (r) {
+      btn.disabled = false;
+      res.textContent = r.error || "stopping run #" + r.stopping + ": it keeps what it learned; Learn now starts a new one once it stopped";
+      res.className = "result " + (r.error ? "bad" : "good");
+      setTimeout(runs, 1000);
     });
   });
   // ---------------------------------------------------------------- catalog entries

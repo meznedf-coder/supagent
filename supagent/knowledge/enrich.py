@@ -118,26 +118,24 @@ def _parse(text: str) -> list[dict[str, Any]]:
     return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
 
 
-def _undescribed(kind: str) -> Any:
+def _undescribed(kind: str, source_id: int | None = None) -> Any:
     q = (db.session.query(KObject).filter(KObject.kind == kind, KObject.gone_at.is_(None))
          .filter((KObject.description.is_(None)) | (KObject.description == "")))
+    if source_id is not None:
+        q = q.filter(KObject.source_id == source_id)
     return q.filter(KObject.name.notin_(SKIPPED_LABELS)) if kind == "label" else q
 
 
-def left_to_describe() -> int:
-    """Objects no one described yet (a label name counts once per database)."""
-    from sqlalchemy import distinct, func, tuple_
-
-    n = sum(_undescribed(k).count() for k in ("metric", "index", "family", "field"))
-    try:
-        n += _undescribed("label").with_entities(func.count(distinct(tuple_(KObject.source_id, KObject.name)))).scalar()
-    except Exception:  # pylint: disable=broad-except   (databases without tuple counts)
-        db.session.rollback()
-        n += len({(s, nm) for s, nm in _undescribed("label").with_entities(KObject.source_id, KObject.name)})
+def left_to_describe(source_id: int | None = None) -> int:
+    """Objects no one described yet, of one database or of all (a label name counts once per
+    database)."""
+    n = sum(_undescribed(k, source_id).count() for k in ("metric", "index", "family", "field"))
+    n += len({(s, nm) for s, nm in _undescribed("label", source_id).with_entities(KObject.source_id, KObject.name)
+              .distinct()})
     return int(n or 0)
 
 
-def _chunks(kind: str) -> Any:
+def _chunks(kind: str, source_id: int | None = None) -> Any:
     """Ids of the objects of this kind to describe, CHUNK at a time (read again for each chunk:
     what the run describes leaves the list). A label is described once per database and name:
     "instance" means the same on ten thousand metrics."""
@@ -146,11 +144,11 @@ def _chunks(kind: str) -> Any:
     after = 0
     while True:
         if kind == "label":
-            rows = (_undescribed("label").with_entities(func.min(KObject.id))
+            rows = (_undescribed("label", source_id).with_entities(func.min(KObject.id))
                     .group_by(KObject.source_id, KObject.name).having(func.min(KObject.id) > after)
                     .order_by(func.min(KObject.id)).limit(CHUNK).all())
         else:
-            rows = _undescribed(kind).filter(KObject.id > after).with_entities(KObject.id) \
+            rows = _undescribed(kind, source_id).filter(KObject.id > after).with_entities(KObject.id) \
                 .order_by(KObject.id).limit(CHUNK).all()
         ids = [r[0] for r in rows]
         if not ids:
@@ -186,10 +184,12 @@ def _write(obj: KObject, entry: dict[str, Any]) -> int:
     return 1
 
 
-def enrich(run: Run | None, deadline: float, llm: Any = None) -> dict[str, Any]:
-    """LLM descriptions for what nobody described (metrics and indices first), CHUNK objects at a
-    time, BATCH per request, each batch saved at once, until the time limit: the next run goes on
-    where this one stopped. No limit of objects per run."""
+def enrich(run: Run | None, deadline: float, llm: Any = None, source_id: int | None = None) -> dict[str, Any]:
+    """LLM descriptions for what nobody described (metrics and indices first), of one database
+    (`source_id`) or of all, CHUNK objects at a time, BATCH per request, each batch saved at once,
+    until the time limit: the next run goes on where this one stopped. No limit of objects per
+    run. Stops at once when an admin stops the run."""
+    from supagent.knowledge.stopping import check
     from supagent.llm import LLM
 
     out: dict[str, Any] = {"written": 0, "requests": 0}
@@ -199,11 +199,12 @@ def enrich(run: Run | None, deadline: float, llm: Any = None) -> dict[str, Any]:
         out["error"] = str(ex)[:300]
         return out
     for kind in sorted(KIND_ORDER, key=KIND_ORDER.get):
-        for ids in _chunks(kind):
+        for ids in _chunks(kind, source_id):
             for i in range(0, len(ids), BATCH):
+                check()
                 if time.time() > deadline:
                     out["stopped"] = "time limit: the next run goes on"
-                    out["left"] = left_to_describe()
+                    out["left"] = left_to_describe(source_id)
                     return out
                 batch = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(ids[i:i + BATCH]))}
                 items = [_label_context(o) if o.kind == "label" else _context(o) for o in batch.values()]
@@ -215,7 +216,7 @@ def enrich(run: Run | None, deadline: float, llm: Any = None) -> dict[str, Any]:
                 except Exception as ex:  # pylint: disable=broad-except
                     out["error"] = str(ex)[:300]
                     log.warning("supagent learn: LLM descriptions stopped: %s", ex)
-                    out["left"] = left_to_describe()
+                    out["left"] = left_to_describe(source_id)
                     return out
                 out["requests"] += 1
                 batch = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(list(batch)))}

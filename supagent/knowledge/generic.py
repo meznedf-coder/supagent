@@ -210,6 +210,9 @@ def tidy_learned(llm: Any = None, limit: int = 50, deadline: float | None = None
     out = {"answers": 0, "chats": 0, "merged": 0}
 
     def late() -> bool:
+        from supagent.knowledge.stopping import check
+
+        check()                                    # an admin stopped the learning run
         if deadline is not None and time.time() > deadline:
             out["stopped"] = "time limit"
             return True

@@ -198,7 +198,10 @@ def embed_pending(limit: int | None = None) -> dict[str, Any]:
             .order_by(Chunk.id).limit(limit).all())
     done, batch = 0, max(1, int(settings.get("embed.batch")))
     qdrant = settings.get("search.vector_store") == "qdrant"
+    from supagent.knowledge.stopping import check
+
     for i in range(0, len(todo), batch):
+        check()                                    # an admin stopped the learning run
         part = todo[i:i + batch]
         vectors = E.embed([f"{c.title}\n{c.text}" for c in part])
         for c, v in zip(part, vectors):
