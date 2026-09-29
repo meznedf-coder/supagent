@@ -8,7 +8,16 @@ button): it ends as "stopped", keeping what it learned.
 
 Runs every day at learn.hour (Celery beat, task supagent.learn_tick), from the admin page
 ("Learn now") or with `superset supagent learn`. A run stops after learn.max_minutes; the
-next one starts with what was not learned (new objects first, then the oldest profiles)."""
+next one starts with what was not learned (new objects first, then the oldest profiles).
+
+The databases never learned come first (one just added is learned the same day), and each
+database gets a fair share of the time left (the time left divided by the databases left), so
+that a very big one (thousands of metrics) cannot keep the others waiting for days: it goes on
+at the next run. The settings page shows, while the run goes, the database being learned, the
+ones still to come, and the ones left out with the reason.
+
+One run at a time for all the web servers and workers: starting a run holds a row lock
+(supagent_meta 'learn:start') while it checks that none is running."""
 
 from __future__ import annotations
 
@@ -25,6 +34,8 @@ from supagent.models import Run
 
 log = logging.getLogger(__name__)
 BACKENDS = ("osagg", "promagg")
+START_LOCK = "learn:start"
+FINISHING = "relations, catalog and AI descriptions"
 
 
 def learning_username() -> str:
@@ -73,6 +84,26 @@ def databases_to_learn(only: list[str] | None = None, why: dict[str, str] | None
     return out
 
 
+def in_order(targets: list[Any]) -> list[Any]:
+    """The databases never learned first (by id), then the others (by id)."""
+    from supagent.models import Source
+
+    learned = {i for (i,) in db.session.query(Source.database_id).filter(Source.last_learned_at.isnot(None))}
+    return sorted(targets, key=lambda d: (d.id in learned, d.id))
+
+
+def _publish(run_id: int, stats: dict[str, Any]) -> None:
+    """What the run did so far, for the settings page (a run can take hours)."""
+    import copy
+
+    try:
+        (db.session.query(Run).filter(Run.id == run_id)
+         .update({"stats": copy.deepcopy(stats)}, synchronize_session=False))
+        db.session.commit()
+    except Exception:  # pylint: disable=broad-except   (the page shows it at the end)
+        db.session.rollback()
+
+
 SCHEDULED_TRIES = 3          # a scheduled run stopped by a restart or an error is tried again, 3 times a day
 
 
@@ -106,6 +137,34 @@ def running_run() -> Run | None:
     return running or stopping
 
 
+def _start_run(reason: str) -> int | None:
+    """Create the run, unless another process (a worker, a web server, cron) started one
+    meanwhile: the check and the insert hold a row lock, so only one of them starts it
+    (PostgreSQL, MySQL; SQLite writes one at a time anyway). Called after running_run(), whose
+    clean-up commits (a commit would end the lock)."""
+    from sqlalchemy.exc import IntegrityError
+
+    from supagent.models import Meta
+
+    if db.session.get(Meta, START_LOCK) is None:
+        try:
+            db.session.add(Meta(key=START_LOCK, value=""))
+            db.session.commit()
+        except IntegrityError:                         # created by another process meanwhile
+            db.session.rollback()
+    db.session.query(Meta).filter(Meta.key == START_LOCK).with_for_update().one()
+    limit = dt.datetime.utcnow() - dt.timedelta(minutes=2 * int(settings.get("learn.max_minutes")) + 5)
+    busy = (db.session.query(Run.id).filter(Run.kind == "learn", Run.status.in_(("running", "stopping")),
+                                            Run.started_at > limit).first())
+    if busy is not None:
+        db.session.rollback()                          # the lock ends
+        return None
+    run = Run(kind="learn", reason=reason, status="running", stats={})
+    db.session.add(run)
+    db.session.commit()                                # the lock ends
+    return run.id
+
+
 def run_learning(reason: str = "manual", databases: list[str] | None = None, llm: bool = True,
                  max_minutes: int | None = None) -> dict[str, Any]:
     """Learn now; returns the run's summary (also stored in supagent_run). Its LLM calls wait
@@ -128,13 +187,12 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
     from supagent.knowledge.index import sync
     from supagent.knowledge.stopping import LearningStopped, check, watching
 
-    busy = running_run()
-    if busy is not None:
-        return {"run": busy.id, "status": "skipped", "reason": f"run {busy.id} is still {busy.status}"}
-    run = Run(kind="learn", reason=reason, status="running", stats={})
-    db.session.add(run)
-    db.session.commit()
-    run_id = run.id
+    busy = running_run()                          # marks the runs whose process died first
+    run_id = _start_run(reason) if busy is None else None
+    if run_id is None:
+        busy = busy or running_run()
+        return {"run": busy.id if busy else None, "status": "skipped",
+                "reason": f"run {busy.id} is still {busy.status}" if busy else "another run started at the same time"}
     minutes = int(max_minutes or settings.get("learn.max_minutes"))
     deadline = time.time() + 60 * minutes
     llm_deadline = deadline + 600                 # descriptions may take ten more minutes
@@ -170,21 +228,25 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
             with acting_as(username):
                 run = db.session.get(Run, run_id)
                 skipped: dict[str, str] = {}
-                targets = databases_to_learn(databases, why=skipped)
+                targets = in_order(databases_to_learn(databases, why=skipped))
                 if skipped:
                     stats["skipped"] = skipped
                 if not targets:
                     stats["note"] = "no osagg or promagg database to learn (or none this user may read)"
-                for database in targets:
+                stats["plan"] = [d.database_name for d in targets]
+                for i, database in enumerate(targets):
                     check(force=True)
+                    stats["now"] = database.database_name
+                    _publish(run_id, stats)                    # the page: this one now, the next ones
                     source = source_for(database)
                     db.session.commit()
                     t1 = time.time()
+                    share = t1 + max(0.0, deadline - t1) / (len(targets) - i)   # a fair share of the time left
                     try:
                         if database.backend == "promagg":
-                            res = learn_metrics(run, source, database, deadline)
+                            res = learn_metrics(run, source, database, share)
                         else:
-                            res = learn_indices(run, source, database, deadline)
+                            res = learn_indices(run, source, database, share)
                     except Exception as ex:  # pylint: disable=broad-except
                         db.session.rollback()
                         log.exception("supagent learn: database %s", database.database_name)
@@ -198,6 +260,8 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                     if not res.get("complete", True) or res.get("error") or res.get("errors"):
                         status = "partial"
                     index_now()
+                stats["now"] = FINISHING
+                _publish(run_id, stats)
                 during = descriptions_so_far()                  # every database read: the thread ends
                 check(force=True)
                 stats["relations"] = learn_relations()          # between all the databases: at the end
@@ -262,6 +326,7 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
     if describer is not None and "llm" not in stats and describer.out.get("written"):
         stats["llm"] = {"written": describer.out["written"], "requests": describer.out["requests"]}
     stats["seconds"] = round(time.time() - t0, 1)
+    stats.pop("now", None)
     run = db.session.get(Run, run_id)
     run.status = status
     run.error = error
@@ -310,7 +375,7 @@ def plan_learning(databases: list[str] | None = None) -> list[dict[str, Any]]:
     today = dt.date.today()
     out = []
     skipped: dict[str, str] = {}
-    targets = databases_to_learn(databases, why=skipped)
+    targets = in_order(databases_to_learn(databases, why=skipped))
     out += [{"database": name, "skipped": reason} for name, reason in skipped.items()]
     for database in targets:
         source = source_for(database)

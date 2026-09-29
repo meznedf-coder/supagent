@@ -24,7 +24,7 @@ import logging
 import os
 from typing import Any, Callable
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -139,6 +139,9 @@ def init_app(app: Any) -> None:
     appbuilder.add_view(AdminView, MENU_ITEMS["admin"], label="Chat settings", icon="fa-cog",
                         category=SETTINGS_CATEGORY)
     add_beat_schedule()
+    from supagent import workers
+
+    workers.register(app)                  # the workers' heartbeat (in a `celery worker` only)
     log.info("supagent %s: chat, data dictionary and daily learning enabled", __version__)
 
 

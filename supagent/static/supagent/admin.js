@@ -35,7 +35,8 @@
     "qdrant.url": "Qdrant server", "qdrant.api_key": "Qdrant API key", "qdrant.collection": "Qdrant collection",
     "docs.allowed_domains": "Allowed domains for documents", "docs.max_kb": "Largest page or file (KB)",
     "memory.enabled": "Learn from the chats", "memory.team_approval": "Team memories need approval",
-    "memory.prompt_chars": "Characters of memories per question", "chats.keep_days": "Keep chats (days, 0: always)"
+    "memory.prompt_chars": "Characters of memories per question", "chats.keep_days": "Keep chats (days, 0: always)",
+    "agent.queue_keep_days": "Keep delivered queue messages (days, 0: always)"
   };
 
   function status() {
@@ -43,7 +44,10 @@
       var box = $("status");
       box.innerHTML = "";
       [["supagent " + (s.version || "?") + " (tables v" + (s.schema_version || "?") + ")", !!s.schema_version],
-       [s.celery_workers ? "Celery workers answer" : "no Celery worker: answers run in the web server", !!s.celery_workers],
+       [s.executor === "thread" ? "answers run in the web server (agent.executor = thread)" :
+        s.celery_workers ? "Celery workers answer" + (s.workers ? " (" + s.workers + ")" : "") :
+        s.executor === "celery" ? "no Celery worker: questions wait for one (agent.executor = celery)" :
+        "no Celery worker: answers run in the web server", !!s.celery_workers || s.executor === "thread"],
        [s.superset_mcp ? "Superset MCP tools (charts, dashboards)" : "Superset MCP service not installed: no chart saving", !!s.superset_mcp],
        [s.daily_tick_scheduled ? "daily learning in the beat schedule" : "daily learning not scheduled", !!s.daily_tick_scheduled]
       ].forEach(function (x) { box.appendChild(el("span", { class: x[1] ? "ok" : "no", text: x[0] })); });
@@ -147,13 +151,17 @@
           var bits = [];
           ["metrics", "labels", "indices", "fields"].forEach(function (k) { if (x[k]) bits.push(S.num(x[k]) + " " + k); });
           if (x.due) bits.push(S.num(x.profiled || 0) + " of " + S.num(x.due) + " due today profiled");
-          if (x.complete === false) bits.push("stopped at the time limit (learn.max_minutes): the next run continues");
+          if (x.complete === false) bits.push("stopped at its share of the time (learn.max_minutes): the next run continues");
           if (x.history_pending) bits.push(S.num(x.history_pending) + " history lookups left for the next runs");
           if (x.skipped_unchanged) bits.push(S.num(x.skipped_unchanged) + " unchanged today");
           if (x.error) bits.push("error: " + x.error);
           if (x.llm && (x.llm.written || x.llm.left)) bits.push(S.num(x.llm.written || 0) + " AI descriptions" + (x.llm.left ? " (" + S.num(x.llm.left) + " left)" : ""));
           parts.push(name + ": " + (bits.join(", ") || "nothing"));
         });
+        if (st.now && (r.status === "running" || r.status === "stopping")) {       // the run in progress
+          var next = (st.plan || []).filter(function (n) { return n !== st.now && !(st.databases || {})[n]; });
+          parts.unshift("now: " + st.now + (next.length ? "; next: " + next.join(", ") : ""));
+        }
         if (r.progress) parts.push("so far: " + S.num(r.progress.objects) + " objects learned or updated, " +
           S.num(r.progress.ai_descriptions) + " AI descriptions");
         Object.keys(st.skipped || {}).forEach(function (name) { parts.push(name + ": not learned: " + st.skipped[name]); });

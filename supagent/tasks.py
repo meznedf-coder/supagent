@@ -1,6 +1,12 @@
 """Celery tasks, registered on Superset's own Celery app (its workers and beat load them with
 the app): answering a question, learning, and the hourly tick that starts the daily learning
-at learn.hour. Without a worker, questions are answered in a thread of the web server."""
+at learn.hour. Without a worker, questions are answered in a thread of the web server.
+
+A question is answered once, by one process: the worker or web server that starts it first
+takes it (runner.run_answer: pending -> running), the others leave it. In agent.executor = auto
+a question goes to the workers while one is alive (supagent.workers: their heartbeats), and the
+web server that received it answers it itself if no worker started it within TAKEOVER_S seconds
+(every worker busy, or one stopped since its last heartbeat)."""
 
 from __future__ import annotations
 
@@ -15,13 +21,16 @@ from superset.extensions import celery_app
 log = logging.getLogger(__name__)
 _PING: dict[str, Any] = {"at": 0.0, "ok": False}
 BEAT_KEY = "supagent-learn-tick"
+TAKEOVER_S = 15.0              # auto: a question no worker started in this time is answered here
 
 
-@celery_app.task(name="supagent.answer", soft_time_limit=1800, time_limit=1900, ignore_result=True)
+@celery_app.task(name="supagent.answer", soft_time_limit=1800, time_limit=1900, ignore_result=True,
+                 acks_late=True)          # a busy worker leaves the next questions to the other workers
 def answer_task(message_id: int) -> None:
     from supagent.runner import run_answer
 
-    run_answer(message_id)
+    if not run_answer(message_id):
+        log.info("supagent: answer %s already taken (another worker, a web server) or stopped", message_id)
 
 
 @celery_app.task(name="supagent.learn", soft_time_limit=4 * 3600, time_limit=4 * 3600 + 300)
@@ -108,10 +117,15 @@ def learn_tick() -> None:
 
     from supagent.knowledge.learner import due_today, run_learning
     from supagent.runner import purge_old_chats, purge_old_files
+    from supagent.workers import purge
 
     try:
         purge_old_files()
         purge_old_chats()
+        try:
+            purge()                          # delivered queue messages, heartbeats of gone workers
+        except Exception:  # pylint: disable=broad-except   (the learning goes on)
+            log.exception("supagent: clean-up of the queue")
         if due_today():
             run_learning(reason="schedule")
         else:
@@ -132,7 +146,14 @@ def add_beat_schedule() -> None:
 
 
 def workers_alive() -> bool:
-    """A Celery worker answered a ping in the last minute."""
+    """A Celery worker reads the answers' queue: its heartbeat (any broker), or, with a broker
+    that carries broadcasts (Redis, RabbitMQ), a worker that answered a ping in the last minute."""
+    from supagent.workers import can_broadcast, live_workers
+
+    if live_workers():
+        return True
+    if not can_broadcast():                  # a database queue: no ping
+        return False
     if time.time() - _PING["at"] < 60:
         return _PING["ok"]
     found: list[bool] = []
@@ -158,7 +179,7 @@ def _queue() -> dict[str, str]:
     return {"queue": queue} if queue else {}
 
 
-def _in_thread(fn: Any, *args: Any, background: bool = False) -> None:
+def _in_thread(fn: Any, *args: Any, background: bool = False, delay: float = 0.0) -> None:
     from flask import current_app
 
     app = current_app._get_current_object()
@@ -173,7 +194,9 @@ def _in_thread(fn: Any, *args: Any, background: bool = False) -> None:
             else:
                 fn(*args)
 
-    threading.Thread(target=run, name=f"supagent-{fn.__name__}", daemon=True).start()
+    t = threading.Timer(delay, run) if delay else threading.Thread(target=run)
+    t.name, t.daemon = f"supagent-{fn.__name__}", True
+    t.start()
 
 
 def dispatch_answer(message_id: int) -> str:
@@ -197,9 +220,17 @@ def dispatch_answer(message_id: int) -> str:
             if msg is not None:
                 msg.task_id = res.id
                 db.session.commit()
+            if mode == "auto":                # no worker started it in time: this web server answers
+                _in_thread(_take_over, message_id, delay=TAKEOVER_S)
             return "celery"
     _in_thread(run_answer, message_id)
     return "thread"
+
+
+def _take_over(message_id: int) -> None:
+    from supagent.runner import run_answer
+
+    run_answer(message_id, taking_over=True)
 
 
 def dispatch_learning(reason: str = "manual", databases: list[str] | None = None) -> str:

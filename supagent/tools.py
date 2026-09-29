@@ -728,18 +728,52 @@ def chart_from_sql(sql: str, kind: Literal["bar", "line"] = "bar", title: str = 
 
 
 def _export_file(path: str, suffixes: tuple[str, ...]) -> str:
-    """A file made by these tools (inside EXPORT_DIR), by path, name or 6-character id."""
+    """A file made by these tools (inside EXPORT_DIR), by path, name or 6-character id; else the
+    same file of an earlier answer of this user, kept in Superset's database (made by another
+    worker or web server)."""
     root = os.path.realpath(_export_dir())
     name = os.path.basename(str(path).strip())
     full = os.path.realpath(os.path.join(root, name))
     if not (full.startswith(root + os.sep) and full.lower().endswith(suffixes) and os.path.isfile(full)):
         ident = _file_id(name) if "-" in name else os.path.splitext(name)[0]
-        hits = [f for f in os.listdir(root) if f.lower().endswith(suffixes) and not f.startswith(".")
+        hits = [f for f in (os.listdir(root) if os.path.isdir(root) else [])
+                if f.lower().endswith(suffixes) and not f.startswith(".")
                 and re.fullmatch(r"[0-9a-f]{6}", ident or "") and _file_id(f) == ident]
-        if len(hits) != 1:
+        if len(hits) == 1:
+            return os.path.join(root, hits[0])
+        kept = _kept_file(name, ident, suffixes, root) if not hits else None
+        if kept is None:
             raise ToolError(f"{path}: not a {'/'.join(suffixes)} file made by these tools "
                             "(give the id or the path returned by the tool)")
-        full = os.path.join(root, hits[0])
+        full = kept
+    return full
+
+
+def _kept_file(name: str, ident: str, suffixes: tuple[str, ...], root: str) -> str | None:
+    """A file of an earlier answer of the user who asks (supagent_file), written into EXPORT_DIR."""
+    from flask import g
+    from sqlalchemy import or_
+    from superset import db
+
+    from supagent.models import Conversation, File, Message
+
+    uid = getattr(getattr(g, "user", None), "id", None)
+    if uid is None or not name:
+        return None
+    q = (db.session.query(File).join(Message, File.message_id == Message.id)
+         .join(Conversation, Message.conversation_id == Conversation.id).filter(Conversation.user_id == uid))
+    if re.fullmatch(r"[0-9a-f]{6}", ident or ""):
+        q = q.filter(or_(File.name == name, File.name.like(f"%-{ident}.%")))
+    else:
+        q = q.filter(File.name == name)
+    f = next((x for x in q.order_by(File.id.desc()).limit(10)
+              if (x.name or "").lower().endswith(suffixes) and x.data is not None), None)
+    if f is None:
+        return None
+    os.makedirs(root, exist_ok=True)
+    full = os.path.join(root, os.path.basename(f.name))
+    with open(full, "wb") as fh:
+        fh.write(f.data)
     return full
 
 

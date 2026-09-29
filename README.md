@@ -63,9 +63,11 @@ Content-Security-Policy (Talisman nonces).
   else works; the agent says that it cannot save charts.
 * The learner reads OpenSearch through **osagg** and Prometheus / Mimir through **promagg**.
   Both are optional: supagent learns the databases of these two kinds.
-* The chat answers in Superset's **Celery workers** when they run (recommended); without a
-  worker it answers in a thread of the web server. The daily learning is started by Superset's
-  **Celery beat**; without beat, run `superset supagent learn` from cron.
+* The chat answers in Superset's **Celery workers** when they run (recommended), with any
+  broker: Redis, RabbitMQ, or a queue in Superset's own database (no extra service: see
+  *Celery workers and beat*); without a worker it answers in a thread of the web server. The
+  daily learning is started by Superset's **Celery beat**; without beat, run
+  `superset supagent learn` from cron.
 * An OpenAI-compatible LLM with tool calls (llama.cpp `--jinja`, vLLM, a company gateway...).
 * Optional: an OpenAI-compatible **embedding** endpoint (`/embeddings`, e.g. BGE-M3 behind the
   same gateway) for search by meaning. Without it the search uses words only. No `pgvector`
@@ -76,7 +78,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.4.4-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.4.5-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -101,6 +103,70 @@ Restart the web server, the Celery workers and beat.
 The role **AI Agent** gives the chat and the data dictionary; the settings stay with the
 Admin role. `superset init` never gives these pages to Gamma or Alpha. What a user can query
 through the agent stays what Superset lets that user query.
+
+## Celery workers and beat
+
+The web server alone is enough: without a worker, the answers run in threads of the web server,
+and the daily learning waits for `superset supagent learn` (cron). With Superset's Celery
+**workers**, the answers and the learning leave the web server; Celery **beat** starts the daily
+learning (and Superset's alerts and reports).
+
+**The queue.** The web servers and the workers talk through a broker. With Redis, configure it as
+Superset's documentation says. Without Redis, Superset's own database can be the queue: in
+`superset_config.py`, after the `SQLALCHEMY_DATABASE_URI` line, this is the whole change
+(Superset's other Celery defaults are kept):
+
+```python
+from superset.config import CeleryConfig as SupersetCeleryConfig
+
+class CeleryConfig(SupersetCeleryConfig):
+    broker_url = "sqla+" + SQLALCHEMY_DATABASE_URI
+    result_backend = "db+" + SQLALCHEMY_DATABASE_URI
+
+CELERY_CONFIG = CeleryConfig
+```
+
+Without a `CELERY_CONFIG`, Superset's default queue is a SQLite file (`celerydb.sqlite`) in the
+directory each process starts from: web servers and workers started elsewhere, or on other
+hosts, do not see each other. The first start creates the tables `kombu_queue`, `kombu_message`,
+`celery_taskmeta` and `celery_tasksetmeta` in Superset's database (a database in LATIN1 is fine:
+the messages are ASCII). Celery never deletes a delivered message: supagent deletes them after
+`agent.queue_keep_days` days (default 90; about 1 KB each, three months of Superset's reports
+scheduler are about 150 MB, and keeping them does not slow the queue down). Celery beat removes
+its own old results every night.
+
+**Start them** with the `celery` of Superset's virtualenv, the same `SUPERSET_CONFIG_PATH` and the
+same environment as the web server (the worker computes the answers: the LLM middleware's
+certificate paths, `SUPAGENT_*`, `EXPORT_*`, `EMAIL_*`...), for example as services with
+`Restart=always`:
+
+```bash
+celery --app=superset.tasks.celery_app:app worker --pool=prefork -O fair -c 4 --loglevel=INFO
+celery --app=superset.tasks.celery_app:app beat --pidfile= -s /path/to/celerybeat-schedule --loglevel=INFO
+```
+
+`-c 4`: four answers or reports at once per worker (a learning run keeps one busy while it runs;
+each takes about 250-300 MB). Then restart the web servers.
+
+**Several web servers and workers** (behind a load balancer):
+
+* Workers on as many hosts as needed, all with the same configuration, and **one beat** for all
+  of them (two beats start everything twice: the learning still runs once, Superset's reports
+  would not). The same supagent version on every web server and worker, upgraded together.
+* **One question, one answer**: whatever the number of workers and web servers, a question is
+  answered once, by the process that starts it first; the others leave it. A worker holds at
+  most as many questions as it has processes, so a busy worker leaves the next ones to the others.
+* `agent.executor` = `auto` (the default) sends the questions to the workers while one of them is
+  alive: every worker writes a heartbeat in Superset's database every 30 seconds (with any broker:
+  a queue in a database cannot carry Celery's ping) and removes it when it stops. With no worker
+  alive, the web server answers at once; a question no worker started within 15 seconds (every
+  worker busy, or one stopped since its last heartbeat) is answered by the web server that
+  received it. `celery` sends every question to the workers (questions wait while none runs),
+  `thread` never.
+* The files an answer made are kept in Superset's database: the next answer finds them on any
+  host ("mail me that Excel file"). One learning run at a time for all the hosts.
+
+The settings page says "Celery workers answer (2)" with two workers alive.
 
 ## Connect the LLM
 
@@ -167,9 +233,9 @@ billions of documents:
   `learn.stats_max_series` series get no value statistics. The start of the data (the depth of
   the history) is looked up with the time left, about 8 label-index requests per 50 metrics,
   then once a month.
-* **Thousands of metrics**: the first profiles take a few runs. A run that reaches
-  `learn.max_minutes` is marked **partial** on the settings page ("stopped at the time limit:
-  the next run continues"); the next run starts with the metrics not profiled yet. To go
+* **Thousands of metrics**: the first profiles take a few runs. A database that reaches its
+  share of `learn.max_minutes` is marked **partial** on the settings page ("stopped at its share
+  of the time: the next run continues"); the next run starts with the metrics not profiled yet. To go
   faster the first time, run it once at night with more time
   (`superset supagent learn --database "<name>" --minutes 240`), leave out what nobody asks
   about (`learn.metrics_exclude`: `go_*`, `process_*`, `promhttp_*`...) and, if the Mimir team
@@ -183,8 +249,10 @@ billions of documents:
   overload errors in a row (429, 503, timeouts, circuit breakers) the run leaves that database
   for the day. A run stops after `learn.max_minutes` (default 30); the next one continues.
 
-The databases are learned one after the other, and the **AI descriptions are written during the
-learning**: while the learner reads the databases (slowly on purpose, one request at a time),
+The databases are learned one after the other, **the ones never learned first**, each with **a
+fair share of the time left** (the time left divided by the databases left: a database of
+thousands of metrics goes on at the next run instead of keeping the others waiting; a quick one
+leaves its time to the next), and the **AI descriptions are written during the learning**: while the learner reads the databases (slowly on purpose, one request at a time),
 the LLM describes what has none yet, as the objects are learned: the catalog first (what people
 wrote always wins), then metrics and indices, fields and labels (100 objects at a time, 10 per
 LLM call, each call saved at once; a label is described once per database for every metric that
@@ -193,7 +261,9 @@ database of thousands of metrics that takes two hours to learn gets its descript
 those two hours, not after them. Every osagg and promagg database is learned, except the ones
 `learn.databases` leaves out and the ones the learning user (`learn.user`) may not read: each
 run lists those, with the reason (settings page, and `superset supagent learn --plan`). While a
-run is going, the runs list shows how many objects it learned and described so far.
+run is going, the runs list shows the database being learned, the ones still to come ("now:
+Mimir; next: logs, jobs"), the ones left out with the reason, and how many objects it learned
+and described so far.
 
 Once every database is read, it measures the **relations** between them all (a metric label and
 an index field hold the same values; the evidence is kept; a relation an admin marked **Wrong**
@@ -459,8 +529,8 @@ behind your gateway.
 
 ## Operations
 
-* **Where answers run**: `agent.executor` = `auto` (Celery when a worker answers, else a
-  thread of the web server), `celery` or `thread`. An answer with no progress for 35 minutes
+* **Where answers run**: `agent.executor` = `auto` (the Celery workers while one is alive,
+  else a thread of the web server; see *Celery workers and beat*), `celery` or `thread`. An answer with no progress for 35 minutes
   is marked as failed, so a restarted worker never locks a conversation.
 * **Many users at once**: every question runs on its own (a Celery task, or a thread of the web
   server); there is no one-at-a-time limit in supagent, and a running answer holds no
@@ -478,7 +548,9 @@ behind your gateway.
   and memory from a *Helpful*) waits while answers are being computed (2 minutes at most per
   call), so that the LLM serves the people waiting first.
 * **Old chats**: `chats.keep_days` (0, the default: keep every chat) deletes the chats nobody
-  used for that many days, with their messages and files; what they taught stays.
+  used for that many days, with their messages and files (90: three months); what they taught
+  stays. The delivered messages of a queue in Superset's database: `agent.queue_keep_days`
+  (default 90).
 * **The chat panel** on Superset's pages is added through Superset's own place for custom page
   scripts (`tail_js_custom_extra.html`; what a deployment put there is kept), only for the users
   who may chat, never on embedded or standalone dashboards. It shows the chat page in a frame of

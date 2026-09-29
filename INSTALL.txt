@@ -1,8 +1,8 @@
-supagent 0.4.4 - the AI agent inside Apache Superset
+supagent 0.4.5 - the AI agent inside Apache Superset
 =====================================================
 
 What is in this folder
-  supagent-0.4.4-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
+  supagent-0.4.5-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
@@ -10,7 +10,7 @@ What is in this folder
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.4.4-py3-none-any.whl
+   $PY -m pip install supagent-0.4.5-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
    Superset 6.0 (no pydantic there): pip installs pydantic; offline, unzip the pydantic
    wheelhouse next to the wheel and add:  --no-index --find-links ./wheelhouse-pydantic
@@ -52,6 +52,29 @@ What is in this folder
 
 5. Restart the web server, the Celery workers and Celery beat.
 
+   No workers yet, and no Redis? Superset's own database can be Celery's queue. In
+   superset_config.py, after the SQLALCHEMY_DATABASE_URI line (Superset's other defaults kept):
+
+     from superset.config import CeleryConfig as SupersetCeleryConfig
+
+     class CeleryConfig(SupersetCeleryConfig):
+         broker_url = "sqla+" + SQLALCHEMY_DATABASE_URI
+         result_backend = "db+" + SQLALCHEMY_DATABASE_URI
+
+     CELERY_CONFIG = CeleryConfig
+
+   Then, with the celery of Superset's virtualenv, the same SUPERSET_CONFIG_PATH and the same
+   environment as the web server (as services, Restart=always), and restart the web server:
+
+     celery --app=superset.tasks.celery_app:app worker --pool=prefork -O fair -c 4 --loglevel=INFO
+     celery --app=superset.tasks.celery_app:app beat --pidfile= -s /path/to/celerybeat-schedule --loglevel=INFO
+
+   Workers on any number of hosts, ONE beat for all of them, the same supagent version everywhere.
+   agent.executor = auto (default): questions go to the workers while one is alive (their
+   heartbeat), each answered once; with no worker, or none free within 15 s, the web server
+   answers. Settings -> Chat settings shows "Celery workers answer (N)". Delivered queue
+   messages are deleted after agent.queue_keep_days (90) days.
+
 6. Learn now (then every day at learn.hour, 02:00 by default, through Celery beat)
 
    superset supagent import-catalog catalog.yaml       (optional, recommended)
@@ -87,7 +110,7 @@ Learn again from scratch (every database, or --database NAME):
                                               admins' dictionary edits are kept)
    superset supagent learn --minutes 240     (or wait for the daily run)
 
-Many users: without Celery workers, answers run in the web server; start it with several
+Many users: without Celery workers (step 5), answers run in the web server; start it with several
 workers and threads, e.g. gunicorn -w 4 -k gthread --threads 8 ... "superset.app:create_app()".
 The number of answers in parallel is mostly set by the LLM server (how many requests it serves
 at once).

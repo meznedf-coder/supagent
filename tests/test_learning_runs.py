@@ -6,6 +6,7 @@ and start another one."""
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 
@@ -105,15 +106,27 @@ def _fake_steps(monkeypatch, calls: list, stop_at: str | None = None):
     monkeypatch.setattr(quality, "evaluate_resolver", lambda limit=100, seconds=60: {})
 
 
+def _in_learning_order():
+    """The databases never learned first, then the others (by id in each group)."""
+    from superset.extensions import db
+    from superset.models.core import Database
+
+    from supagent.models import Source
+
+    learned = {i for (i,) in db.session.query(Source.database_id).filter(Source.last_learned_at.isnot(None))}
+    dbs = [d for d in db.session.query(Database).order_by(Database.id) if d.backend in ("osagg", "promagg")]
+    return [d.database_name for d in sorted(dbs, key=lambda d: (d.id in learned, d.id))]
+
+
 def test_descriptions_run_during_the_learning_and_relations_come_last(four, monkeypatch):
     from supagent.knowledge.learner import run_learning
 
     calls: list = []
     _fake_steps(monkeypatch, calls)
+    names = _in_learning_order()
     out = run_learning(reason="test")
-    names = _learnable()
     learned = [c for c in calls if c[0] == "learn"]
-    assert learned == [("learn", n) for n in names]                       # every database, in order
+    assert learned == [("learn", n) for n in names]                       # every database, the new ones first
     last = max(i for i, c in enumerate(calls) if c[0] == "learn")
     rel = calls.index(("relations",))
     assert rel > last and ("describe", "during") in calls[:rel]           # the thread worked during the reading
@@ -184,7 +197,7 @@ def test_an_admin_stops_a_run_it_keeps_what_it_learned_and_another_can_start(fou
     from supagent.models import Run
     from superset.extensions import db
 
-    names = _learnable()
+    names = _in_learning_order()
     calls: list = []
     _fake_steps(monkeypatch, calls, stop_at=names[1])
     out = run_learning(reason="test")
@@ -305,3 +318,103 @@ def test_a_run_in_progress_shows_what_it_did_so_far(four, app):
     assert mine["progress"]["objects"] >= 3 and mine["progress"]["ai_descriptions"] >= 1
     run.status = "done"
     db.session.commit()
+
+
+def _learned_before(names_learned: set[str]) -> None:
+    from superset.extensions import db
+    from superset.models.core import Database
+
+    from supagent.knowledge.store import source_for
+
+    for d in db.session.query(Database).filter(Database.database_name.in_(["jobs", "metrics", "jobs-eu", "logs"])):
+        source_for(d).last_learned_at = dt.datetime.utcnow() if d.database_name in names_learned else None
+    db.session.commit()
+
+
+def test_a_new_database_comes_first_and_each_gets_a_fair_share_of_the_time(four, monkeypatch):
+    """A database of 5,000 metrics must not keep the others waiting: each one gets the time left
+    divided by the databases left (a quick one leaves its time to the next)."""
+    import time as _time
+
+    from supagent.knowledge import learn_indices, learn_metrics
+    from supagent.knowledge.learner import plan_learning, run_learning
+
+    calls: list = []
+    _fake_steps(monkeypatch, calls)
+    _learned_before({"jobs", "metrics"})
+    shares: dict[str, float] = {}
+
+    def learn(run, source, database, deadline):
+        shares[database.database_name] = deadline - _time.time()
+        return {"complete": True}
+
+    monkeypatch.setattr(learn_metrics, "learn_metrics", learn)
+    monkeypatch.setattr(learn_indices, "learn_indices", learn)
+    monkeypatch.setattr(learn_metrics, "_promagg_connection", lambda d: pytest.fail("no data read"), raising=False)
+    out = run_learning(reason="test", max_minutes=40)
+    order = list(shares)
+    assert order[:2] == ["jobs-eu", "logs"] and set(order[2:]) == {"jobs", "metrics"}   # never learned: first
+    assert [round(shares[n] / 60) for n in order] == [10, 13, 20, 40]     # 40/4, then what is left / 3, / 2, / 1
+    assert out["plan"] == order and "now" not in out
+
+
+def test_the_page_shows_the_database_being_learned_and_the_next_ones(four, monkeypatch):
+    import sqlalchemy as sa
+    from superset.extensions import db
+
+    from supagent.knowledge import learn_indices, learn_metrics
+    from supagent.knowledge.learner import FINISHING, run_learning
+
+    calls: list = []
+    _fake_steps(monkeypatch, calls)
+    _learned_before(set())
+    seen: list[dict] = []
+
+    def read_stats(run_id):
+        with db.engine.connect() as conn:                     # what the settings page reads meanwhile
+            value = conn.execute(sa.text("SELECT stats FROM supagent_run WHERE id = :i"), {"i": run_id}).scalar()
+        return json.loads(value) if isinstance(value, str) else value
+
+    def learn(run, source, database, deadline):
+        seen.append(read_stats(run.id))
+        return {"complete": True, "fields": 3}
+
+    monkeypatch.setattr(learn_metrics, "learn_metrics", learn)
+    monkeypatch.setattr(learn_indices, "learn_indices", learn)
+    from supagent.knowledge import relations
+
+    monkeypatch.setattr(relations, "learn_relations", lambda: seen.append(read_stats(_last_run_id())) or {})
+    out = run_learning(reason="test")
+    plan = out["plan"]
+    assert [s["now"] for s in seen[:4]] == plan and all(s["plan"] == plan for s in seen)
+    assert list(seen[1]["databases"]) == plan[:1] and list(seen[3]["databases"]) == plan[:3]   # the ones done
+    assert seen[4]["now"] == FINISHING and len(seen[4]["databases"]) == 4
+    final = read_stats(out["run"])
+    assert "now" not in final and final["plan"] == plan
+
+
+def _last_run_id():
+    from superset.extensions import db
+
+    from supagent.models import Run
+
+    return db.session.query(Run.id).order_by(Run.id.desc()).limit(1).scalar()
+
+
+def test_only_one_run_starts_at_a_time_for_all_the_processes(app):
+    from superset.extensions import db
+
+    from supagent.knowledge.learner import _start_run, run_learning
+    from supagent.models import Run
+
+    with app.app_context():
+        _no_runs()
+        first = _start_run("schedule")
+        assert first and _start_run("schedule") is None          # another worker, the same minute: no second run
+        out = run_learning(reason="manual")
+        assert out["status"] == "skipped" and out["run"] == first
+        db.session.query(Run).filter(Run.id == first).update({"status": "done"})
+        db.session.commit()
+        second = _start_run("manual")
+        assert second and second != first
+        _no_runs()

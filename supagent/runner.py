@@ -183,30 +183,34 @@ def _record_usage(message_id: int, user_id: int | None, seconds: float, llm: dic
         log.info("supagent: usage of answer %s not recorded", message_id)
 
 
-def run_answer(message_id: int) -> None:
-    """Compute the answer of an assistant message (status pending -> running -> done / error)."""
+def run_answer(message_id: int, taking_over: bool = False) -> bool:
+    """Compute the answer of an assistant message (status pending -> running -> done / error).
+    The process that moves it from pending to running answers it, whatever the number of workers
+    and web servers: False (nothing done) when another one took it first, or it was stopped."""
     from superset.extensions import security_manager
 
     from supagent.security import acting_as
 
+    if not _save(message_id, live=("pending",), status="running"):
+        return False                                     # taken by another process, or stopped
+    if taking_over:
+        log.info("supagent: no worker started answer %s in time: answered in the web server", message_id)
     msg = db.session.get(Message, message_id)
-    if msg is None or msg.status not in ("pending", "running"):
-        return
+    if msg is None:
+        return False
     conv = db.session.get(Conversation, msg.conversation_id)
     user = security_manager.get_user_by_id(conv.user_id) if conv else None
     user_id = conv.user_id if conv else None
     if user is None:
         _save(message_id, status="error", content="the user of this conversation no longer exists",
               finished_at=dt.datetime.utcnow())
-        return
+        return True
     username = user.username
     earlier = (db.session.query(Message).filter(Message.conversation_id == conv.id, Message.id < message_id)
                .order_by(Message.id).all())
     question = next((m.content for m in reversed(earlier) if m.role == "user"), "")
     history = [{"role": m.role, "content": m.content} for m in earlier[:-1]
                if m.status == "done" and m.content]
-    if not _save(message_id, status="running"):
-        return                                           # stopped before it started
 
     def on_step(trace: list[dict]) -> None:
         if not _save(message_id, steps=_steps_for_page(trace)):
@@ -241,7 +245,7 @@ def run_answer(message_id: int) -> None:
                 if kept:
                     db.session.query(File).filter(File.id.in_(kept)).delete(synchronize_session=False)
                     db.session.commit()
-                return
+                return True
             _record_usage(message_id, user_id, time.time() - started, getattr(agent, "usage", None) or {}, trace)
             from supagent.knowledge.experience import learn_from_answer
 
@@ -266,6 +270,7 @@ def run_answer(message_id: int) -> None:
               finished_at=dt.datetime.utcnow())
     finally:
         db.session.remove()
+    return True
 
 
 def purge_old_chats() -> int:

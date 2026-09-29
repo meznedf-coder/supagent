@@ -1129,8 +1129,12 @@ class AdminView(BaseView):
 
         row = db.session.get(Meta, "schema_version")
         last = (db.session.query(Run).filter(Run.reason == "schedule").order_by(Run.id.desc()).first())
+        from supagent import settings
+        from supagent.workers import live_workers
+
         return _json({"version": __version__, "schema_version": row.value if row else None,
-                      "celery_workers": workers_alive(), "superset_mcp": mcp,
+                      "celery_workers": workers_alive(), "workers": len(live_workers(fresh=True)),
+                      "executor": settings.get("agent.executor"), "superset_mcp": mcp,
                       "daily_tick_scheduled": BEAT_KEY in (celery_app.conf.beat_schedule or {}),
                       "last_scheduled_run": last.started_at if last else None,
                       "last_scheduled_status": last.status if last else None})

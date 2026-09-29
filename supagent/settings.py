@@ -142,6 +142,8 @@ SPECS: list[Spec] = [
          choices=("auto", "celery", "thread")),
     Spec("agent.celery_queue", "", "str", "Celery queue of the answers and the learning runs (empty: the default "
          "queue); set it when the workers only read named queues (celery worker -Q ...)"),
+    Spec("agent.queue_keep_days", 90, "int", "With Celery's queue in Superset's database (broker_url \"sqla+...\"): "
+         "delivered messages are deleted after this many days (0: never; Celery itself never deletes them)"),
 ]
 BY_KEY = {s.key: s for s in SPECS}
 

@@ -119,12 +119,24 @@ def test_feedback_keeps_the_sql_as_an_example(app):
         assert ex.sql == "SELECT 1" and ex.question == "How many jobs failed?"
 
 
+def _background_done(seconds: float = 30.0) -> None:
+    """The background threads of earlier tests (Helpful, memory) must not read a table changed here."""
+    import threading
+    import time
+
+    end = time.time() + seconds
+    for t in threading.enumerate():
+        if t.name.startswith("supagent-") and t is not threading.current_thread():
+            t.join(max(0.0, end - time.time()))
+
+
 def test_missing_columns_are_added(ctx):
     import sqlalchemy as sa
     from superset.extensions import db
 
     from supagent.models import _add_missing_columns
 
+    _background_done()
     with db.engine.begin() as conn:
         conn.execute(sa.text("ALTER TABLE supagent_message DROP COLUMN results"))
     assert "supagent_message.results" in _add_missing_columns(db.engine)

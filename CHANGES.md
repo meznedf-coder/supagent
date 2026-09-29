@@ -1,5 +1,28 @@
 # Changes
 
+## 0.4.5 (2026-09-29)
+
+* **Celery workers without Redis, several web servers and workers**: the workers can use
+  Superset's own database as their queue (`broker_url = "sqla+" + SQLALCHEMY_DATABASE_URI`, five
+  lines in `superset_config.py`, see *Celery workers and beat*). Every worker writes a heartbeat
+  in Superset's database (every 30 seconds, removed when it stops), so `agent.executor` = `auto`
+  sees the workers with any broker (a queue in a database cannot carry Celery's ping), and the
+  settings page counts them.
+* **One question, one answer**: a question is answered by the first process that starts it (worker
+  or web server), the others leave it; a busy worker leaves the next questions to the other
+  workers. In `auto`, a question no worker started within 15 seconds is answered by the web server
+  that received it; with no worker alive, the web server answers at once.
+* `agent.queue_keep_days` (default 90): the delivered messages of a queue in Superset's database
+  are deleted after that many days (Celery never deletes them), with the heartbeats of workers
+  gone for a day, by the hourly tick.
+* **Learning**: the databases never learned come first, each database gets a fair share of the
+  time left (a database of thousands of metrics no longer keeps the others waiting for days), and
+  the runs list shows, while the run goes, the database being learned, the ones still to come and
+  the ones left out with the reason (before, only at the end of the run). One run at a time for
+  all the hosts (a row lock while a run starts).
+* A file made by an earlier answer (Excel, chart image) is found by the next answer on any worker
+  or web server (it is kept in Superset's database), for the same user only.
+
 ## 0.4.4 (2026-09-29)
 
 * **AI descriptions during the learning**: the LLM describes what has no description while the
