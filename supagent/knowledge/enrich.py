@@ -184,15 +184,17 @@ def _write(obj: KObject, entry: dict[str, Any]) -> int:
     return 1
 
 
-def enrich(run: Run | None, deadline: float, llm: Any = None, source_id: int | None = None) -> dict[str, Any]:
+def enrich(run: Run | None, deadline: float, llm: Any = None, source_id: int | None = None,
+           pause: Any = None) -> dict[str, Any]:
     """LLM descriptions for what nobody described (metrics and indices first), of one database
     (`source_id`) or of all, CHUNK objects at a time, BATCH per request, each batch saved at once,
     until the time limit: the next run goes on where this one stopped. No limit of objects per
-    run. Stops at once when an admin stops the run."""
+    run. Stops at once when an admin stops the run, and after the batch in progress when `pause`
+    (a threading.Event) is set. "by_source": what was written in each database (source id)."""
     from supagent.knowledge.stopping import check
     from supagent.llm import LLM
 
-    out: dict[str, Any] = {"written": 0, "requests": 0}
+    out: dict[str, Any] = {"written": 0, "requests": 0, "by_source": {}}
     try:
         llm = llm or LLM()
     except Exception as ex:  # pylint: disable=broad-except
@@ -202,6 +204,9 @@ def enrich(run: Run | None, deadline: float, llm: Any = None, source_id: int | N
         for ids in _chunks(kind, source_id):
             for i in range(0, len(ids), BATCH):
                 check()
+                if pause is not None and pause.is_set():
+                    out["paused"] = True
+                    return out
                 if time.time() > deadline:
                     out["stopped"] = "time limit: the next run goes on"
                     out["left"] = left_to_describe(source_id)
@@ -226,7 +231,10 @@ def enrich(run: Run | None, deadline: float, llm: Any = None, source_id: int | N
                     except (TypeError, ValueError):
                         continue
                     if obj is not None:
-                        out["written"] += _write(obj, entry)
+                        n = _write(obj, entry)
+                        out["written"] += n
+                        if n:
+                            out["by_source"][obj.source_id] = out["by_source"].get(obj.source_id, 0) + n
                 db.session.commit()
     out["left"] = 0
     return out

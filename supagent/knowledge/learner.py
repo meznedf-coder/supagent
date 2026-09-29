@@ -1,9 +1,10 @@
 """One learning run: every osagg and promagg database (or the ones of learn.databases) is read
-as the learning user, one after the other: what changed since the last run is recorded, the
-catalog is applied and the LLM describes what nobody described in that database (with a fair share
-of the time left, so that the next databases get theirs); then the relations between them all are
-measured. The databases left out, and why, are in the run's statistics. An admin can stop a run
-(the Stop button): it ends as "stopped", keeping what it learned.
+as the learning user, one after the other, and what changed since the last run is recorded. While
+they are read, the LLM describes what nobody described yet (supagent.knowledge.describer: after
+the catalog, as the objects are learned); once every database is read, the relations between them
+all are measured, the catalog is applied, and the time left describes what is still missing. The
+databases left out, and why, are in the run's statistics. An admin can stop a run (the Stop
+button): it ends as "stopped", keeping what it learned.
 
 Runs every day at learn.hour (Celery beat, task supagent.learn_tick), from the admin page
 ("Learn now") or with `superset supagent learn`. A run stops after learn.max_minutes; the
@@ -148,6 +149,20 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
         except Exception:  # pylint: disable=broad-except
             db.session.rollback()
 
+    describer = None
+    if describe:                                  # the descriptions while the databases are read
+        from flask import current_app
+
+        from supagent.knowledge.describer import Describer
+
+        describer = Describer(current_app._get_current_object(), run_id, deadline)
+        describer.start()
+
+    def descriptions_so_far() -> dict[str, Any]:
+        if describer is None:
+            return {}
+        return describer.finish(timeout=float(settings.get("llm.timeout") or 900) + 60)
+
     try:
         with watching(run_id):
             username = learning_username()
@@ -160,7 +175,7 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                     stats["skipped"] = skipped
                 if not targets:
                     stats["note"] = "no osagg or promagg database to learn (or none this user may read)"
-                for i, database in enumerate(targets):
+                for database in targets:
                     check(force=True)
                     source = source_for(database)
                     db.session.commit()
@@ -183,36 +198,31 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                     if not res.get("complete", True) or res.get("error") or res.get("errors"):
                         status = "partial"
                     index_now()
-                    if describe:                  # this database's descriptions now, with a fair share of the time
-                        check(force=True)
-                        apply_catalog()           # people's texts first: the LLM never describes what they did
-                        share = max(0.0, llm_deadline - time.time()) / (len(targets) - i)
-                        res["llm"] = enrich(run, min(llm_deadline, time.time() + share), source_id=source.id)
-                        source = db.session.merge(source)
-                        source.stats = dict(res)
-                        db.session.commit()
-                        if res["llm"].get("error"):
-                            status = "partial"
-                        index_now()
+                during = descriptions_so_far()                  # every database read: the thread ends
                 check(force=True)
                 stats["relations"] = learn_relations()          # between all the databases: at the end
                 stats["catalog"] = apply_catalog()
                 stats["categories"] = infer_categories()
                 if describe:
-                    parts = [x.get("llm") or {} for x in stats["databases"].values()]
-                    llm_out = {"written": sum(p.get("written", 0) for p in parts),
-                               "requests": sum(p.get("requests", 0) for p in parts)}
-                    if time.time() < llm_deadline:              # time left: what a database's share left
-                        more = enrich(run, llm_deadline)
+                    llm_out = {"written": during.get("written", 0), "requests": during.get("requests", 0)}
+                    by_source = dict(during.get("by_source") or {})
+                    if during.get("error"):
+                        llm_out["error"] = during["error"]
+                    if time.time() < llm_deadline and not during.get("still_running") and not during.get("error"):
+                        more = enrich(run, llm_deadline)        # what is still missing, with the time left
                         llm_out["written"] += more.get("written", 0)
                         llm_out["requests"] += more.get("requests", 0)
                         llm_out.update({k: more[k] for k in ("left", "stopped", "error") if k in more})
+                        for sid, n in (more.get("by_source") or {}).items():
+                            by_source[sid] = by_source.get(sid, 0) + n
                     else:
                         from supagent.knowledge.enrich import left_to_describe
 
                         llm_out["left"] = left_to_describe()
-                    if any(p.get("error") for p in parts) and "error" not in llm_out:
-                        llm_out["error"] = next(p["error"] for p in parts if p.get("error"))
+                    for d in targets:                           # each database's share, for the runs list
+                        x = stats["databases"].get(d.database_name)
+                        if x is not None:
+                            x["llm"] = {"written": by_source.get(source_for(d).id, 0)}
                     stats["llm"] = llm_out
                     if llm_out.get("error"):
                         status = "partial"
@@ -246,6 +256,11 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
         db.session.rollback()
         log.exception("supagent learn: run %s failed", run_id)
         status, error = "error", "".join(traceback.format_exception_only(type(ex), ex))[-2000:]
+    finally:
+        if describer is not None and describer.is_alive():
+            describer.finish(timeout=60)          # a stop or a failure: the thread ends too
+    if describer is not None and "llm" not in stats and describer.out.get("written"):
+        stats["llm"] = {"written": describer.out["written"], "requests": describer.out["requests"]}
     stats["seconds"] = round(time.time() - t0, 1)
     run = db.session.get(Run, run_id)
     run.status = status

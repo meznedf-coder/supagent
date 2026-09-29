@@ -154,6 +154,8 @@
           if (x.llm && (x.llm.written || x.llm.left)) bits.push(S.num(x.llm.written || 0) + " AI descriptions" + (x.llm.left ? " (" + S.num(x.llm.left) + " left)" : ""));
           parts.push(name + ": " + (bits.join(", ") || "nothing"));
         });
+        if (r.progress) parts.push("so far: " + S.num(r.progress.objects) + " objects learned or updated, " +
+          S.num(r.progress.ai_descriptions) + " AI descriptions");
         Object.keys(st.skipped || {}).forEach(function (name) { parts.push(name + ": not learned: " + st.skipped[name]); });
         if (st.relations) parts.push("relations: " + (st.relations.same_values || 0) + " measured");
         if (st.llm) parts.push("AI descriptions: " + (st.llm.written || 0) + (st.llm.left ? ", " + st.llm.left +

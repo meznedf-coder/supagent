@@ -76,7 +76,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.4.3-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.4.4-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -183,22 +183,25 @@ billions of documents:
   overload errors in a row (429, 503, timeouts, circuit breakers) the run leaves that database
   for the day. A run stops after `learn.max_minutes` (default 30); the next one continues.
 
-The databases are learned **one after the other, each with its descriptions**: the catalog is
-applied (what people wrote always wins), then the LLM describes what has none in that database
-(metrics and indices first, 100 objects at a time, 10 per LLM call, each call saved at once; a
-label is described once per database for every metric that has it; exporters' HELP texts and
-catalog texts count as descriptions; marked *AI-written*), with a fair share of the run's time
-(the run's time plus ten minutes, shared between the databases left, so that each gets its turn);
-the next run goes on where it stopped. Every osagg and promagg database is learned, except the
-ones `learn.databases` leaves out and the ones the learning user (`learn.user`) may not read:
-each run lists those, with the reason (settings page, and `superset supagent learn --plan`).
+The databases are learned one after the other, and the **AI descriptions are written during the
+learning**: while the learner reads the databases (slowly on purpose, one request at a time),
+the LLM describes what has none yet, as the objects are learned: the catalog first (what people
+wrote always wins), then metrics and indices, fields and labels (100 objects at a time, 10 per
+LLM call, each call saved at once; a label is described once per database for every metric that
+has it; exporters' HELP texts and catalog texts count as descriptions; marked *AI-written*). A
+database of thousands of metrics that takes two hours to learn gets its descriptions during
+those two hours, not after them. Every osagg and promagg database is learned, except the ones
+`learn.databases` leaves out and the ones the learning user (`learn.user`) may not read: each
+run lists those, with the reason (settings page, and `superset supagent learn --plan`). While a
+run is going, the runs list shows how many objects it learned and described so far.
 
-Then it measures the **relations** between them all (a metric label and an index field hold the
-same values; the evidence is kept; a relation an admin marked **Wrong** in *Data dictionary →
-Relations* is never measured again nor given to the agent, and a catalog entry of
-classification *relationships* states the right one), uses the time left for descriptions a
-database's share did not reach, lets the agent write the **catalog entries it is certain of**
-(below), and updates the knowledge search.
+Once every database is read, it measures the **relations** between them all (a metric label and
+an index field hold the same values; the evidence is kept; a relation an admin marked **Wrong**
+in *Data dictionary → Relations* is never measured again nor given to the agent, and a catalog
+entry of classification *relationships* states the right one), applies the **catalog**, describes
+what is still missing with the time left (the run's time plus ten minutes; the next run goes on
+where it stopped), lets the agent write the **catalog entries it is certain of** (below), and
+updates the knowledge search.
 
 **Stopping a run**: *Stop learning* on the settings page (or `superset supagent learn --stop`)
 stops the running run at its next step (a few seconds, or the LLM request in progress); it keeps

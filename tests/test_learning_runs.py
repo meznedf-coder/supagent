@@ -63,12 +63,21 @@ def test_every_osagg_and_promagg_database_is_learned_and_the_others_say_why(four
 
 
 def _fake_steps(monkeypatch, calls: list, stop_at: str | None = None):
-    """The learning steps replaced by recorders (the order of a run is what is checked)."""
-    from supagent.knowledge import (autocatalog, curated, enrich, generic, index, learn_indices, learn_metrics,
-                                    quality, relations)
+    """The learning steps replaced by recorders (the order of a run is what is checked); the
+    describer thread's calls are marked "during"."""
+    import threading
+
+    from supagent.knowledge import (autocatalog, curated, describer, enrich, generic, index, learn_indices,
+                                    learn_metrics, quality, relations)
+
+    lock = threading.Lock()
+
+    def note(*item):
+        with lock:
+            calls.append(item)
 
     def learn(run, source, database, deadline):
-        calls.append(("learn", database.database_name))
+        note("learn", database.database_name)
         if database.database_name == stop_at:      # an admin presses Stop while this database is learned
             from supagent.knowledge.stopping import check, request_stop
 
@@ -76,13 +85,18 @@ def _fake_steps(monkeypatch, calls: list, stop_at: str | None = None):
             check(force=True)                      # the next request to the database
         return {"complete": True}
 
+    def describe(run, deadline, llm=None, source_id=None, pause=None):
+        during = threading.current_thread().name.startswith("supagent-describe")
+        note("describe", "during" if during else "end")
+        return {"written": 1, "requests": 1, "by_source": {}} if not during else {"written": 0, "requests": 0}
+
+    monkeypatch.setattr(describer, "IDLE_S", 0.01)
     monkeypatch.setattr(learn_metrics, "learn_metrics", learn)
     monkeypatch.setattr(learn_indices, "learn_indices", learn)
-    monkeypatch.setattr(enrich, "enrich", lambda run, deadline, llm=None, source_id=None:
-                        calls.append(("describe", source_id)) or {"written": 1, "requests": 1})
+    monkeypatch.setattr(enrich, "enrich", describe)
     monkeypatch.setattr(enrich, "infer_categories", lambda: 0)
     monkeypatch.setattr(enrich, "left_to_describe", lambda source_id=None: 0)
-    monkeypatch.setattr(relations, "learn_relations", lambda: calls.append(("relations",)) or {"same_values": 0})
+    monkeypatch.setattr(relations, "learn_relations", lambda: note("relations") or {"same_values": 0})
     monkeypatch.setattr(curated, "apply_catalog", lambda: {"curated": 0})
     monkeypatch.setattr(autocatalog, "run", lambda llm_docs=True: {})
     monkeypatch.setattr(generic, "tidy_learned", lambda limit=50, deadline=None: {})
@@ -91,23 +105,78 @@ def _fake_steps(monkeypatch, calls: list, stop_at: str | None = None):
     monkeypatch.setattr(quality, "evaluate_resolver", lambda limit=100, seconds=60: {})
 
 
-def test_each_database_is_described_right_after_it_and_the_relations_come_last(four, monkeypatch):
+def test_descriptions_run_during_the_learning_and_relations_come_last(four, monkeypatch):
     from supagent.knowledge.learner import run_learning
-    from supagent.knowledge.store import source_for
-    from superset.extensions import db
-    from superset.models.core import Database
 
     calls: list = []
     _fake_steps(monkeypatch, calls)
     out = run_learning(reason="test")
     names = _learnable()
-    sources = {d.database_name: source_for(d).id for d in db.session.query(Database) if d.database_name in names}
-    expected = []
-    for name in names:
-        expected += [("learn", name), ("describe", sources[name])]
-    assert calls[:len(expected)] == expected and calls[len(expected)] == ("relations",)
-    assert calls[len(expected) + 1:] == [("describe", None)]         # the time left: what a share left
-    assert out["status"] == "done" and out["llm"]["written"] == len(names) + 1
+    learned = [c for c in calls if c[0] == "learn"]
+    assert learned == [("learn", n) for n in names]                       # every database, in order
+    last = max(i for i, c in enumerate(calls) if c[0] == "learn")
+    rel = calls.index(("relations",))
+    assert rel > last and ("describe", "during") in calls[:rel]           # the thread worked during the reading
+    assert all(c != ("describe", "during") for c in calls[rel:])          # and was over before the relations
+    assert calls[rel + 1:] == [("describe", "end")]                       # then what is still missing
+    assert out["status"] == "done" and out["llm"]["written"] == 1
+
+
+def test_descriptions_are_written_while_a_database_is_still_being_read(four, monkeypatch):
+    """The real describe step next to a slow database: its first metrics are described (by a
+    fake LLM) before it is fully read."""
+    import json
+    import threading
+    import time as _time
+
+    from superset.extensions import db
+
+    from supagent import llm as L
+    from supagent.knowledge import (autocatalog, describer, generic, index, learn_indices, learn_metrics, quality,
+                                    relations)
+    from supagent.knowledge.learner import run_learning
+    from supagent.knowledge.store import upsert
+    from supagent.models import KObject
+
+    events: list = []
+
+    class FakeLLM:
+        def __init__(self, *a, **k):
+            pass
+
+        def chat(self, messages, tools=None, max_tokens=None):
+            items = json.loads(messages[1]["content"])
+            events.append(("llm", threading.current_thread().name, _time.time(), [i["name"] for i in items]))
+            return {"content": json.dumps([{"id": i["id"], "description": f"About {i['name']}"} for i in items])}
+
+    def slow_metrics(run, source, database, deadline):                   # 3 batches, a pause after each
+        for b in range(3):
+            for k in range(4):
+                upsert(run, source, "metric", "", f"slow_{b}_{k}", {"metric_type": "gauge", "stats": {"series": 1}})
+            db.session.commit()
+            events.append(("batch", b, _time.time()))
+            _time.sleep(0.6)
+        events.append(("read", database.database_name, _time.time()))
+        return {"complete": True}
+
+    monkeypatch.setattr(L, "LLM", FakeLLM)
+    monkeypatch.setattr(describer, "IDLE_S", 0.05)
+    monkeypatch.setattr(learn_metrics, "learn_metrics", slow_metrics)
+    monkeypatch.setattr(learn_indices, "learn_indices", lambda run, source, database, deadline: {"complete": True})
+    monkeypatch.setattr(relations, "learn_relations", lambda: events.append(("relations", _time.time())) or {})
+    monkeypatch.setattr(autocatalog, "run", lambda llm_docs=True: {})
+    monkeypatch.setattr(generic, "tidy_learned", lambda limit=50, deadline=None: {})
+    monkeypatch.setattr(index, "index_knowledge", lambda: {})
+    monkeypatch.setattr(quality, "evaluate_resolver", lambda limit=100, seconds=60: {})
+    out = run_learning(reason="test")
+    read_at = next(e[2] for e in events if e[0] == "read")
+    during = [e for e in events if e[0] == "llm" and e[1].startswith("supagent-describe")]
+    assert during and during[0][2] < read_at                              # described before the database was read
+    assert any(n.startswith("slow_0_") for e in during for n in e[3])      # its first metrics among them
+    rel_at = next(e[1] for e in events if e[0] == "relations")
+    assert all(e[2] < rel_at for e in during)
+    left = db.session.query(KObject).filter(KObject.name.like("slow_%"), KObject.description.is_(None)).count()
+    assert out["status"] == "done" and left == 0 and out["llm"]["written"] >= 12
 
 
 def test_an_admin_stops_a_run_it_keeps_what_it_learned_and_another_can_start(four, monkeypatch):
@@ -120,7 +189,7 @@ def test_an_admin_stops_a_run_it_keeps_what_it_learned_and_another_can_start(fou
     _fake_steps(monkeypatch, calls, stop_at=names[1])
     out = run_learning(reason="test")
     assert out["status"] == "stopped" and out["error"] == "stopped by an admin"
-    assert calls == [("learn", names[0]), ("describe", calls[1][1]), ("learn", names[1])]   # no more after the stop
+    assert [c for c in calls if c[0] != "describe"] == [("learn", names[0]), ("learn", names[1])]   # nothing after
     assert names[0] in out["databases"] and ("relations",) not in calls
     run = db.session.get(Run, out["run"])
     assert run.status == "stopped" and run.finished_at is not None
@@ -212,3 +281,27 @@ def test_the_stop_button_and_command(app):
         assert out.exit_code == 0 and f"stopping learning run {run.id}" in out.output
         db.session.get(Run, run.id).status = "stopped"
         db.session.commit()
+
+
+def test_a_run_in_progress_shows_what_it_did_so_far(four, app):
+    from superset.extensions import db
+
+    from supagent.knowledge.store import upsert
+    from supagent.models import KObject, Run
+
+    run = Run(kind="learn", reason="test", status="running", started_at=dt.datetime.utcnow() - dt.timedelta(seconds=5))
+    db.session.add(run)
+    db.session.commit()
+    for k in range(3):
+        upsert(run, four["s_prom"], "metric", "", f"progress_{k}", {"metric_type": "gauge", "stats": {"series": 1}})
+    db.session.flush()
+    obj = db.session.query(KObject).filter_by(name="progress_0").one()
+    obj.description, obj.description_source = "About it", "llm"
+    db.session.commit()
+    with app.test_client() as c:
+        login(c, "admin")
+        runs = c.get("/supagent/admin/api/runs").get_json()["runs"]
+    mine = next(r for r in runs if r["id"] == run.id)
+    assert mine["progress"]["objects"] >= 3 and mine["progress"]["ai_descriptions"] >= 1
+    run.status = "done"
+    db.session.commit()

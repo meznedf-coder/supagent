@@ -1,5 +1,16 @@
 # Changes
 
+## 0.4.4 (2026-09-29)
+
+* **AI descriptions during the learning**: the LLM describes what has no description while the
+  databases are read (the learner waits for the databases most of the time: the LLM works
+  meanwhile), as the metrics and indices are learned, instead of after a database (0.4.3) or after
+  the whole run (0.4.2). A Mimir of thousands of metrics that takes two hours to learn gets its
+  descriptions during those two hours. Once every database is read: the relations between them
+  all, the catalog, then the descriptions still missing with the time left.
+* A run in progress shows in the runs list how many objects it learned or updated, and how many
+  AI descriptions it wrote so far.
+
 ## 0.4.3 (2026-09-29)
 
 * **Every database is learned, and a run says which ones it left out and why**: each run lists
