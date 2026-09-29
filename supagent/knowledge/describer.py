@@ -19,6 +19,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 IDLE_S = 10.0                    # nothing to describe yet: look again after this long
+CATALOG_S = 120.0                # the catalog is applied again at most this often (big catalogs, long runs)
 
 
 class Describer(threading.Thread):
@@ -45,8 +46,11 @@ class Describer(threading.Thread):
         with self.app.app_context():
             try:
                 with background(), watching(self.run_id):
+                    applied = 0.0
                     while not self.done.is_set() and time.time() < self.deadline:
-                        apply_catalog()                     # people's texts first: never described twice
+                        if time.time() - applied >= CATALOG_S:
+                            apply_catalog()                 # people's texts first: never described twice
+                            applied = time.time()
                         res = enrich(None, self.deadline, llm=self.llm, pause=self.done)
                         self._add(res)
                         if res.get("error"):
