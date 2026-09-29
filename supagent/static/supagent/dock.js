@@ -121,7 +121,7 @@
   document.addEventListener("click", function (ev) {
     if (ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
     var a = ev.target && ev.target.closest ? ev.target.closest("a") : null;
-    if (!isChatLink(a)) return;
+    if (!isChatLink(a) || (dock && dock.contains(a))) return;     // the panel's own full-page button: a link
     ev.preventDefault();
     ev.stopPropagation();
     if (dock && !dock.hidden) hide(); else show();

@@ -1,5 +1,10 @@
 # Changes
 
+## 0.4.2 (2026-09-29)
+
+* The chat panel's ⤢ button opens the full chat page again (in 0.4.1 it closed the panel: it was
+  taken for a click on the Chat tab).
+
 ## 0.4.1 (2026-09-29)
 
 * **The chat beside Superset's pages**: the Chat tab of the top bar no longer leaves the page: it
