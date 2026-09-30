@@ -209,3 +209,16 @@ def test_a_follow_up_restating_the_chats_results_needs_no_new_query(ctx, monkeyp
     b, _ran = agent_with(monkeypatch, [say("BILLING_API had 412 failed jobs.")] * 3)
     answer, _trace = b.ask("The failed jobs.", history)                  # a number of its own: sent back, marked
     assert b.usage.get("nudges") and "(Check:" in answer
+
+
+def test_a_follow_up_with_another_day_is_not_answered_from_the_chat(ctx, monkeypatch):
+    from test_agent_loop import agent_with, say
+
+    history = [{"role": "user", "content": "How many jobs failed on 23 September?"},
+               {"role": "assistant", "content": "5,939 jobs failed on 23 September."}]
+    a, _ran = agent_with(monkeypatch, [say("5,939 jobs failed on 22 September.")] * 3)
+    answer, _trace = a.ask("And on 22 September?", history)
+    assert a.usage.get("nudges") and "(Check:" in answer                 # another day: its own query
+    b, _ran = agent_with(monkeypatch, [say("ok")])
+    last = b.prompt("The CPU of srv-amer-002 yesterday.", history)[-1]["content"]
+    assert last.endswith("The CPU of srv-amer-002 yesterday.")          # a new question, not a completion

@@ -844,6 +844,23 @@ HOW_MANY = re.compile(r"\b(how many|how much|combien|quel(?:le)? (?:nombre|quant
 NONE_SAID = re.compile(r"\b(no|none|zero|nothing|aucun\w*|z[ée]ro|pas de|rien)\b", re.I)
 
 
+def adds_to(question: str, before: str) -> bool:
+    """The question names a day, a period or a value the previous one did not ("And on 22 September?",
+    "The CPU of srv-amer-002 yesterday."): its answer needs its own query."""
+    if not before:
+        return False
+    from supagent.knowledge.period import PERIOD_WORDS, days_named
+    from supagent.knowledge.resolve import VALUE_TOKEN
+
+    today = now().date()
+    if set(days_named(question, today)) - set(days_named(before, today)):
+        return True
+    said_before = {w.lower() for w in PERIOD_WORDS.findall(before)}
+    if {w.lower() for w in PERIOD_WORDS.findall(question)} - said_before:
+        return True
+    return bool(set(VALUE_TOKEN.findall(question or "")) - set(VALUE_TOKEN.findall(before or "")))
+
+
 def without_extrapolation(answer: str, unknown: list[str]) -> tuple[str, list[str]]:
     """After the check was given: the lines that continue a list up to a name no result gave are taken out
     (unless most of the answer would go); the other made-up numbers and names stay marked."""
@@ -1066,6 +1083,7 @@ class Agent:
         self.scope: Any = None                   # the databases, charts and dashboards of the question
         self.places: dict = {}                   # values of the question in several kinds of data
         self.follow_up = False                   # the question refers to the chat (its results may answer it)
+        self.asks_new = False                    # a follow-up with another day, value or period
         self.max_steps = int(settings.get("agent.max_steps"))
 
     def close(self) -> None:
@@ -1241,11 +1259,14 @@ class Agent:
         # question), or completes the previous question after an answer ("The failed jobs.", "Only PROD.")
         answered = bool(before) and bool(said) and asks_back(said) and not question.strip().endswith("?") and \
             len(question.split()) <= REPLY_WORDS
-        completes = bool(before) and bool(said) and not answered and len(question.split()) <= FRAGMENT_WORDS and \
-            bool(FRAGMENT.match(question or ""))
+        adds = adds_to(question, before)               # "And on 22 September?": another day, value or period
+        completes = bool(before) and bool(said) and not answered and not adds and \
+            len(question.split()) <= FRAGMENT_WORDS and bool(FRAGMENT.match(question or ""))
         replied = answered or completes
         follow = bool(before) and (refers_back(question) or replied)
-        self.follow_up = follow
+        # the chat's results may answer it only when it asks nothing new (no other day, value or period)
+        self.follow_up = answered or (follow and not adds)
+        self.asks_new = bool(before) and adds
         self.wants_saved_chart = bool(SAVED_CHART_ASK.search(f"{before}\n{question}" if follow else question or ""))
         # "what charts are in it?": the tools, instructions and checks of the question it refers to, too
         self.intent_text = f"{before}\n{question}" if follow else question
@@ -1387,6 +1408,9 @@ class Agent:
                     if any(t.get("full") for t in trace):
                         answer = trim_tables(answer)   # every row is in the page's result view
                 note = unsupported_note(answer, trace) if nudged else ""
+                if nudged and not note and self.asks_new and _has_data(answer) and \
+                        not {t.get("called") or t["tool"] for t in trace if t.get("status") == "done"} & set(QUERY_TOOLS):
+                    note = UNSUPPORTED_NOTE            # "And on 22 September?" answered with the chat's numbers
                 if unknown:                            # a list continued past the results: that line goes
                     answer, unknown = without_extrapolation(answer, unknown)
                 if unknown:                            # still there after asking: marked

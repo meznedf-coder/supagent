@@ -1,5 +1,13 @@
 # Changes
 
+## 0.5.2 (2026-09-30)
+
+* A short follow-up that asks for something new ("And on 22 September?", "The CPU of srv-amer-002
+  yesterday.") is no longer read as completing the previous question, nor answered from the chat's
+  results without a query: 0.5.1 could answer "And on 22 September?" with the number of the 23rd,
+  unmarked. Such an answer, still without a query after the reminder, is marked.
+* "database 4" names a database; a bare "base 4" no longer does.
+
 ## 0.5.1 (2026-09-30)
 
 Checks that run **before** a query or a saved chart, instead of after the answer (a model told

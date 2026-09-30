@@ -34,7 +34,7 @@ GENERIC = {"prometheus", "mimir", "opensearch", "elasticsearch", "osagg", "proma
 DB_WORDS = {"database", "databases", "db", "cluster", "clusters", "connection", "prometheus", "mimir", "opensearch",
             "elasticsearch", "elastic", "replica", "federation"}
 NEAR = 2                      # words between a name's word and a word for a database
-DB_ID = re.compile(r"\b(?:database|db|base de donn[ée]es|base)\s*(?:id\s*)?#?\s*(\d{1,6})\b", re.I)
+DB_ID = re.compile(r"\b(?:database|db|base de donn[ée]es)\s*(?:id\s*)?#?\s*(\d{1,6})\b", re.I)
 CHART_ID = re.compile(r"\b(?:chart|graph|graphique|slice)\s*(?:id\s*)?(?:#|n[°o]\.?\s*)?(\d{1,7})\b", re.I)
 DASH_ID = re.compile(r"\b(?:dashboard|tableau de bord)\s*(?:id\s*)?(?:#|n[°o]\.?\s*)?(\d{1,7})\b", re.I)
 DASH_URL = re.compile(r"/superset/dashboard/([\w-]+)")
