@@ -84,7 +84,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.5.2-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.5.3-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -505,6 +505,13 @@ While it answers, the agent:
   `{"column": "ENVIRONMENT_TYPE", "op": "!=", "value": "UAT"}`); sent again unchanged, it runs and the
   answer is marked (unless the question asks for the rule's value). In the lab the model ignored the
   rule even after being told once; a query refused before it runs is always written again;
+* **adds no condition of its own**: every condition of a query (a status, an environment, a threshold,
+  a chart filter) must come from what was said: the question and the chat, the team's rules and words,
+  the memory, the documents and learned answers found, the formulas of the instructions, or the rows an
+  earlier query of the same answer gave. "Late" jobs counted among the successful ones only, or "over 45
+  minutes" read from the 60-minute bucket, are sent back before they run (once per condition); kept
+  anyway, the answer says which condition nobody asked for. Open questions (what is happening, why) are
+  not checked: the agent chooses what to look at;
 * **counts events, not samples**: `COUNT(*)` on a counter of a metrics database (requests, errors,
   jobs) is sent back once with `SUM(increase)`;
 * **queries the question's period**: a question with a date or a period needs queries on the time of
@@ -521,7 +528,11 @@ While it answers, the agent:
 * saves charts with the **query context** Superset's front end would save (Superset's MCP service
   saves none): their data API, CSV and text reports work;
 * when its calls run out (twice `agent.max_steps` when it builds charts and dashboards), writes what
-  it did and saved and what remains, instead of stopping without an answer;
+  it did and saved and what remains, instead of stopping without an answer; that answer, and the last
+  result shown when the model writes nothing, get the same checks (numbers, rules, conditions);
+* sends back once an answer that **goes round in circles** (a model writing its working notes again
+  and again until its token limit), then cuts it where it repeats and says so; one LLM answer has at
+  most `llm.max_answer_tokens` tokens (8192);
 * has **every number checked** (`agent.check_numbers`): a number of its answer must come from what
   it was given: a value of a result as shown or rounded, a share as a percentage, seconds in
   minutes or hours, bytes in kB to GB, a column's total or average, the total of its first rows, a

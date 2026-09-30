@@ -229,3 +229,8 @@ def test_small_results_come_with_their_column_sums(app):
     assert out["column_sums"] == {"FAILED_JOBS": 7011, "rate": 4.25} and out["rows"] == rows
     one = json.dumps({"success": True, "columns": [{"name": "n"}], "rows": [{"n": 5}]})
     assert compact_for_llm(one, "how many") == one                     # one row: nothing to add
+    cut = json.loads(compact_for_llm(json.dumps({"success": True, "columns": [{"name": "APPLICATION"},
+                                                                               {"name": "FAILED_JOBS"}], "rows": rows[:2],
+                                                 "note": "The SQL's own LIMIT 2 was reached: more rows may match."}),
+                                     "top applications by failed jobs"))
+    assert cut["note"].startswith("The SQL's own LIMIT 2 was reached") and "these 2 rows only" in cut["note"]

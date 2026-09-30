@@ -34,6 +34,7 @@ class ScriptedLLM:
 
     def chat(self, messages, tools=None, max_tokens=None):
         self.seen.append([dict(m) for m in messages])
+        self.caps = [*getattr(self, "caps", []), max_tokens]
         reply = self.replies.pop(0)
         self.last_usage = {"calls": 1, "seconds": 2.0, "prompt_tokens": 1000, "completion_tokens": 20,
                            "cached_tokens": 800}
@@ -128,6 +129,8 @@ def test_an_empty_llm_answer_without_any_result_still_fails(ctx, monkeypatch):
     "The index is batch-jobs. I will now query it for yesterday.",
     "J'ai trouvé la métrique. Je vais lancer la requête.",
     "Next, I'll create the chart in Superset:",
+    "I'll do this in three steps:\n1. Update chart 277 to show 23 September\n2. Add it to the dashboard\n"
+    "3. E-mail a screenshot of the dashboard",                          # a plan and nothing done (lab)
 ])
 def test_an_announced_step_is_sent_back_once(ctx, monkeypatch, text):
     from supagent.agent import announces_action
@@ -149,6 +152,8 @@ def test_an_announced_step_is_sent_back_once(ctx, monkeypatch, text):
     "5 jobs failed. Shall I create a chart?",
     "5 jobs failed. Si vous voulez, je vais créer un graphique.",
     "The query I ran counts the failed jobs: 5.",
+    "Here is what I did:\n1. Updated chart 277 to 23 September\n2. Added it to the dashboard",
+    "Two applications failed:\n- BILLING: 12\n- PAYROLL: 4",
 ])
 def test_offers_and_plain_answers_are_not_announcements(text):
     from supagent.agent import announces_action

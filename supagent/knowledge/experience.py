@@ -566,10 +566,12 @@ def compact_for_llm(content: str, question: str) -> str:
         sums = column_sums(res)
         if not sums:
             return content
-        return json.dumps({**res, "column_sums": sums,
-                           "note": "column_sums: the totals of the numeric columns (right for counts and amounts, "
-                                   "not for rates or averages): quote them, never add numbers yourself"},
-                          ensure_ascii=False, default=str)
+        note = ("column_sums: the totals of the numeric columns (right for counts and amounts, not for rates or "
+                "averages): quote them, never add numbers yourself")
+        if res.get("note"):                             # the SQL's own LIMIT reached: said, and the sums are of these rows
+            note = (f"{res['note']} column_sums: the totals of these {len(rows)} rows only, not of every matching "
+                    "row (and not for rates or averages); never add numbers yourself")
+        return json.dumps({**res, "column_sums": sums, "note": note}, ensure_ascii=False, default=str)
     columns = [c.get("name") if isinstance(c, dict) else c for c in res.get("columns") or []]
     numeric: dict[str, dict[str, float]] = {}
     top: dict[str, list] = {}

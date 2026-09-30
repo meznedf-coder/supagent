@@ -1,5 +1,55 @@
 # Changes
 
+## 0.5.3 (2026-09-30)
+
+**No condition of the model's own.** Every condition of a query (WHERE, FILTER, CASE, HAVING, PromQL
+matchers, a saved chart's filters) must come from what was said: the question and the chat, the team's
+rules and words (glossary), the memory, the documents, notes and learned answers found for the question,
+the formulas of the instructions (`mode <> 'idle'`), or the rows an earlier query of the same answer gave
+(the 3 servers with the most failures, then their CPU). In the lab the model counted "late" jobs among
+the successful ones only (288 instead of 337) and "jobs over 45 minutes" from the 60-minute bucket; both
+passed every check. Now such a query is sent back before it runs, once per condition: sent again, or in
+another query of the same answer, it runs and the answer says so ("this answer counts only STATUS =
+'SUCCESS', a condition the question did not ask for"); a histogram bucket (`le`) sent back comes with the
+reminder that it counts up to its bound only (no estimate between buckets). Words say values in other
+words ("failed" FAILED, "errors" FAILED, "production" PROD, "5xx" '5%', "45 minutes" 2700), the
+dictionary's lists of values are not a source (every status is in them). Not checked: open questions
+(what is happening, why, is it normal), queries that only list values, dates and times (the period
+check), IS NULL, comparisons with 0. Replayed over node3's latest 800 stored answers (1,077 queries with
+conditions, the lab's rule and SLA note in place), it sends back queries in 5 answers: the two invented
+conditions above, position labels used for a calendar date, and 2 answers whose values came from a result
+the replay only had cut to 4,000 characters (the live agent reads it whole). Values an earlier query of
+the answer found count when that query gave figures or was filtered (the applications that failed today),
+not a bare list of values (every status).
+
+**Every way an answer ends gets its checks.** Out of calls, the model's last summary had no check of its
+numbers, rules or conditions, and an empty answer's fallback (the last result) none of the rules and
+conditions: they now get the same notes as any answer.
+
+**An answer going round in circles.** In the lab a long report ended with the model writing its working
+notes again and again ("I will now write the response. One final check: ...") until the server's limit:
+174,000 characters shown to the user after 17 minutes. Such an answer (the same block of lines a third
+time) is now sent back once with the loop cut out of the chat, then cut where it repeats and said; one
+LLM answer has at most `llm.max_answer_tokens` tokens (8192; with `llm.thinking`, four times this; 0: the
+server's own limit). A short first paragraph where the model says it will now write the answer ("Now I
+have all the numbers. Let me write the summary:"), with no figure in it, is left out.
+
+**A LIMIT read as a count.** A query grouped by four columns with LIMIT 100 gave 100 rows, and the answer
+said "100 failed job runs" (358 in fact), unmarked: 100 was "from the query". Such a number (the rows a
+query's own LIMIT let through, written as a count, not asked for, not a value of the result) is now sent
+back once, then marked. And a small result cut by its own LIMIT kept the column totals but lost the note
+saying it was cut (the totals were then read as those of every row): the note stays, and says the totals
+are those of the rows shown only.
+
+**A plan instead of the work.** Asked to change a chart, add it to a dashboard and e-mail it, the model
+answered "I'll do this in three steps: 1. ... 2. ... 3. ..." and called no tool; the check of announced
+steps read only the last sentence. An answer that is only a list of steps it will take is now sent back
+once, like an announced step.
+
+Also: the total of the rows a sentence names ("BILLING and PAYROLL account for 871") is read as from the
+results when it is the sum of those rows in one column of a result (it was marked as made up when the rows
+were not the first ones of the result).
+
 ## 0.5.2 (2026-09-30)
 
 * A short follow-up that asks for something new ("And on 22 September?", "The CPU of srv-amer-002

@@ -48,6 +48,8 @@ SPECS: list[Spec] = [
     Spec("llm.timeout", 900, "int", "Seconds to wait for one LLM answer"),
     Spec("llm.temperature", 0.2, "float", "Sampling temperature"),
     Spec("llm.thinking", False, "bool", "Let reasoning models think before each step (slower)"),
+    Spec("llm.max_answer_tokens", 8192, "int", "Tokens of one LLM answer at most: a model that repeats itself "
+         "stops there (0: the LLM server's own limit; with llm.thinking, four times this)"),
     Spec("llm.extra_headers", {}, "json", "More HTTP headers for the LLM calls (JSON object)"),
     # ---- the agent
     Spec("agent.max_steps", 16, "int", "Tool calls per question at most"),

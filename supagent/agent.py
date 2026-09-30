@@ -47,7 +47,9 @@ tools only show and do what this user may see and do in Superset.
 Rules:
 1. Facts come from the tools: never invent a number, an id or a name, and never add numbers up yourself:
    quote the column_sums of a result, or run a query. Never write a list as a range ("srv-000 to srv-200"):
-   give its count and the names the result showed. Answer in the language of the question, even when
+   give its count and the names the result showed. Count exactly what is asked: every condition of a
+   query comes from the question, the chat, the team's rules and words or the documents given (a status,
+   an environment, a threshold nobody gave is not added). Answer in the language of the question, even when
    the data, the dictionary or earlier answers use another language.
 2. When "Where the data is" is given below, start from it: it names the metrics, indices and fields that
    match the question, with their database id and a SQL to adapt. Use them as they are. Call
@@ -837,9 +839,18 @@ RULES_NUDGE = ("(Check before answering: the team's rule \"{rule}\" applies to t
                "one line. Then "
                "write the whole answer for the user as if for the first time: they see neither the one above nor this check, so never mention it, apologise or say what changed.)")
 RULES_NOTE = "\n\n(Check: the team's rule \"{rule}\" was not applied in this answer's queries.)"
+LOOP_NUDGE = ("(Your answer repeated the same lines again and again: it is cut above. Write the final answer for the "
+              "user now, once: what the results above give, without working notes.)")
+LOOP_NOTE = "\n\n(Cut: the model's text went round in circles from here.)"
 COUNT_NUDGE = ("(Check before answering: the question asks how many or how much, and your answer gives no number "
                "for it (only shares or rates). Give that number from a query (COUNT, SUM, SUM(increase) of a counter), "
                "or say why it cannot be counted.)")
+LIMIT_NUDGE = ("(Check before answering: {n} is the number of rows the LIMIT {n} of your query let through, not a "
+               "count of what the question asks: more rows match. For a total, run a query without that LIMIT "
+               "(COUNT(*), or the sum of the counts). Then write the whole answer for the user as if for the first "
+               "time: they see neither the one above nor this check, so never mention it, apologise or say what "
+               "changed.)")
+LIMIT_NOTE = "\n\n(Check: {n} is where the LIMIT of a query cut its rows, not a count: more rows match.)"
 HOW_MANY = re.compile(r"\b(how many|how much|combien|quel(?:le)? (?:nombre|quantit[ée]))\b", re.I)
 NONE_SAID = re.compile(r"\b(no|none|zero|nothing|aucun\w*|z[ée]ro|pas de|rien)\b", re.I)
 
@@ -912,6 +923,30 @@ def asks_back(answer: str) -> bool:
         not TABLE_WITH_NUMBERS.search(text) and "```" not in text
 
 
+def repeating(text: str) -> int | None:
+    """Where a text starts going round in circles: the same block of three lines (120 characters or more)
+    a third time, as a model writes until its token limit ("I will now write the response. One final
+    check: ..."). The text is kept up to the block's second copy; None when nothing repeats so."""
+    lines = (text or "").splitlines(keepends=True)
+    starts, pos = [], 0
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln)
+    full = [i for i, ln in enumerate(lines) if ln.strip()]
+    seen: dict[tuple, list[int]] = {}
+    for j in range(len(full) - 2):
+        block = tuple(" ".join(lines[full[j + m]].split()) for m in range(3))
+        if sum(map(len, block)) < 120:
+            continue
+        at = seen.setdefault(block, [])
+        if at and j - at[-1] < 3:                      # overlapping copies of one block: the same lines
+            continue
+        at.append(j)
+        if len(at) >= 3:
+            return starts[full[at[1]]]
+    return None
+
+
 def unsupported_answer(answer: str, trace: list[dict]) -> str | None:
     """A reminder when an answer was written without the tools: no tool called at all, or
     results shown (a JSON block, "SQL run", a table of numbers) with no query run. A question
@@ -975,6 +1010,51 @@ def without_apology(answer: str) -> str:
     return text if text.strip() else answer
 
 
+PREAMBLE = re.compile(r"\b(let me|i will|i'll|now i will|now i'll)\s+(now\s+)?(write|present|put together|compose|draft|"
+                      r"format|give|provide|summari[sz]e)\b", re.I)
+
+
+def without_preamble(answer: str) -> str:
+    """The model's words about writing the answer before it ("Now I have all the numbers. Let me write the
+    summary:" and a rule): not for the user. Only a short first paragraph with no figure in it."""
+    text = (answer or "").lstrip()
+    m = re.match(r"(.{1,300}?)(\n\s*\n|\n(?=\s*(?:-{3,}|\*{3,}|_{3,})\s*\n))", text, flags=re.S)
+    if not m or re.search(r"\d", m.group(1)) or not PREAMBLE.search(m.group(1)):
+        return answer
+    rest = re.sub(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*\n", "", text[m.end():].lstrip("\n")).lstrip()
+    return rest if len(rest) >= 80 else answer
+
+
+def limit_as_count(answer: str, trace: list[dict], question: str = "") -> int | None:
+    """The LIMIT of a query that cut its rows (the result has as many rows as the LIMIT), written in the
+    answer as a number of something ("100 failed job runs"): not when the question asked for that many,
+    when a value of the result is that number, or when the answer says rows, the first or at least N."""
+    text = re.sub(r"```.*?```|`[^`\n]*`", " ", answer or "", flags=re.S)
+    asked = {int(float(v)) for v in re.findall(r"\d+", question or "")}
+    for t in trace:
+        if t.get("status") != "done" or (t.get("called") or t["tool"]) != "execute_sql":
+            continue
+        req = (t.get("args") or {}).get("request") or t.get("args") or {}
+        m = re.search(r"\blimit\s+(\d+)\s*;?\s*$", str(req.get("sql") if isinstance(req, dict) else ""), re.I)
+        n = int(m.group(1)) if m else 0
+        result = str(t.get("result") or "")
+        got = re.search(r'"row_count":\s*(\d+)', result)
+        if n < 2 or n in asked or not got or int(got.group(1)) != n:
+            continue
+        rest = re.sub(r'"row_count":\s*\d+|"note":\s*"(?:[^"\\]|\\.)*"', " ", result)
+        if re.search(rf"(?<![\d.]){n}(?![\d.])", rest):
+            continue                                   # a value of the result too
+        for hit in re.finditer(rf"(?<![\w.,]){re.escape(f'{n:,}')}(?!\w|[.,]\d)", text):
+            before = text[max(0, hit.start() - 30):hit.start()].lower()
+            after = text[hit.end():hit.end() + 14].lower()
+            if re.search(r"(first|top|up to|at most|at least|more than|over|limit(ed)?( to| of| at)?|showing|shown|"
+                         r"only|>=?|≥)\W*$", before) or re.search(r"^\W*(rows?|lines?|results?|entries|records?)\b",
+                                                                   after):
+                continue
+            return n
+    return None
+
+
 def announces_action(answer: str) -> str | None:
     """The announced step at the end of an answer that called no tool for it, or None. Offers
     ("if you want, I can...", "let me know...") and questions are not announcements."""
@@ -984,7 +1064,29 @@ def announces_action(answer: str) -> str | None:
                                                             r"si vous|souhaitez|voulez|dites-moi)\b", last, re.I):
         return None
     m = ANNOUNCE.search(last)
-    return last.strip()[:160] if m else None
+    if m:
+        return last.strip()[:160]
+    return announced_plan(answer)
+
+
+PLAN_LEAD = re.compile(r"\b(I(?:'ll| will| am going to|'m going to)|let me|let's|je vais|nous allons)\b[^\n]{0,120}:\s*$", re.I)
+LIST_ITEM = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+\S")
+
+
+def announced_plan(answer: str) -> str | None:
+    """An answer that is only a plan: "I'll do this in three steps:" then the list of steps, and nothing
+    done (the model wrote what it would do instead of calling the tools). Its first line, or None."""
+    lines = [ln for ln in (answer or "").strip().splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    items = 0
+    while lines and LIST_ITEM.match(lines[-1]):
+        items += 1
+        lines.pop()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    lead = lines[-1].strip() if lines else ""
+    return lead[:160] if items >= 2 and PLAN_LEAD.search(lead) else None
 
 
 # the answer says all is well while a check or a query of this answer could not run
@@ -1083,6 +1185,9 @@ class Agent:
         self.scope: Any = None                   # the databases, charts and dashboards of the question
         self.places: dict = {}                   # values of the question in several kinds of data
         self.follow_up = False                   # the question refers to the chat (its results may answer it)
+        self.support: Any = None                 # what was said (the conditions of the queries come from it)
+        self.open_question = False               # "what is happening", "why": the agent chooses what to look at
+        self.people_words = ""
         self.asks_new = False                    # a follow-up with another day, value or period
         self.max_steps = int(settings.get("agent.max_steps"))
 
@@ -1175,6 +1280,7 @@ class Agent:
             text += glossary_block(question, shown)   # the team's words, before where the data is
         except Exception:  # pylint: disable=broad-except
             log.warning("supagent: the team's words: not given", exc_info=True)
+        self.people_words = text                        # the memory, the rules, the glossary: what people said
         try:
             from supagent.knowledge.resolve import where_block
 
@@ -1310,6 +1416,16 @@ class Agent:
             asked = f"{before}\n(About your answer above: {question}) Answer my question again with this."
         messages.append({"role": "user", "content": (blocks + "\n\n" if blocks else "") +
                          f"(Now: {now():%A %Y-%m-%d %H:%M}.{hint})\n{asked}"})
+        try:                                            # what was said: the conditions of the queries come from it
+            from supagent.knowledge.conditions import build
+
+            people = [question, self.intent_text, getattr(self, "people_words", "")] + [
+                str(h.get("content") or "") for h in recent if h.get("role") == "user"]
+            self.support = build(messages, people)
+        except Exception:  # pylint: disable=broad-except
+            log.warning("supagent: what was said: not read", exc_info=True)
+            self.support = None
+        self.open_question = bool(intents(self.intent_text) & {"status", "investigation", "usual"})
         return messages
 
     def ask(self, question: str, history: list[dict] | None = None) -> tuple[str, list[dict]]:
@@ -1320,9 +1436,9 @@ class Agent:
         charts: list[str] = []
         emailed: list[str] = []
         messages = self.prompt(question, history)
-        asked_at = len(messages)                       # what the LLM was given, before its own words
+        asked_at = self._asked_at = len(messages)      # what the LLM was given, before its own words
         trace: list[dict] = []
-        nudged = announced = numbers_asked = rules_asked = count_asked = False
+        nudged = announced = numbers_asked = rules_asked = count_asked = looped = limit_asked = False
         done: set[str] = set()                         # identical successful calls: not run twice
         saved_calls: set[str] = set()                   # identical saving calls: not run again either
         self.usage = {}
@@ -1335,13 +1451,13 @@ class Agent:
         for _ in range(steps):
             self._check_stop()
             try:
-                msg = self.llm.chat(messages, tools=specs)
+                msg = self.llm.chat(messages, tools=specs, max_tokens=self._answer_tokens())
             except EmptyAnswer:
                 add_usage(self.usage, self.llm.last_usage)
                 fallback = self._empty_fallback(trace)
                 if fallback is None:
                     raise
-                return fallback, trace
+                return fallback + self._marks(fallback, trace), trace
             except LLMError as ex:
                 if not BAD_TOOL_CALL.search(str(ex)) or unreadable >= 2:
                     if unreadable and trace:           # it did things before: say what, not an error
@@ -1356,6 +1472,16 @@ class Agent:
             calls = msg.get("tool_calls") or []
             if not calls:
                 answer = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S).strip()
+                cut = repeating(answer)
+                if cut is not None and not looped:     # once: an answer going round in circles
+                    looped = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (repeats itself, %d characters)", len(answer))
+                    messages[-1]["content"] = answer[:cut]
+                    messages.append({"role": "user", "content": LOOP_NUDGE})
+                    continue
+                if cut is not None:                    # again: cut there, and said
+                    answer = answer[:cut].rstrip()
                 nudge = None if nudged else unsupported_answer(answer, trace)
                 if nudge and self.follow_up and settings.get("agent.check_numbers") and \
                         not self._ungrounded(answer, messages[:asked_at]):
@@ -1389,14 +1515,22 @@ class Agent:
                     log.info("supagent: answer sent back (numbers not in the results): %s", unknown)
                     messages.append({"role": "user", "content": NUMBERS_NUDGE.format(numbers=", ".join(unknown[:12]))})
                     continue
+                read_as_count = limit_as_count(answer, trace, question)
+                if read_as_count and not limit_asked:  # once: the rows a LIMIT let through read as a count
+                    limit_asked = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (LIMIT %s read as a count)", read_as_count)
+                    messages.append({"role": "user", "content": LIMIT_NUDGE.format(n=read_as_count)})
+                    continue
                 if not count_asked and missing_count(question, answer):     # once: "how many" answered with shares
                     count_asked = True
                     self.usage["nudges"] = self.usage.get("nudges", 0) + 1
                     log.info("supagent: answer sent back (no count for how many)")
                     messages.append({"role": "user", "content": COUNT_NUDGE})
                     continue
-                if nudged or announced or numbers_asked or rules_asked or count_asked:
+                if nudged or announced or numbers_asked or rules_asked or count_asked or looped or limit_asked:
                     answer = without_apology(answer)   # written again after a check the user never saw
+                answer = without_preamble(answer)
                 missing = [c for c in charts if c.splitlines()[-1].strip() not in answer]
                 if missing:
                     answer += "".join(f"\n\n```\n{c}\n```" for c in missing)
@@ -1417,6 +1551,11 @@ class Agent:
                     note += NUMBERS_NOTE.format(numbers=", ".join(unknown[:12]))
                 if missed:
                     note += RULES_NOTE.format(rule=missed[0][:300])
+                if read_as_count:                      # still there after asking: marked
+                    note += LIMIT_NOTE.format(n=read_as_count)
+                note += self._marks(answer, trace, conditions_only=True)
+                if cut is not None:
+                    note += LOOP_NOTE
                 return (answer + claims_check(answer, trace) + honesty_note(answer, trace) + note +
                         self._other_reading(answer, trace)), trace
             for tc in calls:
@@ -1484,6 +1623,9 @@ class Agent:
                             done.add(call_key)
                 if called in RESULT_TOOLS and step["status"] == "done" and content is not REPEAT_NOTE:
                     step["full"] = content               # for the page, never sent to the model whole
+                    if getattr(self, "support", None) is not None:   # the 3 servers found: the next queries
+                        req = args.get("request") if isinstance(args.get("request"), dict) else args
+                        self.support.add_result(content, str(req.get("sql") or ""))   # may use them
                     if called == "execute_sql":
                         from supagent.knowledge.experience import compact_for_llm
 
@@ -1499,9 +1641,10 @@ class Agent:
     def _out_of_steps(self, messages: list[dict], trace: list[dict]) -> str:
         """No calls left: the LLM says, without tools, what was done (what is saved, with its links) and
         what remains, instead of an answer that only says it stopped."""
+        given = self._given(messages)
         messages.append({"role": "user", "content": OUT_OF_STEPS})
         try:
-            msg = self.llm.chat(messages, tools=None)
+            msg = self.llm.chat(messages, tools=None, max_tokens=self._answer_tokens())
             add_usage(self.usage, self.llm.last_usage)
             text = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S).strip()
             # a call written as text instead of a summary ("<tool_call><function=execute_sql>..."): not shown
@@ -1509,14 +1652,58 @@ class Agent:
         except Exception:  # pylint: disable=broad-except
             log.warning("supagent: the summary after the last call failed", exc_info=True)
             text = ""
+        cut = repeating(text)
+        if cut is not None:
+            text = text[:cut].rstrip()
+        text = without_preamble(text)
         if not text:
             got = self._empty_fallback(trace)          # what the queries gave, rather than nothing
             if got:
-                return got + "\n\n(Stopped: the tool calls of one answer were used up; ask a narrower question.)"
+                return got + self._marks(got, trace) + ("\n\n(Stopped: the tool calls of one answer were used up; "
+                                                         "ask a narrower question.)")
             return "(stopped after too many tool calls: ask a narrower question)"
         if self.rich:
             text = local_links(text)
-        return text + claims_check(text, trace) + "\n\n(Stopped: the tool calls of one answer were used up.)"
+        return (text + claims_check(text, trace) + self._marks(text, trace, given=given) +
+                (LOOP_NOTE if cut is not None else "") + "\n\n(Stopped: the tool calls of one answer were used up.)")
+
+    def _answer_tokens(self) -> int | None:
+        """The most tokens one LLM answer may have (llm.max_answer_tokens; with thinking, four times as
+        many: the reasoning counts too): a model repeating itself stops there."""
+        try:
+            cap = int(settings.get("llm.max_answer_tokens") or 0)
+        except Exception:  # pylint: disable=broad-except
+            return None
+        if cap and getattr(getattr(self.llm, "cfg", None), "thinking", False):
+            cap *= 4
+        return cap or None
+
+    def _given(self, messages: list[dict]) -> list[dict]:
+        """What the LLM was given for this answer: the prompt, the tool results and calls (not its own words)."""
+        at = getattr(self, "_asked_at", len(messages))
+        return messages[:at] + [m if m["role"] == "tool" else {"role": "assistant", "tool_calls": m["tool_calls"]}
+                                for m in messages[at:] if m["role"] == "tool" or m.get("tool_calls")]
+
+    def _marks(self, answer: str, trace: list[dict], given: list[dict] | None = None,
+               conditions_only: bool = False) -> str:
+        """The notes an answer gets whatever way it ends (an answer, the calls used up, no text): numbers
+        nothing supports (when `given`), a team rule not applied, a condition nobody asked for."""
+        note = ""
+        if not conditions_only:
+            unknown = self._ungrounded(answer, given) if given is not None else []
+            if unknown:
+                note += NUMBERS_NOTE.format(numbers=", ".join(unknown[:12]))
+            missed = self._unapplied(getattr(self, "question", ""), trace)
+            if missed:
+                note += RULES_NOTE.format(rule=missed[0][:300])
+            read_as_count = limit_as_count(answer, trace, getattr(self, "question", ""))
+            if read_as_count:
+                note += LIMIT_NOTE.format(n=read_as_count)
+        if not getattr(self, "open_question", False):
+            from supagent.knowledge.conditions import note as condition_note
+
+            note += condition_note(getattr(self, "support", None), trace)
+        return note
 
     def _refusal(self, name: str, args: dict) -> str | None:
         """Why this call is sent back before it runs (once), every reason at once: it reads a table in
@@ -1527,9 +1714,13 @@ class Agent:
             from supagent.knowledge.period import refusal as period_refusal
             from supagent.knowledge.scope import refusal
 
+            from supagent.knowledge.conditions import refusal as condition_refusal
+
             question = getattr(self, "intent_text", None) or getattr(self, "question", "")
             reasons = [refusal(self.scope, name, args) if self.scope is not None else None,
-                       period_refusal(question, name, args), self._counted_samples(name, args)]
+                       period_refusal(question, name, args), self._counted_samples(name, args),
+                       None if getattr(self, "open_question", False) else
+                       condition_refusal(getattr(self, "support", None), name, args)]
             if name in ("generate_chart", "update_chart"):
                 req = args.get("request", args)
                 config = req.get("config") if isinstance(req, dict) else None

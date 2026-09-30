@@ -215,3 +215,12 @@ def test_a_result_cut_by_the_sqls_own_limit_says_so():
     res = {"success": True, "columns": ["ERROR", "n"], "rows": rows, "note": "The SQL's own LIMIT 100 was reached"}
     out = json.loads(compact_for_llm(json.dumps(res), "Show me the errors"))
     assert "The SQL's own LIMIT 100 was reached" in out["note"]
+
+
+def test_the_total_of_the_rows_a_sentence_names_is_from_the_results():
+    rows = {"rows": [{"APPLICATION": "BILLING", "failed": 616}, {"APPLICATION": "ORDERS", "failed": 285},
+                     {"APPLICATION": "PAYROLL", "failed": 255}, {"APPLICATION": "LEDGER", "failed": 100}]}
+    msgs = given("Failed jobs per application?", rows)
+    assert ungrounded("BILLING and PAYROLL, the critical ones, account for 871 of them.", msgs) == []   # rows 1 + 3
+    assert ungrounded("BILLING and PAYROLL account for 950 of them.", msgs) == ["950"]
+    assert ungrounded("The critical ones account for 871 of them.", msgs) == ["871"]     # which rows: not said

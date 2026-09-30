@@ -267,8 +267,12 @@ def ungrounded(answer: str, messages: list[dict]) -> list[str]:
         shown = sorted(v for text, readings in candidates if (text, readings) not in kept and share.search(text)
                        for v, _t in readings)
         rests = sorted({100 - v for v in shown if 0 <= v <= 100} | {1 - v for v in shown if 0 <= v <= 1})
-        out += [text for text, readings in kept
+        kept = [(text, readings) for text, readings in kept
                 if not (share.search(text) and any(_close(v, tol, rests) for v, tol in readings))]
+        if kept:                                        # "BILLING and PAYROLL: 871" = the sum of the rows it names
+            tables = [t for m in messages if m.get("role") == "tool" for t in _tables(m.get("content"))]
+            kept = [(text, readings) for text, readings in kept if not _named_sum(text, readings, answer, tables)]
+        out += [text for text, _readings in kept]
     names = answer_names(answer)
     if names:
         given = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or "")
@@ -295,6 +299,46 @@ def drop_extrapolated(answer: str, names: list[str]) -> tuple[str, list[str]]:
         kept.append(line)
     left = [n for n in names if n not in dropped or any(n.lower() in ln.lower() for ln in kept)]
     return ("\n".join(kept), left) if dropped else (answer, names)
+
+
+def _tables(content: Any) -> list[list[dict]]:
+    """The tables of rows (dicts) of a tool result."""
+    try:
+        data = json.loads(content) if isinstance(content, str) else content
+    except (TypeError, ValueError):
+        return []
+    out: list[list[dict]] = []
+
+    def walk(v: Any) -> None:
+        if isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list) and v:
+            if all(isinstance(r, dict) for r in v):
+                out.append(v[:MAX_ROWS])
+            for x in v[:50]:
+                if isinstance(x, (dict, list)):
+                    walk(x)
+
+    walk(data)
+    return out
+
+
+def _named_sum(text: str, readings: list[tuple[float, float]], answer: str, tables: list[list[dict]]) -> bool:
+    """The number is the total of the rows its sentence names (two or more), in one column of a result."""
+    sentence = next((s for s in re.split(r"(?<=[.!?])\s+|\n", answer or "") if text in s), "")
+    if not sentence:
+        return False
+    for rows in tables:
+        named = [r for r in rows if any(isinstance(v, str) and len(v) >= 2 and
+                                        re.search(rf"(?<![\w-]){re.escape(v)}(?![\w-])", sentence) for v in r.values())]
+        if len(named) < 2:
+            continue
+        for col in named[0]:
+            vals = [_num(r.get(col)) for r in named]
+            if all(v is not None for v in vals) and any(abs(sum(vals) - v) <= max(t, 1e-9) for v, t in readings):
+                return True
+    return False
 
 
 def _given_range(name: str, given: str) -> bool:
