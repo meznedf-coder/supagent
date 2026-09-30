@@ -69,29 +69,77 @@ def test_the_rules_come_again_next_to_the_question(ruled):
     assert RULE in blocks
 
 
-def test_an_answer_that_skipped_the_rule_is_sent_back_once_then_marked(ruled, monkeypatch):
+def ROWS(name, args):  # noqa: N802
+    return json.dumps({"success": True, "columns": [{"name": "n"}], "rows": [{"n": 12}]})
+WITHOUT = {"request": {"database_id": 1, "sql": 'SELECT COUNT(*) FROM "jobs" WHERE "STATUS" = \'FAILED\''}}
+WITH = {"request": {"database_id": 1, "sql": 'SELECT COUNT(*) FROM "jobs" WHERE "STATUS" = \'FAILED\' AND '
+                                             '"ENVIRONMENT_TYPE" <> \'UAT\''}}
+
+
+def test_a_query_without_the_rule_is_sent_back_before_it_runs(ruled, monkeypatch):
     from test_agent_loop import agent_with, call, say
 
-    rows = lambda name, args: json.dumps({"success": True, "columns": [{"name": "n"}], "rows": [{"n": 12}]})  # noqa
-    a, ran = agent_with(monkeypatch, [
-        call("execute_sql", {"request": {"database_id": 1, "sql": 'SELECT COUNT(*) FROM "jobs" WHERE "STATUS" = '
-                                                                  "'FAILED'"}}),
-        say("12 jobs failed."),
-        call("execute_sql", {"request": {"database_id": 1, "sql": 'SELECT COUNT(*) FROM "jobs" WHERE "STATUS" = '
-                                                                  "'FAILED' AND \"ENVIRONMENT_TYPE\" <> 'UAT'"}}),
-        say("Without UAT, 12 jobs failed."),
-    ], results=rows)
-    answer, _trace = a.ask("How many jobs failed yesterday?")
-    assert answer == "Without UAT, 12 jobs failed." and len(ran) == 2
-    assert any("the team's rule" in (m["content"] or "") for m in a.llm.seen[-1] if m["role"] == "user")
+    a, ran = agent_with(monkeypatch, [call("execute_sql", WITHOUT), call("execute_sql", WITH),
+                                      say("Without UAT, 12 jobs failed.")], results=ROWS)
+    answer, trace = a.ask("How many jobs failed?")
+    assert answer == "Without UAT, 12 jobs failed." and ran == [("execute_sql", WITH)]      # the first never ran
+    assert trace[0]["status"] == "error" and "not run: team rule" in trace[0]["result"]
+    assert "\"ENVIRONMENT_TYPE\" <> 'UAT' in the WHERE" in trace[0]["result"]            # what to add
+    assert a.usage["nudges"] == 1
 
-    b, _ran = agent_with(monkeypatch, [
-        call("execute_sql", {"request": {"database_id": 1, "sql": 'SELECT COUNT(*) FROM "jobs"'}}),
-        say("12 jobs."),
-        say("12 jobs, all environments."),
-    ], results=rows)
-    answer, _trace = b.ask("How many jobs ran yesterday?")
+
+def test_a_query_sent_again_unchanged_runs_and_the_answer_is_marked(ruled, monkeypatch):
+    from test_agent_loop import agent_with, call, say
+
+    b, ran = agent_with(monkeypatch, [
+        call("execute_sql", WITHOUT),
+        call("execute_sql", WITHOUT),          # sent again unchanged: the question may ask for it
+        say("12 jobs failed."),
+        say("12 jobs failed, all environments."),
+    ], results=ROWS)
+    answer, _trace = b.ask("How many jobs failed?")
+    assert ran == [("execute_sql", WITHOUT)]
     assert answer.endswith(f'(Check: the team\'s rule "{RULE}" was not applied in this answer\'s queries.)')
+
+
+def test_a_question_that_asks_for_the_rules_value_is_not_sent_back(ruled, monkeypatch):
+    from test_agent_loop import agent_with, call, say
+
+    c, ran = agent_with(monkeypatch, [call("execute_sql", WITHOUT), say("12 jobs failed in all, UAT included.")],
+                        results=ROWS)
+    answer, trace = c.ask("How many jobs failed, UAT included?")
+    assert ran == [("execute_sql", WITHOUT)] and trace[0]["status"] == "done" and "(Check:" not in answer
+
+
+def test_the_example_follows_the_rule_and_the_tool(ruled):
+    from supagent.knowledge.rulecheck import _detail, _suggestion, call_refusal
+
+    d = _detail({"text": RULE}, {"ENVIRONMENT_TYPE"}, ["UAT"], {"jobs"})
+    assert (d["field"], d["value"], d["exclude"]) == ("ENVIRONMENT_TYPE", "UAT", True)
+    assert _suggestion(d, "promql_query") == '{ENVIRONMENT_TYPE!="UAT"} in the selector'
+    assert json.loads(_suggestion(d, "generate_chart").split(" in the filters")[0]) == {
+        "column": "ENVIRONMENT_TYPE", "op": "!=", "value": "UAT"}
+    only = _detail({"text": "Only count PROD jobs (ENVIRONMENT_TYPE = 'PROD'), never DEV."}, {"ENVIRONMENT_TYPE"},
+                   ["PROD"], {"jobs"})
+    assert (only["value"], only["exclude"]) == ("PROD", False)
+    assert call_refusal("How many jobs failed?", "execute_sql", WITH) is None
+    assert call_refusal("How many jobs failed?", "list_charts", {}) is None
+
+
+def test_a_chart_on_the_table_needs_the_rules_filter(ruled):
+    from supagent.knowledge.rulecheck import chart_refusal
+
+    table = types.SimpleNamespace(table_name="jobs", sql=None)
+    query = types.SimpleNamespace(table_name="failed", sql='SELECT * FROM "jobs"')
+    bar = {"chart_type": "xy", "x": {"name": "APPLICATION"}, "y": [{"name": "count", "saved_metric": True}]}
+    refused = chart_refusal("Chart of the failed jobs per application", table, bar)
+    assert refused and '{"column": "ENVIRONMENT_TYPE", "op": "!=", "value": "UAT"}' in refused
+    filtered = dict(bar, filters=[{"column": "ENVIRONMENT_TYPE", "op": "!=", "value": "UAT"}])
+    per_env = dict(bar, group_by=[{"name": "ENVIRONMENT_TYPE"}])
+    assert chart_refusal("Chart of the failed jobs per application", table, filtered) is None
+    assert chart_refusal("Chart of the failed jobs per environment", table, per_env) is None     # each one shown
+    assert chart_refusal("Chart of the failed jobs per application", query, bar) is None         # its SQL decides
+    assert chart_refusal("Chart of the failed UAT jobs per application", table, bar) is None     # asked for UAT
 
 
 def test_a_count_of_zero_over_a_value_that_does_not_exist_says_so(ruled):
@@ -122,3 +170,26 @@ def test_a_rule_that_defines_a_value_never_sends_an_answer_back(ruled):
     q = "How many jobs failed yesterday?"
     applied = _step('SELECT COUNT(*) FROM "jobs" WHERE "STATUS" = \'FAILED\' AND "ENVIRONMENT_TYPE" <> \'UAT\'')
     assert unapplied(q, [applied]) == []                              # the definition is not a filter to apply
+
+
+def test_the_metrics_of_a_promql_expression():
+    from supagent.knowledge.rulecheck import promql_metrics
+
+    assert promql_metrics("avg(fed_temperature)") == {"fed_temperature"}
+    assert promql_metrics('sum by (application) (rate(http_requests_total{code=~"5.."}[1d])) / '
+                          "sum by (application) (rate(http_requests_total[1d])) * 100") == {"http_requests_total"}
+    assert promql_metrics("up == 0 or on(instance) node_load1 > 4") == {"up", "node_load1"}
+    assert promql_metrics("histogram_quantile(0.95, sum by (le) (rate(job_seconds_bucket[5m])))") == {
+        "job_seconds_bucket"}
+
+
+def test_a_count_over_a_counter_is_sent_back(world):
+    from supagent.knowledge.experience import count_of_counter
+
+    metrics = world["metrics"]
+    sql = ("SELECT node, COUNT(*) FILTER (WHERE mode = 'idle') AS idle FROM \"node_cpu_seconds_total\" "
+           "WHERE ts >= TIMESTAMP '2026-09-23 00:00' GROUP BY node")
+    text = count_of_counter(metrics, sql)
+    assert text and text.startswith("tool error (not run: counter)") and "SUM(increase)" in text
+    assert count_of_counter(metrics, "SELECT node, SUM(increase) FROM \"node_cpu_seconds_total\" GROUP BY node") is None
+    assert count_of_counter(world["jobs"], sql) is None                                 # not a metrics database

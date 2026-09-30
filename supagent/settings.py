@@ -53,6 +53,10 @@ SPECS: list[Spec] = [
     Spec("agent.max_steps", 16, "int", "Tool calls per question at most"),
     Spec("agent.databases", [], "list", "Databases the agent may use (names or ids); empty: the OpenSearch "
          "(osagg) and Prometheus / Mimir (promagg) ones. Superset's database access still applies"),
+    Spec("agent.preferred_databases", [], "list", "When the same index or metric is in several databases: the ones "
+         "to use first (names or ids, in order), unless the question names another database or is about a chart "
+         "or a dashboard of another one. Empty: the catalog's metrics database, then the database the team's "
+         "charts use for it"),
     Spec("agent.osagg_max_scan_rows", 20000, "int", "OpenSearch (osagg): raw documents one query of the agent may "
          "read when it cannot be pushed down (the connection's own cap applies if lower); above, the query is "
          "refused at once with the reason instead of running for minutes. 0: the connection's cap"),

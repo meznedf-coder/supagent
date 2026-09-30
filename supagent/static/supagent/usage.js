@@ -71,7 +71,7 @@
     at.innerHTML = "";
     [tile("Answers", S.num(a.count), a.count ? "in " + secs(a.avg_seconds) + " on average, 95% under " + secs(a.p95_seconds) : ""),
      tile("Calls per answer", S.num(a.avg_llm_calls) + " LLM, " + S.num(a.avg_tool_calls) + " tools", S.num(a.failed_tool_calls) + " tool calls failed"),
-     tile("Sent back by the checks", S.num(a.sent_back), "no tool, a number or a rule not from the data"),
+     tile("Sent back by the checks", S.num(a.sent_back), "a rule, a period or a database not applied; no tool; a number not from the data"),
      tile("Answers marked", S.num(a.marked), "a check note left in the answer")].forEach(function (x) { at.appendChild(x); });
     drawSeries();
     var common = [

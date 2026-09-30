@@ -141,7 +141,22 @@ def test_a_name_the_results_did_not_give_is_flagged():
                                                                       {"NODE": "srv-emea-004"}]})
     assert ungrounded("They run on srv-amer-000, srv-amer-001 and srv-emea-004.", msgs) == []
     assert ungrounded("From srv-amer-000 through srv-amer-199.", msgs) == ["srv-amer-199"]   # a series continued
-    assert ungrounded("Use the field `srv-x-9` or https://h/srv-q-2, positions W-1 and D-1.", msgs) == []
+    assert ungrounded("See https://h/srv-q-2, positions W-1 and D-1.", msgs) == []
+    # a name in `code` is a claim too: the model wrote the end of a list it never saw
+    assert ungrounded("They run on `srv-amer-000`, `srv-amer-001` ... up to `srv-amer-200`.", msgs) == ["srv-amer-200"]
+    assert ungrounded("```sql\nSELECT * FROM t WHERE node = 'srv-x-9'\n```", msgs) == []       # a code block: no
+
+
+def test_a_big_result_says_how_many_rows_are_empty():
+    from supagent.knowledge.experience import compact_for_llm
+
+    rows = [{"NODE": f"srv-amer-{i:03d}"} for i in range(200)] + [{"NODE": None}]
+    out = json.loads(compact_for_llm(json.dumps({"success": True, "columns": ["NODE"], "rows": rows}),
+                                     "On which servers do the BILLING jobs run?"))
+    assert out["row_count"] == 201 and out["empty_values"] == {"NODE": 1}
+    assert "not a name" in out["note"] and "never guess the names" in out["note"]
+    small = json.loads(compact_for_llm(json.dumps({"success": True, "columns": ["NODE"], "rows": rows[:3]}), "q"))
+    assert "empty_values" not in small
 
 
 def test_out_of_calls_the_answer_says_what_was_done(ctx, monkeypatch):
@@ -170,3 +185,33 @@ def test_an_answer_written_again_never_speaks_of_the_check():
     assert without_apology(text) == "**Summary:** 358 failed jobs."
     assert without_apology("Sorry about that.\n358 failed jobs.") == "358 failed jobs."
     assert without_apology("358 failed jobs. You're right to ask.") == "358 failed jobs. You're right to ask."
+
+
+def test_the_rest_of_a_share_shown_in_the_answer_is_not_made_up():
+    msgs = given("Availability of each HTTP service?", {"rows": [{"app": "A", "error_pct": 1.0}]})
+    assert ungrounded("| A | 1.00 | 99.00 |\n\nA: 1.00% of errors, 99.00% available.", msgs) == []
+    assert ungrounded("A: 99.00% available.", msgs) == ["99.00%"]                  # its base is not shown
+    counts = given("Jobs and servers?", {"rows": [{"jobs": 12}]})
+    assert ungrounded("12 jobs on 88 servers.", counts) == ["88"]                 # not a share
+
+
+def test_converted_values_rounded_twice_and_unit_constants():
+    msgs = given("Peak heap of each application?", {"rows": [{"app": "A", "bytes": 20610467840}]})
+    assert ungrounded("A: 19.20 GiB (1,073,741,824 bytes per GiB).", msgs) == []     # 19.1949 GiB, 2^30
+    assert ungrounded("A: 19.30 GiB.", msgs) == ["19.30"]
+
+
+def test_a_number_said_as_rounded_is_read_as_rounded():
+    msgs = given("Jobs per server?", {"rows": [{"node": "a", "n": 12305}, {"node": "b", "n": 12864}]})
+    assert ungrounded("Roughly 12,300–12,900 jobs per server.", msgs) == []
+    assert ungrounded("12,300 jobs on server a.", msgs) == ["12,300"]          # said as exact: exact
+    assert ungrounded("About 13,500 jobs per server.", msgs) == ["13,500"]      # too far
+
+
+def test_a_result_cut_by_the_sqls_own_limit_says_so():
+    from supagent.knowledge.experience import compact_for_llm
+
+    rows = [{"ERROR": f"E{i}", "n": 1} for i in range(100)]
+    res = {"success": True, "columns": ["ERROR", "n"], "rows": rows, "note": "The SQL's own LIMIT 100 was reached"}
+    out = json.loads(compact_for_llm(json.dumps(res), "Show me the errors"))
+    assert "The SQL's own LIMIT 100 was reached" in out["note"]

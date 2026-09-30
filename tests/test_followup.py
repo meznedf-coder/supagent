@@ -109,7 +109,7 @@ def test_the_agent_sees_what_that_finding_was(ctx, monkeypatch):
                       {"role": "assistant", "content": "x" * 5000, "queries": queries_of([FINDING])}])
     assert len(next(m["content"] for m in c.llm.seen[0] if m["role"] == "assistant")) == HISTORY_CHARS
     assert PROMQL in c.llm.seen[0][-1]["content"]
-    d, _ = agent_with(monkeypatch, [say("ok"), say("ok")])
+    d, _ = agent_with(monkeypatch, [say("ok"), say("ok"), say("ok")])      # (no count: asked for one)
     d.ask("How many jobs failed?", [])                                # a first question: nothing added
     assert d.llm.seen[0][-1]["content"].endswith("How many jobs failed?") and "computed from" not in d.llm.seen[0][-1]["content"]
 

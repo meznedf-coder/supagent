@@ -573,8 +573,12 @@ def compact_for_llm(content: str, question: str) -> str:
     columns = [c.get("name") if isinstance(c, dict) else c for c in res.get("columns") or []]
     numeric: dict[str, dict[str, float]] = {}
     top: dict[str, list] = {}
+    empty: dict[str, int] = {}
     for c in columns:
         vals = [r.get(c) for r in rows if isinstance(r, dict)]
+        blank = sum(1 for v in vals if v is None or (isinstance(v, str) and not v.strip()))
+        if blank:
+            empty[c] = blank
         nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if nums and len(nums) >= len(vals) * 0.8:
             numeric[c] = {"min": min(nums), "max": max(nums), "avg": round(sum(nums) / len(nums), 4),
@@ -585,12 +589,19 @@ def compact_for_llm(content: str, question: str) -> str:
                 counts[str(v)] = counts.get(str(v), 0) + 1
             if len(counts) <= 1000:
                 top[c] = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
-    return json.dumps({"success": True, "database": res.get("database"), "row_count": len(rows),
-                       "truncated": res.get("truncated"), "columns": columns, "first_rows": rows[:FIRST_ROWS],
-                       "numeric_columns": numeric, "top_values": top,
-                       "note": f"only the first {FIRST_ROWS} of {len(rows)} rows are shown to you; the user sees "
-                               "every row under your answer (table, chart, CSV, Excel): summarise, do not list them"},
-                      ensure_ascii=False, default=str)
+    out = {"success": True, "database": res.get("database"), "row_count": len(rows),
+           "truncated": res.get("truncated"), "columns": columns, "first_rows": rows[:FIRST_ROWS],
+           "numeric_columns": numeric, "top_values": top,
+           "note": f"only the first {FIRST_ROWS} of {len(rows)} rows are shown to you; the user sees "
+                   "every row under your answer (table, chart, CSV, Excel): summarise, do not list them, and never "
+                   "guess the names of the rows you do not see"}
+    if empty:
+        out["empty_values"] = empty
+        out["note"] += ("; empty_values: rows where that column is empty (null): they are not a name, say so when "
+                        "you count them (e.g. 200 servers and 1 row without a server)")
+    if res.get("note"):                                 # the SQL's own LIMIT reached...
+        out["note"] += ". " + str(res["note"])
+    return json.dumps(out, ensure_ascii=False, default=str)
 
 
 BIG_SERIES = 50_000
@@ -633,6 +644,41 @@ def _counter_misuse(tree: Any, names: set[str], src: Any) -> str | None:
             "started), so SUM(value) or AVG(value) means nothing. Use the column rate (per second, e.g. "
             "SUM(rate) for a total rate) or increase (count over each time bucket, e.g. SUM(increase))"
             + (f". The catalog's formulas for it: {hint}" if hint else "") + ".")
+
+
+def count_of_counter(database: Any, sql: str) -> str | None:
+    """COUNT(...) over a counter, histogram or summary of a metrics database counts samples (one per series
+    and scrape), not the requests, jobs or errors the question counts: the reason, or None."""
+    if getattr(database, "backend", None) != "promagg" or not sql or "count" not in sql.lower():
+        return None
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if tree.find(exp.Count) is None:
+        return None
+    ctes = {c.alias_or_name for c in tree.find_all(exp.CTE)}
+    names = {t.name for t in tree.find_all(exp.Table) if t.name and t.name not in ctes}
+    if not names:
+        return None
+    from supagent.models import KObject, Source
+
+    src = db.session.query(Source).filter_by(database_id=database.id).one_or_none()
+    kinds = {} if src is None else {o.name: o.metric_type for o in db.session.query(KObject).filter(
+        KObject.source_id == src.id, KObject.kind == "metric", KObject.name.in_(names))}
+    counters = sorted(n for n in names if kinds.get(n) in ("counter", "histogram", "summary")
+                      or (kinds.get(n) in (None, "unknown") and n.endswith(COUNTER_SUFFIXES)))
+    if not counters:
+        return None
+    name = counters[0]
+    return (f"tool error (not run: counter): COUNT on {name} counts samples (one per series and scrape interval), "
+            "not the requests, jobs or errors it counts. For a number of events over the period use SUM(increase) "
+            "(with FILTER (WHERE ...) for a part, e.g. the 5xx codes), for a rate SUM(rate); a histogram's events "
+            "are its _count metric's increase. If you do want the number of samples (which series have data), "
+            "send this same call again.")
 
 
 def guard_sql(database: Any, sql: str) -> str | None:

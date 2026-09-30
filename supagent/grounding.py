@@ -36,6 +36,9 @@ SCALES = {"k": 1e3, "K": 1e3, "thousand": 1e3, "millier": 1e3, "milliers": 1e3, 
 CONVERSIONS = (1.0, 100.0, 1 / 60, 1 / 3600, 1 / 86400, 1e-3, 1e-6, 1e-9, 1 / 1024, 1 / 1024 ** 2,
                1 / 1024 ** 3)             # as is, a share in %, seconds in minutes / hours / days, bytes in kB...GB
 MAX_ROWS = 300
+APPROX = re.compile(r"\b(about|around|roughly|approximately|approx|nearly|almost|some|over|under|more than|less than|"
+                    r"environ|pr[èe]s de|presque|autour de|plus de|moins de)\b|~|≈", re.I)
+UNIT_CONSTANTS = (1024.0, 3600.0, 86400.0, 1024.0 ** 2, 1024.0 ** 3)   # said when converting (bytes per GiB...)
 RATE_ROWS = 50           # rates within a row: of the first rows only (more would make any number "found")
 
 
@@ -95,6 +98,11 @@ def answer_numbers(answer: str) -> list[tuple[str, list[tuple[float, float]]]]:
         readings = _readings(m.group(1), m.group(2))
         if not readings:
             continue
+        digits = re.sub(r"[^\d.]", "", m.group(1))
+        zeros = len(digits) - len(digits.rstrip("0")) if "." not in digits else 0
+        if zeros and APPROX.search(text[max(0, m.start() - 25):m.start()]):   # "roughly 12,300": to the hundred
+            readings = [(v, max(t, 0.5 * 10 ** zeros) if v >= 10 ** zeros and v % 10 ** zeros == 0 else t)
+                        for v, t in readings]
         unit = (m.group(2) or "").strip()
         if unit != "%" and all(v < 10 and float(v).is_integer() for v, _t in readings):
             continue                                   # 1 to 9: counts of what is listed, ranks
@@ -206,15 +214,18 @@ def derived(rows: list[list[Any]]) -> set[float]:
 def seen_numbers(messages: list[dict]) -> list[float]:
     """Every number the LLM was given before its answer (tools, question, chat, knowledge) and
     what the tools' tables give by totals and rates."""
-    values: set[float] = set()
+    values: set[float] = set(UNIT_CONSTANTS)
     for m in messages:
         content = m.get("content")
         if not isinstance(content, str) or m.get("role") == "system":
             continue
         found = _values(content)
         values.update(found)
-        if m.get("role") == "user":                     # a period of the question in minutes or hours
-            values.update(v * f for v in found for f in (60, 24, 1440, 7))
+        if m.get("role") == "user":                     # a period of the question in minutes or hours (not
+            periods = content                           # its dates and times: 30 September is not 30 days)
+            for rx in SKIP[5:12]:
+                periods = rx.sub(" ", periods)
+            values.update(v * f for v in _values(periods) for f in (60, 24, 1440, 7))
         if m.get("role") == "tool":
             try:
                 data = json.loads(content)
@@ -234,11 +245,10 @@ CODE_NAME = re.compile(r"^[DWMY][-+]\d+$|^[A-Za-z]+\d*$|^[a-z][a-z0-9]*(?:_[a-z0
 
 
 def answer_names(answer: str) -> list[str]:
-    """Names with a digit in the answer's text (servers, hosts, pods: srv-amer-002), its code and links
-    left out: a name the answer writes must be one the tools gave."""
+    """Names with a digit in the answer's text (servers, hosts, pods: srv-amer-002), in `code` too, its
+    code blocks and links left out: a name the answer writes must be one the tools gave."""
     text = answer or ""
-    for rx in SKIP[:2]:
-        text = rx.sub(" ", text)
+    text = SKIP[0].sub(" ", text)                     # code blocks only: `srv-amer-200` in a sentence is a claim
     text = re.sub(r"https?://\S+|\]\([^)]*\)", " ", text)
     return list(dict.fromkeys(n for n in NAME.findall(text) if not CODE_NAME.match(n)))
 
@@ -249,15 +259,48 @@ def ungrounded(answer: str, messages: list[dict]) -> list[str]:
     candidates = answer_numbers(answer)
     if candidates:
         seen = seen_numbers(messages)
-        for text, readings in candidates:
-            if not any(_close(v, tol, seen) for v, tol in readings):
-                out.append(text)
+        kept = [(text, readings) for text, readings in candidates
+                if not any(_close(v, tol, seen) for v, tol in readings)]
+        # the rest of a share the answer shows too (99.00% available next to 1.00% of errors): shares only,
+        # written with a % or decimals (12 jobs and 88 servers are not a share and its rest)
+        share = re.compile(r"%|\d[.,]\d")
+        shown = sorted(v for text, readings in candidates if (text, readings) not in kept and share.search(text)
+                       for v, _t in readings)
+        rests = sorted({100 - v for v in shown if 0 <= v <= 100} | {1 - v for v in shown if 0 <= v <= 1})
+        out += [text for text, readings in kept
+                if not (share.search(text) and any(_close(v, tol, rests) for v, tol in readings))]
     names = answer_names(answer)
     if names:
         given = "\n".join(str(m.get("content") or "") + json.dumps(m.get("tool_calls") or "")
                           for m in messages if m.get("role") != "system").lower()
-        out += [n for n in names if n.lower() not in given]
+        out += [n for n in names if n.lower() not in given and not _given_range(n.lower(), given)]
     return list(dict.fromkeys(out))
+
+
+RANGE_WORDS = re.compile(r"\b(up to|through|thru|until|to|continuing|and so on|etc|jusqu'?[àa]|jusqu)\b|\.\.\.|…|–|—",
+                         re.I)
+
+
+def drop_extrapolated(answer: str, names: list[str]) -> tuple[str, list[str]]:
+    """The lines that continue a list up to a name no result gave ("... up to `srv-amer-199`") taken out
+    of the answer: they are the model's own series, the lines before them stay. (answer, names left)."""
+    if not names:
+        return answer, names
+    kept, dropped = [], set()
+    for line in (answer or "").split("\n"):
+        found = [n for n in names if n.lower() in line.lower()]
+        if found and RANGE_WORDS.search(line):
+            dropped |= set(found)
+            continue
+        kept.append(line)
+    left = [n for n in names if n not in dropped or any(n.lower() in ln.lower() for ln in kept)]
+    return ("\n".join(kept), left) if dropped else (answer, names)
+
+
+def _given_range(name: str, given: str) -> bool:
+    """"n1-n5": two names the tools gave, written as a range (not a name of its own)."""
+    m = re.fullmatch(r"([a-z][a-z0-9_]*\d)-([a-z][a-z0-9_]*\d)", name)
+    return bool(m) and all(re.search(rf"(?<![\w-]){re.escape(p)}(?![\w-])", given) for p in m.groups())
 
 
 def _close(value: float, tol: float, seen: list[float]) -> bool:
@@ -266,7 +309,7 @@ def _close(value: float, tol: float, seen: list[float]) -> bool:
     for factor in CONVERSIONS:
         for sign in (1.0, -1.0):
             target = sign * value / factor              # the seen value that, converted, is shown as `value`
-            margin = tol / factor
+            margin = (tol if factor == 1.0 else 2 * tol) / factor   # converted: rounded twice (19.1949 GiB, 19.20)
             i = bisect.bisect_left(seen, target - margin)
             if i < len(seen) and seen[i] <= target + margin:
                 return True

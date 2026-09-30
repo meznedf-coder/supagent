@@ -84,7 +84,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.5.0-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.5.1-py3-none-any.whl          # Superset 6.1: nothing else to install
 # Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
 ```
 
@@ -468,6 +468,30 @@ that opens SQL Lab or Explore, and read the data of an existing chart, when aske
 Mimir tenants (`__tenant_id__`) usually separate applications or subjects: the agent filters on the
 tenant a question is about, compares by tenant, and never adds tenants up unless asked.
 
+**Several databases with the same data** (two OpenSearch clusters, a DR replica, one Mimir reached
+directly, federated and through a gateway): the same index or metric name can hold other data in
+each. The database comes from, in this order:
+* the question: a database it names (its whole name, or words of its name no other database has,
+  next to a word for a database: "on the DR replica cluster", "in the federated Prometheus"), or a
+  Mimir tenant only one database has;
+* the charts and dashboards the question or the chat is about (an id, a link, a title in quotes, or
+  one a tool of the answer read): the database of each chart's dataset. "Is the dashboard 'Tenants
+  via the gateway' normal?" is answered from the gateway's database, not from another one with the
+  same metric;
+* otherwise `agent.preferred_databases` (names or ids, in order), then the catalog's metrics database,
+  then the database the team's charts use for that index or metric. "Where the data is" names the
+  database used, the others that have the name, and why.
+
+The first two are checked: a query on the same index or metric in another database is sent back
+before it runs, with the database to use; another database is read only when the question names it
+(its name, or "database 4").
+
+A value the question names that is in more than one kind of data ("BILLING_API": an application of
+the jobs index and a label of HTTP metrics) is shown with where it is, when the question does not say
+which data it means; the answer then says which one it took and names the other, and when it read
+only one of them without naming the other, a line under the answer does (*Not read for this answer:
+... Ask if you meant that data.*).
+
 While it answers, the agent:
 * **asks when the question can mean two things** that give different numbers (two fields or
   metrics that fit, a term nobody defined, a period not said where no default applies), and
@@ -475,9 +499,27 @@ While it answers, the agent:
   question naming the readings and the one it would take; otherwise it answers and says in one
   line which reading it took. The answer to that question is learned (see below);
 * **applies the team's rules**: they come again next to the question and win over the learned
-  answers; a rule that filters on a field or label ("ENVIRONMENT_TYPE = 'UAT'") is checked on its
-  queries: a query on data that has that field and does not use it sends the answer back once, then
-  the answer is marked (unless the question asks for the rule's value);
+  answers; a rule that filters on a field or label ("ENVIRONMENT_TYPE = 'UAT'") is checked on each
+  query and saved chart **before it runs**: one on data that has that field and does not use it is
+  sent back with the rule and the condition to add (`"ENVIRONMENT_TYPE" <> 'UAT'`, a chart filter
+  `{"column": "ENVIRONMENT_TYPE", "op": "!=", "value": "UAT"}`); sent again unchanged, it runs and the
+  answer is marked (unless the question asks for the rule's value). In the lab the model ignored the
+  rule even after being told once; a query refused before it runs is always written again;
+* **counts events, not samples**: `COUNT(*)` on a counter of a metrics database (requests, errors,
+  jobs) is sent back once with `SUM(increase)`;
+* **queries the question's period**: a question with a date or a period needs queries on the time of
+  the data (the index's time field, `ts` for metrics), not on business dates (position date, D-1)
+  unless it speaks of them; a question about one whole day needs that whole day (not 00:00-06:00,
+  not the next day), a span of days ("14 to 20 September") exactly those days. Sent back once before
+  it runs, like the rules;
+* **does what a chart was asked for**: a saved chart asked for the top N of something that still
+  shows more (a row limit does not cut the categories of every chart type) is told NOT DONE, with
+  how to do it (a dataset of the query that keeps the top N), never to claim it;
+* reads **a reply to its question** ("The failed jobs.") with the question it answers, and a short
+  reply after an answer ("Only PROD.") with the question it completes;
+* is sent back once when a question asks **how many** and the answer gives only shares or rates;
+* saves charts with the **query context** Superset's front end would save (Superset's MCP service
+  saves none): their data API, CSV and text reports work;
 * when its calls run out (twice `agent.max_steps` when it builds charts and dashboards), writes what
   it did and saved and what remains, instead of stopping without an answer;
 * has **every number checked** (`agent.check_numbers`): a number of its answer must come from what
@@ -487,7 +529,9 @@ While it answers, the agent:
   chat or the knowledge. Otherwise the answer goes back once ("compute totals, rates and
   differences in the query"), and a number still made up is marked in the answer (*Check: these
   numbers or names do not come from the results of this answer's queries*). Names with digits
-  (servers, hosts: `srv-amer-002`) are checked the same way: a series is never continued;
+  (servers, hosts: `srv-amer-002`), in `code` too, are checked the same way: a series is never
+  continued. A big result tells the model how many rows have an empty value (200 servers and one
+  job without a server, not 201 servers);
 * is told **why a result is empty**, from the data dictionary (no extra query): a value in the
   wrong case (`'failed' is written 'FAILED'`), not a value of the field or label (the closest
   ones), a time window before the data starts or after it stopped;

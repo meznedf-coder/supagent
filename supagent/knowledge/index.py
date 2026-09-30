@@ -201,7 +201,10 @@ def _superset_pieces() -> Iterator[dict[str, Any]]:
         from superset.models.slice import Slice
     except Exception:  # pylint: disable=broad-except
         return
+    from superset.models.core import Database
+
     tables = {t.id: t for t in db.session.query(SqlaTable)}
+    db_names = {i: n for i, n in db.session.query(Database.id, Database.database_name)}
     boards: dict[int, list[Any]] = {}
     for d in db.session.query(Dashboard):
         for sl in d.slices or []:
@@ -218,7 +221,8 @@ def _superset_pieces() -> Iterator[dict[str, Any]]:
         dims = [str(x if isinstance(x, str) else (x or {}).get("label") or "") for x in
                 (params.get("groupby") or []) + ([params["x_axis"]] if params.get("x_axis") else [])]
         where = " (a query: " + " ".join((t.sql or "").split())[:300] + ")" if t.sql else ""
-        lines = [f"chart {sl.slice_name} ({sl.viz_type}) on the dataset {t.table_name}{where}",
+        lines = [f"chart {sl.slice_name} ({sl.viz_type}) on the dataset {t.table_name} (id {t.id}) of database "
+                 f'{t.database_id} "{db_names.get(t.database_id, "")}"{where}',
                  "metrics: " + ", ".join(_metric_names(params)[:8]) if _metric_names(params) else "",
                  "by: " + ", ".join(d for d in dims if d)[:300] if any(dims) else "",
                  "filters: " + _filters_text(params) if _filters_text(params) else "",
@@ -238,7 +242,8 @@ def _superset_pieces() -> Iterator[dict[str, Any]]:
             continue
         yield {"ref": f"superset:dashboard:{board_id}:{database_id}", "kind": "dashboard", "database_id": database_id,
                "title": f"dashboard {d.dashboard_title}",
-               "text": f"dashboard {d.dashboard_title} (dashboard id {board_id}): " + "; ".join(charts[:40])}
+               "text": f"dashboard {d.dashboard_title} (dashboard id {board_id}), its charts on database {database_id} "
+                       f'"{db_names.get(database_id, "")}": ' + "; ".join(charts[:40])}
 
 
 KINDS = (("object:", _object_pieces), ("entry:", _entry_pieces), ("recipe:", _recipe_pieces),

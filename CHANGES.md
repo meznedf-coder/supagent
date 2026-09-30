@@ -1,5 +1,73 @@
 # Changes
 
+## 0.5.1 (2026-09-30)
+
+Checks that run **before** a query or a saved chart, instead of after the answer (a model told
+afterwards often keeps its answer; a call sent back before it runs is written again). Each sends the
+call back with what to change, every reason at once. Sent again unchanged, a call left out of a rule,
+a period or a counter runs (the question may mean it; a rule left out is then marked in the answer);
+a call on another database never does (it is read only when the question names it: its name, or
+"database 4").
+
+* **The team's rules**: a query or a saved chart on data that has the field or label of a filtering
+  rule ("Exclude the UAT environment (ENVIRONMENT_TYPE = 'UAT')") and does not use it, with the
+  condition to add (`"ENVIRONMENT_TYPE" <> 'UAT'`, a chart filter, a PromQL matcher). Also the SQL of
+  e-mails, SQL Lab saved queries and `compare_to_usual`.
+* **The right database** when the same index or metric is in several (two OpenSearch clusters, a DR
+  replica, one Mimir reached directly, federated and through a gateway): the database the question
+  names (its own words next to a word for a database, its whole name, a tenant only it has), and the
+  database of the charts and dashboards the question or the chat is about (an id, a link, a title,
+  or read by a tool of the answer). In the lab, questions about the dashboard of the gateway's
+  tenants were answered from the federated database (same metric, other data).
+* **The question's period**: a question with a date or a period needs a filter on the time of the
+  data (the index's time field, `ts` of metrics), not on business dates unless it speaks of them;
+  one whole day needs the whole day, a span of days ("the week of 14 to 20 September") exactly those
+  days (in the lab: `POSITION_LABEL = 'D-1'` for "on 23 September", a chart of "23 September" built
+  on 00:00-06:00, a week ending at 06:00 the next day).
+* **Counters counted as samples**: `COUNT(*)` on a counter, histogram or summary of a metrics
+  database counts samples, not requests or errors (in the lab: "66.67 % availability, 2,880 errors"
+  that were sample counts, and "201,600 jobs over 45 minutes" from a histogram bucket); the call is
+  sent back with `SUM(increase)`.
+
+Also:
+* When the same index or metric is in several databases, "Where the data is" names the one to use and
+  why: `agent.preferred_databases` (new setting, names or ids in order), then the catalog's metrics
+  database, then the database the team's charts use for it (before: the lowest score, then the
+  catalog, then the lowest id). Chart and dashboard pieces of the knowledge name their database.
+* A value the question names that is in several kinds of data (an application of the jobs index and a
+  label of HTTP metrics) is shown with where it is when the question does not say which; the answer
+  says which one it took, and when it read only one of them and does not name the other, a line under
+  it does ("Not read for this answer: BILLING_API is also a value of the label application of 10
+  metrics ... Ask if you meant that data."). The lookup reads one label per name, not every metric's.
+* A reply to the agent's question back ("The failed jobs.") comes with the question it answers, and so
+  does a short reply that completes the previous question after an answer ("The failed jobs.", "Only
+  PROD."): in the lab the model then answered for every application.
+* A list continued past the results ("... up to `srv-amer-199`") that stays after the check is taken
+  out of the answer (the lines before it stay) instead of marking the whole answer.
+* A follow-up answered from the chat's own results (every number in them) is not sent back for a new
+  query.
+* A saved chart asked for the top N that shows more categories is told NOT DONE, with how to do it (in
+  the lab the model listed the first 5 rows of the chart, sorted by name, as "the top 5").
+* Names in `code` are checked like the others (`srv-amer-200`, a series continued, was missed in
+  backticks); `n1-n5` of two given names is not flagged. A big result says how many rows have an empty
+  value (201 "servers" were 200 and one row without a server).
+* The numbers check no longer reads the date of "now" as a period (30 September was 43,200 minutes:
+  a made-up 43 passed on the 30th of the month); the rest of a share the answer shows (99.00 %
+  available next to 1.00 % of errors), a converted value rounded twice (19.1949 GiB written 19.20)
+  and the unit constants (1,073,741,824 bytes per GiB) are not marked as made up, nor a number said
+  as rounded ("roughly 12,300", to the hundred). The numbers check
+  asks to delete the sentences it cannot support, rather than to keep them.
+* "How many" answered with shares or rates only is sent back once for the count; a result cut by the
+  SQL's own LIMIT says that more rows may match (in the lab "61 of the 100 failures" were 100 rows of
+  358).
+* A question of many parts (a manager's summary of five figures) gets half as many tool calls more;
+  a tool call the model writes as text when its calls are used up is not shown as the answer (the
+  results it had are); the instructions tell to compare periods one query per period.
+* Charts the agent saves or changes get the query context Superset's front end would save (Superset's
+  MCP service saves none, so their data API, CSV and text reports failed with "Chart has no query context
+  saved"), mixed charts with their two queries; a chart made in Explore keeps its own; a chart type it
+  cannot be written for keeps none.
+
 ## 0.5.0 (2026-09-29)
 
 * **Context**: every night (after the day's learning) the agent writes the system's documentation,

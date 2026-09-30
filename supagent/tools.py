@@ -1743,7 +1743,16 @@ class ReportRequest(BaseModel):
 
 
 def _query_context(params: dict[str, Any], ds_id: int) -> dict[str, Any]:
-    """The query context Superset's front end would save for a table / XY / big-number chart."""
+    """The query context Superset's front end would save for a table / XY / big-number / pie chart, and a
+    mixed chart (its two queries: metrics and metrics_b)."""
+    if params.get("viz_type") == "mixed_timeseries":
+        first = {k: v for k, v in params.items() if not k.endswith("_b")}
+        second = {**first, **{k[:-2]: v for k, v in params.items() if k.endswith("_b")}}
+        a = _query_context({**first, "viz_type": "echarts_timeseries"}, ds_id)
+        b = _query_context({**second, "viz_type": "echarts_timeseries", "x_axis": params.get("x_axis")}, ds_id)
+        a["queries"] += b["queries"]
+        a["form_data"] = {**params, "datasource": f"{ds_id}__table"}
+        return a
     metrics = list(params.get("metrics") or ([params["metric"]] if params.get("metric") else []))
     grain = params.get("time_grain_sqla")
     if params.get("query_mode") == "raw":
@@ -1773,6 +1782,35 @@ def _query_context(params: dict[str, Any], ds_id: int) -> dict[str, Any]:
                          "row_limit": params.get("row_limit") or 1000, "filters": filters,
                          "time_range": time_range,
                          "extras": {"time_grain_sqla": grain, "having": "", "where": ""}}]}
+
+
+QUERY_CONTEXT_VIZ = {"table", "pie", "big_number_total", "big_number", "mixed_timeseries", "echarts_timeseries",
+                     "echarts_timeseries_line",
+                     "echarts_timeseries_bar", "echarts_timeseries_area", "echarts_timeseries_scatter",
+                     "echarts_timeseries_smooth", "echarts_timeseries_step", "echarts_area"}
+
+
+def refresh_query_context(chart_id: int, keep_existing: bool = False) -> bool:
+    """A chart the agent saved or changed gets the query context Superset's front end would save
+    (Superset's MCP service saves none: the chart data API, CSV and text reports need one). A chart
+    type it cannot be written for keeps none, never a stale one. Only for the chart's owners;
+    `keep_existing`: a chart that has one (saved in Explore, with its post-processing) keeps it."""
+    from superset.extensions import db, security_manager
+    from superset.models.slice import Slice
+
+    chart = db.session.get(Slice, int(chart_id))
+    if chart is None or (keep_existing and chart.query_context):
+        return False
+    try:
+        security_manager.raise_for_ownership(chart)
+    except Exception:  # pylint: disable=broad-except
+        return False
+    params = json.loads(chart.params or "{}")
+    viz = params.get("viz_type") or chart.viz_type
+    chart.query_context = (json.dumps(_query_context(params, chart.datasource_id)) if viz in QUERY_CONTEXT_VIZ
+                           else None)
+    db.session.commit()
+    return chart.query_context is not None
 
 
 def _ensure_query_context(chart_id: int) -> None:

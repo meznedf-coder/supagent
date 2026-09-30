@@ -160,7 +160,7 @@ def test_the_announcement_nudge_is_given_once_only(ctx, monkeypatch):
     sql = {"request": {"database_id": 1, "sql": "SELECT 1"}}
     a, _ran = agent_with(monkeypatch, [call("execute_sql", sql), say("Let me run the query."),
                                        say("Let me run the query.")])
-    answer, _trace = a.ask("How many?")
+    answer, _trace = a.ask("Which applications failed?")
     assert answer.startswith("Let me run the query.")                # not sent back twice
 
 
@@ -340,3 +340,12 @@ def test_a_nested_aggregate_on_metrics_gets_the_way_to_write_it():
 
     assert NESTED_AGG.search("PushdownError: AVG(100 * SUM(rate) FILTER(WHERE mode <> 'idle') / SUM(rate)): cannot")
     assert not NESTED_AGG.search("PushdownError: WINDOW functions are not supported")
+
+
+def test_a_call_written_as_text_after_the_last_call_is_not_the_answer(ctx, monkeypatch):
+    calls = [call("execute_sql", {"request": {"database_id": 1, "sql": f"SELECT {i}"}}) for i in range(10)]
+    a, _ran = agent_with(monkeypatch, calls + [say('<tool_call>\n<function=execute_sql>\n<parameter=request>\n'
+                                                   '{"database_id": 1}\n</parameter>\n</function>\n</tool_call>')])
+    answer, _trace = a.ask("Which applications failed?")
+    assert "<tool_call>" not in answer and "<function=" not in answer
+    assert answer.endswith("(Stopped: the tool calls of one answer were used up; ask a narrower question.)")

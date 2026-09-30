@@ -79,7 +79,7 @@ def _agent():
 
     a = object.__new__(Agent)
     a.username, a.on_step, a.should_stop, a.rich, a.max_steps = "alice", None, None, True, 5
-    a.llm = ScriptedLLM([say("Done."), say("Done.")])
+    a.llm = ScriptedLLM([say("Done."), say("Done."), say("Done.")])
     a.names, a.local, a.specs = set(), {}, []
     a.superset = types.SimpleNamespace(schema=lambda name: {}, available=True, error=None, call=lambda n, a: "{}")
     a.guard = ChartGuard(a)

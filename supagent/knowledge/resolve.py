@@ -291,24 +291,92 @@ def resolve(question: str) -> list[dict[str, Any]]:
     _associations(q, found, databases, live, _gone(tuple(sorted(by_source))), by_source)
     known_sources = {o["source_id"] for o in known}
     learned = {d.id for sid, d in by_source.items() if sid in known_sources}
+    # one entry per metric, index or field name, in the database the question names, else the one of
+    # the policy (preferred_databases), stated in "Where the data is" with the others that have it
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for c in found.values():
+        groups.setdefault((c["kind"], c["parent"], c["name"]), []).append(c)
+    named = _named(question, databases) if any(len(g) > 1 for g in groups.values()) else {}
+    order = preferred_databases(databases)
+    charts = _charts_per_table() if any(len(g) > 1 for g in groups.values()) else {}
+    best: dict[tuple, dict[str, Any]] = {}
+    for key, cands in groups.items():
+        def rank(c: dict[str, Any]) -> tuple:
+            d = c["database"]
+            table = c["parent"] or c["name"]
+            return (d.id not in named, order.get(d.id, (len(order), ""))[0], -c["score"], -charts.get((d.id, table), 0),
+                    d.id not in learned, d.id, len(c["name"]))
+
+        cands.sort(key=rank)
+        top = dict(cands[0])
+        top["score"] = max(c["score"] for c in cands)
+        if len(cands) > 1:
+            d = top["database"]
+            table = top["parent"] or top["name"]
+            top["elsewhere"] = [c["database"] for c in cands[1:]]
+            top["why_here"] = (named.get(d.id) or order.get(d.id, (0, ""))[1]
+                               or (f"the team's charts use it ({charts[(d.id, table)]})" if charts.get((d.id, table))
+                                   else "the one learned" if d.id in learned else "the first one"))
+        best[key] = top
+    ranked = sorted(best.values(), key=lambda c: -c["score"])
+    return ranked[:DETAILED + NAMED]
+
+
+def _named(question: str, databases: list[Any]) -> dict[int, str]:
+    """The databases the question names (by name or by a tenant only one has): see scope."""
+    try:
+        from supagent.knowledge.scope import named_databases, tenant_databases
+
+        return {**tenant_databases(question, databases), **named_databases(question, databases)}
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        return {}
+
+
+def preferred_databases(databases: list[Any]) -> dict[int, tuple[int, str]]:
+    """The databases used first when the same name is in several (id -> (rank, why)): the admins' list
+    (agent.preferred_databases, names or ids), then the catalog's metrics database."""
+    from supagent import settings
+
+    out: dict[int, tuple[int, str]] = {}
+    try:
+        wanted = [str(x).strip() for x in settings.get("agent.preferred_databases") or [] if str(x).strip()]
+    except Exception:  # pylint: disable=broad-except
+        wanted = []
+    for w in wanted:
+        for d in databases:
+            if (str(d.id) == w or (d.database_name or "").lower() == w.lower()) and d.id not in out:
+                out[d.id] = (len(out), "the admins' preferred database (agent.preferred_databases)")
     try:
         from supagent.tools import _catalog
 
-        preferred = (_catalog().get("metrics") or {}).get("database")
+        metrics_db = (_catalog().get("metrics") or {}).get("database")
     except Exception:  # pylint: disable=broad-except
-        preferred = None
-    # one entry per metric or index name: the preferred database, then a learned one, then the first
-    best: dict[tuple, dict[str, Any]] = {}
-    order = sorted(found.values(), key=lambda c: (-c["score"], c["database"].database_name != preferred,
-                                                  c["database"].id not in learned, c["database"].id, len(c["name"])))
-    for c in order:
-        key = (c["kind"], c["parent"], c["name"])
-        if key in best:
-            best[key].setdefault("elsewhere", []).append(c["database"].id)
-            continue
-        best[key] = c
-    ranked = sorted(best.values(), key=lambda c: -c["score"])
-    return ranked[:DETAILED + NAMED]
+        metrics_db = None
+    for d in databases:
+        if metrics_db and d.database_name == metrics_db and d.id not in out:
+            out[d.id] = (len(out), "the catalog's metrics database")
+    return out
+
+
+def _charts_per_table() -> dict[tuple[int, str], int]:
+    """Saved charts per (database id, table) of a physical dataset: the database the team's charts use."""
+    def make() -> dict[tuple[int, str], int]:
+        from sqlalchemy import func
+        from superset.connectors.sqla.models import SqlaTable
+        from superset.models.slice import Slice
+
+        rows = (db.session.query(SqlaTable.database_id, SqlaTable.table_name, func.count(Slice.id))
+                .join(Slice, (Slice.datasource_id == SqlaTable.id) & (Slice.datasource_type == "table"))
+                .filter((SqlaTable.sql.is_(None)) | (SqlaTable.sql == ""))
+                .group_by(SqlaTable.database_id, SqlaTable.table_name).all())
+        return {(i, t): n for i, t, n in rows}
+
+    try:
+        return _cached(("charts per table",), make, fresh=False)
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        return {}
 
 
 ASSOCIATION_DAYS = 60             # an association no answer used for this long is not used
@@ -424,6 +492,95 @@ def _sql(c: dict[str, Any]) -> str:
     return f'SELECT DATE_TRUNC(\'hour\', ts) AS t, {value} FROM "{name}" {where} GROUP BY 1 ORDER BY 1'
 
 
+VALUE_TOKEN = re.compile(r"(?<![\w-])([A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+|[A-Z][A-Z0-9]{2,})(?![\w-])")
+MAX_VALUES = 4                    # values of the question looked up
+VALUE_ROWS = 200                  # fields and labels read per value
+
+
+def value_places(question: str, databases: list[Any] | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Where the values the question names are ("BILLING_API": the field APPLICATION of an index and the
+    label application of metrics), when they are in more than one kind of data or database and the
+    question does not say which data it means: {value: [{database_id, database, kind, name, tables}]}."""
+    from sqlalchemy import Text, cast, func
+
+    from supagent.models import KObject, Source
+
+    tokens = [t for t in dict.fromkeys(VALUE_TOKEN.findall(question or "")) if not t.isdigit()][:MAX_VALUES]
+    if not tokens:
+        return {}
+    databases = databases if databases is not None else _databases()
+    by_source = {sid: d for sid, d in ((s.id, next((d for d in databases if d.id == s.database_id), None))
+                                       for s in db.session.query(Source)) if d is not None}
+    if not by_source:
+        return {}
+    # a label of the same name has much the same values in every metric: one of them is read (tens of
+    # thousands of labels stay unread), and the metrics that have it are counted
+    reps = (db.session.query(func.min(KObject.id)).filter(KObject.kind == "label", KObject.gone_at.is_(None),
+                                                          KObject.source_id.in_(list(by_source)))
+            .group_by(KObject.source_id, KObject.name))
+    out: dict[str, list[dict[str, Any]]] = {}
+    for token in tokens:
+        like = cast(KObject.stats, Text).like(f'%"{token}"%')
+        rows = (db.session.query(KObject.source_id, KObject.kind, KObject.parent, KObject.name, KObject.stats)
+                .filter(KObject.gone_at.is_(None), KObject.source_id.in_(list(by_source)), like,
+                        ((KObject.kind == "field") | KObject.id.in_(reps))).limit(VALUE_ROWS).all())
+        places: dict[tuple[int, str, str], list[str]] = {}
+        for sid, kind, parent, name, stats in rows:
+            if token not in map(str, (stats or {}).get("values") or []):
+                continue
+            if kind == "label":                         # every metric that has the label
+                parent_rows = (db.session.query(KObject.parent).filter(
+                    KObject.kind == "label", KObject.source_id == sid, KObject.name == name,
+                    KObject.gone_at.is_(None)).limit(200).all())
+                places.setdefault((by_source[sid].id, kind, name), []).extend(p for (p,) in parent_rows)
+                continue
+            places.setdefault((by_source[sid].id, kind, name), []).append(parent or "")
+        kinds = {k for (_i, k, _n) in places}
+        dbs = {i for (i, _k, _n) in places}
+        if len(kinds) < 2 and len(dbs) < 2:
+            continue                                    # one kind of data in one database: nothing to choose
+        subjects = {t for parents in places.values() for p in parents for t in name_tokens(p)}
+        if set(terms(question)) & subjects:
+            continue                                    # "jobs of BILLING": the question says which data
+        names = {d.id: d.database_name for d in databases}
+        out[token] = [{"database_id": i, "database": names.get(i, ""), "kind": kind, "name": name,
+                       "tables": sorted(set(parents))} for (i, kind, name), parents in sorted(places.items())]
+    return out
+
+
+def place_text(p: dict[str, Any]) -> str:
+    tables = p["tables"]
+    what = (f"field {p['name']} of index {', '.join(tables[:3])}" if p["kind"] == "field" else
+            f"label {p['name']} of {len(tables)} metric(s): {', '.join(tables[:4])}" + (" ..." if len(tables) > 4 else ""))
+    return f'{what} (database {p["database_id"]} "{p["database"]}")'
+
+
+def values_lines(question: str, databases: list[Any] | None = None) -> list[str]:
+    """The lines of "Where the data is" about value_places."""
+    return [f'- "{token}" is a value of: ' + "; ".join(place_text(p) for p in places[:6]) + ". If the question can "
+            "mean either, say in the first line which one you answered and name the other one."
+            for token, places in value_places(question, databases).items()]
+
+
+def other_reading(answer: str, tables_read: set[str], places: dict[str, list[dict[str, Any]]]) -> str:
+    """A value the question named is in data this answer did not read and does not mention: said in one
+    line (the other reading), e.g. an application that also has HTTP metrics."""
+    low = (answer or "").lower()
+    read = {t.lower() for t in tables_read}
+    notes = []
+    for token, ps in places.items():
+        used = [p for p in ps if read & {t.lower() for t in p["tables"]}]
+        if not used:
+            continue                                   # none of them read: nothing to say about the others
+        kinds = {p["kind"] for p in used}
+        other = [p for p in ps if p["kind"] not in kinds and not any(t.lower() in low for t in p["tables"])]
+        if other:
+            notes.append(f'"{token}" is also a value of the {place_text(other[0])}')
+    if not notes:
+        return ""
+    return "\n\n(Not read for this answer: " + "; ".join(notes[:2]) + ". Ask if you meant that data.)"
+
+
 def where_block(question: str, shown: set[str] | None = None) -> str:
     """The candidates as a block of the system prompt ("" when nothing matches). `shown` gets the
     titles of the knowledge pieces of the metrics and indices given with their details."""
@@ -437,7 +594,13 @@ def where_block(question: str, shown: set[str] | None = None) -> str:
 
     ranked = [c for c in ranked                           # what the team said not to use is never proposed
               if not is_excluded(c["kind"], c["database"].id, c["name"], c.get("parent") or "")]
-    if not ranked:
+    try:
+        values = values_lines(question)
+    except Exception as ex:  # pylint: disable=broad-except
+        log.warning("supagent resolve: values: %s", ex)
+        db.session.rollback()
+        values = []
+    if not ranked and not values:
         return ""
     lines = ["\n\nWhere the data is (found for this question on names, descriptions and earlier answers, in the "
              "databases you may use; use these exact names and database ids, and do not search for them again):"]
@@ -480,10 +643,13 @@ def where_block(question: str, shown: set[str] | None = None) -> str:
             if banned:
                 lines[-1] += " DO NOT USE (the team): " + "; ".join(f'"{x["name"]}" ({x["why"][:80]})' for x in banned[:8])
         if c.get("elsewhere"):
-            lines[-1] += f' (also in database {", ".join(map(str, sorted(set(c["elsewhere"]))[:4]))})'
+            others = ", ".join(f'{o.id} "{o.database_name}"' for o in sorted(c["elsewhere"], key=lambda o: o.id)[:4])
+            lines[-1] += (f" (also in database {others}: use database {d.id} unless the question asks for another; "
+                          f"{c.get('why_here') or 'the first one'})")
         if c.get("used_for"):
             lines[-1] += f' (used before for: {", ".join(c["used_for"][:5])})'
     more = [f'{c["name"]}' + (f' ({c["parent"]})' if c["kind"] == "field" else "") for c in ranked[DETAILED:]]
     if more:
         lines.append("- also matching: " + ", ".join(more))
+    lines += values
     return "\n".join(lines)

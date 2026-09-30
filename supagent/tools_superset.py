@@ -101,6 +101,16 @@ def execute_sql(request: ExecuteSqlRequest) -> dict:
                    "rows": [{c: _plain(v) for c, v in zip(columns, r)} for r in rows],
                    "row_count": len(rows), "truncated": truncated, "seconds": round(time.time() - t0, 2),
                    "error": None}
+            try:                                        # the SQL's own LIMIT reached: not all the rows
+                from supagent.tools import _check_select
+
+                own = _check_select(request.sql, limit)[1]
+            except Exception:  # pylint: disable=broad-except
+                own = 0
+            if 0 < own <= limit and len(rows) == own and own > 1:
+                out["note"] = (f"The SQL's own LIMIT {own:,} was reached: more rows may match. These {own:,} rows are "
+                               "not all of them: for a total, count in a query without that LIMIT (COUNT(*), the sum "
+                               "of the counts), and never say these rows are all.")
             zeros = len(rows) == 1 and all(v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)
                                                          and v == 0) for v in rows[0])
             if not rows or zeros:          # nothing (an aggregate of no rows: one row of NULLs, or a count

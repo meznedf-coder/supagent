@@ -97,3 +97,17 @@ def test_the_same_value_written_otherwise_is_recognised():
     assert "'srv-amer-2' is written 'srv-amer-002'" in _value_hint("node", ["srv-amer-2"], stats, "promagg")
     assert "'SRV_EMEA_10' is written 'srv-emea-010'" in _value_hint("node", ["SRV_EMEA_10"], stats, "promagg")
     assert _value_hint("node", ["srv-amer-001"], stats, "promagg") is None
+
+
+def test_a_result_the_sqls_own_limit_cut_says_it_is_not_all(world, monkeypatch):
+    from supagent import tools_superset
+    from supagent.security import acting_as
+
+    rows = [(f"E{i}", 1) for i in range(100)]
+    monkeypatch.setattr(tools_superset, "_run", lambda database, sql, limit, extract: (["ERROR", "n"], rows, False))
+    with acting_as("admin"):
+        cut = tools_superset.execute_sql(tools_superset.ExecuteSqlRequest(
+            database_id=world["jobs"].id, sql='SELECT "ERROR", COUNT(*) FROM "jobs" GROUP BY 1 LIMIT 100'))
+        whole = tools_superset.execute_sql(tools_superset.ExecuteSqlRequest(
+            database_id=world["jobs"].id, sql='SELECT "ERROR", COUNT(*) FROM "jobs" GROUP BY 1'))
+    assert "The SQL's own LIMIT 100 was reached" in cut["note"] and "note" not in whole
