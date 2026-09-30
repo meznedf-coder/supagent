@@ -1,5 +1,9 @@
 # Changes
 
+## 0.5.4 (2026-09-30)
+
+* The same code as 0.5.3, published under a new version number. Everything below 0.5.3 applies.
+
 ## 0.5.3 (2026-09-30)
 
 **No condition of the model's own.** Every condition of a query (WHERE, FILTER, CASE, HAVING, PromQL
