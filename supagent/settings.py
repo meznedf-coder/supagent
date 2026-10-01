@@ -53,6 +53,21 @@ SPECS: list[Spec] = [
     Spec("llm.extra_headers", {}, "json", "More HTTP headers for the LLM calls (JSON object)"),
     # ---- the agent
     Spec("agent.max_steps", 16, "int", "Tool calls per question at most"),
+    Spec("governed.use_datasets", True, "bool", "Governed pipeline: a query on a table that has a Superset dataset "
+         "runs through the chart data API (the dataset's permissions and row-level security apply); else as "
+         "execute_sql"),
+    Spec("mcp.servers", [], "json", "Other MCP servers whose tools the agent may use (JSON list of {name, transport: "
+         "streamable_http | sse | stdio | websocket, url or command/args, headers, description, tools, write, "
+         "allow_write, roles}); needs pip install \"supagent[graph]\""),
+    Spec("agent.router", True, "bool", "Route each question (the MOA router: functional, technical, incident, "
+         "charts, observability, infrastructure) by its meaning, the knowledge it touches and the routes people "
+         "confirmed: the route chooses the knowledge given first, the tools and a short instruction; not sure: "
+         "the normal way"),
+    Spec("router.min_confidence", "medium", "choice", "The router's confidence needed to use a route (below it: "
+         "the normal way)", choices=("low", "medium", "high")),
+    Spec("agent.pipeline", "classic", "choice", "How questions are answered: classic (the model writes the queries, "
+         "checked after) or governed (test: the knowledge is chosen first, the model fills a plan, code checks it "
+         "and builds the queries; charts and status questions stay classic)", choices=("classic", "governed")),
     Spec("agent.databases", [], "list", "Databases the agent may use (names or ids); empty: the OpenSearch "
          "(osagg) and Prometheus / Mimir (promagg) ones. Superset's database access still applies"),
     Spec("agent.preferred_databases", [], "list", "When the same index or metric is in several databases: the ones "
@@ -108,6 +123,11 @@ SPECS: list[Spec] = [
     Spec("context.hour", 4, "int", "Hour of the nightly Context build (after the day's learning run)"),
     Spec("context.max_llm_calls", 12, "int", "LLM calls of a Context build at most (its summary pages: only the ones "
          "whose sources changed are written again; the facts pages need no LLM)"),
+    Spec("knowledge.apply_background", True, "bool", "A save in the Data dictionary answers at once; the catalog "
+         "applied to the dictionary, the searchable pieces and their vectors follow in the background (seconds)"),
+    Spec("learn.classify_per_run", 400, "int", "Knowledge items the daily learning classifies at most (their "
+         "categories: aspect, subjects, applications, components, and the relations their texts state); the next "
+         "run continues"),
     Spec("learn.agent_catalog", True, "bool", "The agent adds catalog entries when the evidence is certain: "
          "formulas used in answers confirmed as helpful, team rules and facts approved by an admin, definitions "
          "quoted word for word from the documents. Written as (agent): edit one to take it over; delete it and the "
@@ -130,6 +150,42 @@ SPECS: list[Spec] = [
     Spec("qdrant.url", "", "str", "Qdrant server (search.vector_store = qdrant), e.g. http://qdrant-host:6333"),
     Spec("qdrant.api_key", "", "str", "Qdrant API key", secret=True),
     Spec("qdrant.collection", "supagent", "str", "Qdrant collection"),
+    Spec("search.store", "auto", "choice", "The knowledge store in PostgreSQL (words by BM25 with pg_textsearch, near "
+         "spellings with pg_trgm, meaning with pgvector, the chats): auto = used once built (superset supagent store "
+         "rebuild; init builds it when the extensions are there), on, off (the search of 0.5)",
+         choices=("auto", "on", "off")),
+    Spec("search.store_uri", "", "str", "PostgreSQL that holds the store (e.g. postgresql://user:pw@host/db); empty: "
+         "Superset's database", secret=True),
+    Spec("search.store_schema", "supagent_store", "str", "Schema of the store (its own: wiped with DROP SCHEMA, left "
+         "out of a backup with pg_dump --exclude-schema)"),
+    Spec("search.bm25", "auto", "choice", "Words ranked by: auto = BM25 of pg_textsearch when installed, else "
+         "PostgreSQL's full-text search; builtin = PostgreSQL's full-text search", choices=("auto", "builtin")),
+    Spec("search.chats", True, "bool", "The store keeps the chats: each user may search their own (search_my_chats), "
+         "and the tables of confirmed answers vote for the questions like them (the decider)"),
+    Spec("search.chat_days", 365, "int", "Days of chats the store keeps"),
+    Spec("search.chat_box_similarity", 0.72, "float", "The chat's search box: a chat found by meaning only (none of "
+         "the words typed) when at least this close (cosine; 0.72 suits Qwen3-Embedding-0.6B: lower it for models "
+         "whose scores are lower); chats with the words are always found"),
+    Spec("rerank.url", "", "str", "A cross-encoder reranker's endpoint (e.g. http://gateway:8092/v1/rerank): the "
+         "first pieces the search found are read with the question and ordered again; empty: no reranker"),
+    Spec("rerank.api", "jina", "choice", "The reranker's API: jina ({query, documents} -> results with "
+         "relevance_score: Jina, Cohere, vLLM, llama.cpp --reranking, Infinity) or tei ({query, texts}: "
+         "text-embeddings-inference)", choices=("jina", "tei")),
+    Spec("rerank.model", "", "str", "The reranker model's name, sent with each request (jina API; e.g. "
+         "Qwen3-Reranker-0.6B, bge-reranker-v2-m3); empty: the server's"),
+    Spec("rerank.auth", "none", "choice", "The reranker's authentication: none, token (rerank.token) or llm (the "
+         "LLM's: its token or the middleware, when the reranker is on the same gateway)",
+         choices=("none", "token", "llm")),
+    Spec("rerank.token", "", "str", "The reranker's access token (rerank.auth = token)", secret=True),
+    Spec("rerank.timeout", 2.0, "float", "Seconds the reranker may take; later: the search's own order (and no "
+         "call for a minute)"),
+    Spec("rerank.depth", 40, "int", "Pieces of the search read again by the reranker"),
+    Spec("rerank.weight", 1.0, "float", "How much the reranker's order counts against the search's (1: as much; "
+         "2: twice as much)"),
+    Spec("rerank.max_chars", 1500, "int", "Characters of each piece the reranker reads (about 512 tokens)"),
+    Spec("embed.query_instruction", "", "str", "Text put before a question when it is embedded, for models trained "
+         "with one (Qwen3-Embedding: 'Instruct: Given a question about the data, retrieve the metrics, tables and "
+         "knowledge that answer it\\nQuery:'); empty: the question alone"),
     # ---- documents and sites
     Spec("docs.allowed_domains", [], "list", "Domains the agent may fetch pages from (e.g. wiki.company.com); "
          "empty: public sites only (no private addresses)"),

@@ -43,102 +43,17 @@
     <div class="fields" data-group="search embed qdrant memory docs"></div>
     <div class="actions"><button type="button" class="btn primary" data-save="search embed qdrant memory docs">Save</button></div>
   </section>
-  <section class="card" id="sec-memory">
-    <h2>Team memory</h2>
-    <p class="muted">Preferences, rules and facts for everyone, learned from the chats or written by users. Proposed ones
-      are not used until an admin approves them. Approved rules and facts move into the catalog at the next learning
-      run (setting learn.agent_catalog): edit them there.</p>
-    <div class="table-wrap"><table class="grid" id="team-memory">
-      <thead><tr><th>Memory</th><th>Kind</th><th>By</th><th>State</th><th></th></tr></thead><tbody></tbody></table></div>
-  </section>
-  <section class="card" id="sec-docs">
-    <h2>Documents and sites</h2>
-    <p class="muted">Documents the agent may search: text, Markdown or HTML files, and web pages read again every few
-      days (a site: the pages under the same address). Only the allowed domains are read (setting
-      docs.allowed_domains; empty: public sites only).</p>
-    <div class="fields two">
-      <label class="field"><span>Address of a page or a site</span><input type="text" id="doc-url" placeholder="https://wiki.example.com/ops/runbooks/"></label>
-      <label class="field"><span>Category</span><input type="text" id="doc-category" placeholder="e.g. Runbooks"></label>
-      <label class="field"><span>Pages at most</span><input type="number" id="doc-pages" value="10" min="1" max="200"></label>
-      <label class="field"><span>Read again every (days)</span><input type="number" id="doc-days" value="7" min="1"></label>
-    </div>
+  <section class="card" id="sec-knowledge">
+    <h2>Knowledge</h2>
+    <p class="muted">The catalog, the team memory, the documents and sites, and the categories are edited in the Data
+      dictionary, next to what waits for an admin's review.</p>
     <div class="actions">
-      <button type="button" class="btn primary" id="doc-add">Add the site</button>
-      <label class="btn" for="doc-file">Upload a file (text, Markdown, HTML)</label>
-      <input type="file" id="doc-file" accept=".txt,.md,.markdown,.html,.htm,.csv,.json,.yaml,.yml" hidden>
-      <span id="doc-result" class="result"></span>
+      <a class="btn primary" id="go-review" href="#">What waits for review</a>
+      <a class="btn" id="go-catalog" href="#">Catalog</a>
+      <a class="btn" id="go-memory" href="#">Team memory</a>
+      <a class="btn" id="go-docs" href="#">Documents and sites</a>
     </div>
-    <div class="table-wrap"><table class="grid" id="docs">
-      <thead><tr><th>Document</th><th>Category</th><th class="num">Pages</th><th class="num">Size</th><th>State</th><th>Read</th><th></th></tr></thead>
-      <tbody></tbody></table></div>
   </section>
-  <section class="card" id="sec-catalog">
-    <h2>Catalog</h2>
-    <p class="muted">What people know about the data, in separate entries: the glossary, one entry per index,
-      groups of metrics, relationships, health checks, rules the agent always follows, notes, formulas. Each
-      entry is saved on its own and keeps its history: a mistaken change or deletion can be restored.</p>
-    <p class="muted">The agent adds entries itself only on evidence it can check (setting learn.agent_catalog):
-      formulas used in answers confirmed as helpful, team rules and facts an admin approved, definitions quoted
-      word for word from the documents. They are marked <span class="badge agent">agent</span>; edit one to take
-      it over, delete it and the agent never writes it again.</p>
-    <div class="filters">
-      <select id="cat-class" aria-label="Classification"><option value="">All classifications</option></select>
-      <select id="cat-category" aria-label="Category"><option value="">All categories</option></select>
-      <select id="cat-author" aria-label="Written by"><option value="">Written by anyone</option>
-        <option value="agent">Written by the agent</option><option value="people">Written by people</option></select>
-      <input id="cat-q" type="search" placeholder="Search titles and contents" aria-label="Search the catalog">
-      <button type="button" class="btn primary" id="cat-new">New entry</button>
-      <button type="button" class="btn" id="cat-import">Import YAML</button>
-      <a class="btn" id="cat-export" href="api/catalog/export">Export YAML</a>
-    </div>
-    <div id="cat-warnings"></div>
-    <div class="table-wrap"><table class="grid" id="cat-list">
-      <thead><tr><th>Title</th><th>Classification</th><th>Category</th><th>State</th><th>Changed</th></tr></thead>
-      <tbody></tbody>
-    </table></div>
-  </section>
-</div>
-<div id="entry-drawer" class="drawer" hidden>
-  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="entry-title-h">
-    <button type="button" class="close" id="entry-close" aria-label="Close">&times;</button>
-    <h2 id="entry-title-h">Entry</h2>
-    <div class="edit">
-      <label class="field"><span>Title</span><input type="text" id="e-title" maxlength="255"></label>
-      <div class="fields two">
-        <label class="field"><span>Classification</span><select id="e-class"></select></label>
-        <label class="field"><span>Category</span><input type="text" id="e-category" list="e-categories" maxlength="128"
-          placeholder="e.g. Batch jobs, Servers, Network"><datalist id="e-categories"></datalist></label>
-        <label class="field"><span>Format</span><select id="e-fmt"><option value="yaml">YAML</option>
-          <option value="text">Text</option><option value="markdown">Markdown</option></select></label>
-        <label class="field check"><input type="checkbox" id="e-enabled"><span>Enabled (used by the agent)</span></label>
-      </div>
-      <div class="help" id="e-help"></div>
-      <div class="evidence" id="e-evidence" hidden></div>
-      <textarea id="e-content" rows="18" spellcheck="false" aria-label="Content"></textarea>
-      <div class="actions">
-        <button type="button" class="btn primary" id="e-save">Save</button>
-        <button type="button" class="btn" id="e-delete">Delete</button>
-        <span id="e-confirm" hidden>Delete this entry? It can be restored from its history.
-          <button type="button" class="btn small stop" id="e-delete-yes">Delete</button>
-          <button type="button" class="btn small" id="e-delete-no">Cancel</button></span>
-        <span id="e-result" class="result"></span>
-      </div>
-      <details id="e-history-box"><summary>History</summary><div id="e-history"></div></details>
-    </div>
-  </div>
-</div>
-<div id="import-drawer" class="drawer" hidden>
-  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="import-h">
-    <button type="button" class="close" id="import-close" aria-label="Close">&times;</button>
-    <h2 id="import-h">Import a catalog (YAML)</h2>
-    <p class="muted">The file is split into entries (glossary, one per index, metrics by name prefix,
-      relationships, checks). Entries with the same title are updated, the others added.</p>
-    <textarea id="import-text" rows="18" spellcheck="false" aria-label="Catalog YAML"></textarea>
-    <label class="field check"><input type="checkbox" id="import-replace"><span>Also delete the structured entries this
-      file does not have</span></label>
-    <div class="actions"><button type="button" class="btn primary" id="import-go">Import</button>
-      <span id="import-result" class="result"></span></div>
-  </div>
 </div>
 {% endblock %}
 {% block scripts %}<script src="{{ supagent_static('admin.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

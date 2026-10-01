@@ -130,6 +130,41 @@ def _literals(sql: str) -> list[dt.datetime]:
     return out
 
 
+def _timed_date_fields(tables: set[str]) -> dict[str, str]:
+    """The date fields of these indices whose values carry a time of day ({field: a value, as learned}): a date
+    alone (= '2026-09-23') matches only its 00:00 there, which such data never has."""
+    from supagent.models import KObject
+
+    out: dict[str, str] = {}
+    for o in db.session.query(KObject).filter(KObject.kind == "field", KObject.parent.in_(list(tables)),
+                                              KObject.data_type.in_(("date", "date_nanos")), KObject.gone_at.is_(None)):
+        st = o.stats or {}
+        seen = [str(v) for v in (st.get("min"), st.get("max")) if v]
+        timed = [v for v in seen if re.search(r"[ T](\d{1,2}):(\d{2})", v) and not re.search(r"[ T]0?0:00(:00)?$", v)]
+        if timed:
+            out[o.name] = timed[-1]
+    return out
+
+
+def day_equality(sql: str, tables: set[str]) -> str | None:
+    """A date field whose values carry a time, compared with a date alone ("TRADE_DATE" = '2026-09-23'): it
+    finds nothing. The day is a range."""
+    fields = _timed_date_fields(tables) if tables else {}
+    for field, sample in sorted(fields.items()):
+        m = re.search(rf"(?<![\w@])\"?{re.escape(field)}\"?\s*(?:=|\bIN\s*\(\s*)\s*'(\d{{4}}-\d{{2}}-\d{{2}})'", sql, re.I)
+        if m is None:
+            continue
+        try:
+            day = dt.date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        nxt = day + dt.timedelta(days=1)
+        return (f"tool error (not run: date): {field} holds a date and a time (e.g. {sample}), so {field} = "
+                f"'{day}' matches only {day} 00:00 and finds nothing. For that day use \"{field}\" >= '{day}' AND "
+                f"\"{field}\" < '{nxt}'. If that exact instant is meant, send this same call again unchanged.")
+    return None
+
+
 def refusal(question: str, tool: str, args: dict, today: dt.date | None = None) -> str | None:
     """Why this query does not cover the question's period (sent back once), or None."""
     if tool not in SQL_TOOLS or not question:
@@ -137,10 +172,14 @@ def refusal(question: str, tool: str, args: dict, today: dt.date | None = None) 
     from supagent.knowledge.excluded import query_texts
     from supagent.knowledge.rulecheck import _tables
 
+    sqls = [q for q in query_texts(args) if q]
+    if sqls:
+        same_day = day_equality(sqls[-1], _tables(sqls[-1]))
+        if same_day:
+            return same_day
     today = today or _now().date()
     if not has_period(question, today):
         return None
-    sqls = [q for q in query_texts(args) if q]
     if not sqls:
         return None
     sql = sqls[-1]

@@ -193,3 +193,95 @@ def test_a_count_over_a_counter_is_sent_back(world):
     assert text and text.startswith("tool error (not run: counter)") and "SUM(increase)" in text
     assert count_of_counter(metrics, "SELECT node, SUM(increase) FROM \"node_cpu_seconds_total\" GROUP BY node") is None
     assert count_of_counter(world["jobs"], sql) is None                                 # not a metrics database
+
+
+VAR_RULE = ("The VaR of a desk is its record with BOOK = 'ALL'. Never add up the VaR of the books of a desk "
+            "(VaR is not additive).")
+
+
+@pytest.fixture()
+def desks(world):
+    """Three indices with a BOOK field (PnL, risk, trades); only the risk index's values say VaR."""
+    from superset.extensions import db
+
+    from supagent.knowledge import rulecheck
+    from supagent.knowledge.catalog import save_entry
+    from supagent.knowledge.store import upsert
+    from supagent.models import Entry, EntryVersion, KObject
+
+    made = []
+    for index, fields in (("pnl", {"BOOK": ["EQ_VANILLA_EU", "FX_SPOT_G10"], "PNL_STATUS": ["FLASH", "OFFICIAL"],
+                                   "VALIDATION": ["NOT_VALIDATED", "VALIDATED"]}),       # "not" is in the rule too
+                          ("risk", {"BOOK": ["ALL", "EQ_VANILLA_EU"], "RISK_MEASURE": ["VAR_1D_99", "VEGA", "DELTA"]}),
+                          ("trades", {"BOOK": ["EQ_VANILLA_EU"], "STATUS": ["NEW", "CANCELLED"]}),
+                          ("pricing", {"BOOK": ["FX_SPOT_G10"], "STATUS": ["OK", "ERROR"],
+                                       "ERROR_CODE": ["INVALID_TRADE", "TIMEOUT"]})):
+        made.append(upsert(world["run"], world["s_jobs"], "index", "", index, {"stats": {"time_field": "COB_DATE"}}))
+        for name, values in fields.items():
+            made.append(upsert(world["run"], world["s_jobs"], "field", index, name,
+                               {"data_type": "keyword", "stats": {"values": values, "cardinality": len(values)}}))
+    db.session.commit()
+    save_entry({"title": "VaR of a desk", "classification": "rule", "content": VAR_RULE}, by="admin")
+    rulecheck._CONCERNS.clear()
+    yield world
+    db.session.query(EntryVersion).delete()
+    db.session.query(Entry).delete()
+    for o in made:
+        db.session.delete(o)
+    db.session.commit()
+    rulecheck._CONCERNS.clear()
+
+
+def test_a_rule_applies_to_the_data_it_is_about_and_never_to_a_list_per_its_field(desks):
+    """A rule on BOOK that is about VaR is not added to PnL or trades queries (the lab's governed pipeline found
+    nothing: BOOK = 'ALL' rows exist only in risk), and not to a query per BOOK."""
+    from supagent.knowledge.rulecheck import concerns, unapplied
+
+    assert concerns({"text": VAR_RULE}, {"BOOK"}) == {"risk"}           # not pnl for its NOT_VALIDATED
+    q = "What was the VaR of the EQUITY desk on 23 September?"
+    risk = _step('SELECT SUM("VALUE") FROM "risk" WHERE "RISK_MEASURE" = \'VAR\'')
+    assert unapplied(q, [risk]) == [VAR_RULE]
+    trades = _step('SELECT COUNT(*) FROM "trades" WHERE "STATUS" = \'NEW\'')
+    assert unapplied("How many trades did the desk book?", [trades]) == []
+    per_book = _step('SELECT "BOOK", SUM("VALUE") FROM "risk" WHERE "RISK_MEASURE" = \'VAR\' GROUP BY "BOOK"')
+    assert unapplied("VaR per book on 23 September?", [per_book]) == []
+
+
+def test_the_governed_plan_gets_a_rule_only_where_it_belongs(desks):
+    from supagent.governed.decider import Pack, TableInfo
+    from supagent.governed.plan import Step
+    from supagent.governed.validate import Checked, _apply_rules
+
+    def table(name):
+        return TableInfo(subject=f"data:1:{name}", ref="T1", kind="index", database_id=1, database="lab",
+                         backend="osagg", name=name, columns={"BOOK": {}, "DESK": {}})
+
+    pack = Pack(tables=[], knowledge=[], ambiguous=[], missing=[], kind="data", confidence="high")
+
+    def added(name, by=()):
+        step = Step(id="q1", table="T1", by=list(by))
+        out = Checked(plan=None)
+        _apply_rules(step, table(name), "What was the desk's total?", pack, out)
+        return [(c.field, c.value) for c in step.where]
+
+    assert added("trades") == [] and added("pnl") == []                    # not about their data
+    assert added("risk") == [("BOOK", "ALL")]                               # the VaR of a desk
+    assert added("risk", by=["BOOK"]) == []                                 # per book: every book
+
+
+def test_a_rule_whose_value_cannot_be_in_the_data_is_not_applied_there(desks):
+    """The excluding rule on STATUS = 'CANCELLED' concerns trades (its statuses have CANCELLED), not the pricing
+    index, whose statuses are all known and have none (the lab's answers said "STATUS = CANCELLED: no such value")."""
+    from supagent.knowledge import rulecheck
+    from supagent.knowledge.catalog import save_entry
+
+    save_entry({"title": "Cancelled trades", "classification": "rule", "content":
+                "Exclude cancelled trades (STATUS = 'CANCELLED') from trade counts unless the question asks."}, by="admin")
+    rulecheck._CONCERNS.clear()
+    assert rulecheck.value_possible("pricing", "STATUS", "CANCELLED") is False
+    assert rulecheck.value_possible("trades", "STATUS", "cancelled") is True
+    assert rulecheck.possible_in({"values": ["A", "B"], "cardinality": ">=200"}, "C") is None     # not all known
+    q = "How many pricing requests failed?"
+    assert rulecheck.unapplied(q, [_step('SELECT COUNT(*) FROM "pricing" WHERE "STATUS" = \'ERROR\'')]) == []
+    trades = rulecheck.unapplied("How many trades?", [_step('SELECT COUNT(*) FROM "trades"')])
+    assert any("CANCELLED" in r for r in trades)

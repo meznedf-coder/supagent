@@ -1,19 +1,19 @@
-supagent 0.5.4 - the AI agent inside Apache Superset
-=====================================================
+supagent 0.6.0 - the AI agent inside Apache Superset
+====================================================
 
 What is in this folder
-  supagent-0.5.4-py3-none-any.whl   the package (pure Python; needs pydantic, which Superset 6.1 has)
+  supagent-0.6.0-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
 
+Upgrading from 0.5.4? Go to "Upgrade from 0.5.4 to 0.6.0" below. Steps 1-8 are for a new install.
+
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.5.4-py3-none-any.whl
+   $PY -m pip install supagent-0.6.0-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
-   Superset 6.0 (no pydantic there): pip installs pydantic; offline, unzip the pydantic
-   wheelhouse next to the wheel and add:  --no-index --find-links ./wheelhouse-pydantic
 
 2. Register it: one line in superset_config.py (no logic)
 
@@ -43,11 +43,12 @@ What is in this folder
    no authentication:      --set llm.auth=none
    check:                  superset supagent test-llm
 
-   search by meaning (optional; without it the search uses words only; no pgvector needed):
+   search by meaning (optional; without it the search uses words only):
    superset supagent settings --set embed.model=bge-m3
      (the same gateway and authentication as the LLM; another endpoint: --set embed.base_url=...;
       give the model name exactly as the gateway lists it, e.g. GET <llm.base_url>/models)
-   vectors in a Qdrant server instead of Superset's database (optional):
+   The vectors are kept in Superset's database (no extension needed), or in the knowledge store (step 8),
+   or in a Qdrant server:
      --set search.vector_store=qdrant --set qdrant.url=http://<qdrant>:6333 [--set qdrant.api_key=...]
 
 5. Restart the web server, the Celery workers and Celery beat.
@@ -88,12 +89,147 @@ What is in this folder
    learn.profile_every_days (7) days, the database left for the day after
    learn.stop_after_errors (5) overload errors. Limit what is learned if the clusters are shared:
    superset supagent settings --set "learn.indices=batch-jobs*" --set "learn.metrics=node_*,batch_*"
+   The run also classifies the knowledge (categories, at most learn.classify_per_run = 400 items a day);
+   the first time, all at once: superset supagent classify --minutes 30
 
-7. Documents and sites for the agent (optional): Settings -> Chat settings -> Documents and sites.
-   Intranet sites need their domain allowed first:
+7. Documents and sites for the agent (optional): Settings -> Data dictionary -> Knowledge -> Documents and
+   sites. Intranet sites need their domain allowed first:
    superset supagent settings --set "docs.allowed_domains=wiki.company.com"
 
-Upgrade: pip install the new wheel, superset supagent init, restart.
+8. The knowledge store in PostgreSQL (optional): the search by words (BM25), near spellings and meaning, and
+   the chats, in PostgreSQL. In Superset's database (or another PostgreSQL: --set search.store_uri=...),
+   as a superuser:
+     CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;
+     CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+   Each one is optional: the store uses the ones it finds (none: the search without it, as in 0.5).
+   pg_textsearch 0.5.x: do NOT put it in shared_preload_libraries (see step 1 of the upgrade below);
+   1.x needs it there.
+   Superset's database user needs the CREATE privilege on that database (the store is a schema of its own,
+   supagent_store). Then:
+     superset supagent init          builds it (the first time it finds the extensions)
+     superset supagent store status  extensions, versions, size, warnings
+
+Upgrade from 0.5.4 to 0.6.0
+===========================
+
+What changes (each one can be switched off):
+  - The router (MOA): before each answer, one short LLM call (60 s at most) chooses the kind of work
+    (functional, technical, incident, charts, observability, infrastructure). Off: agent.router=false
+  - The knowledge store, when vector, pg_trgm or pg_textsearch is in Superset's database: init builds it,
+    then the search runs in PostgreSQL. Off: search.store=off (the search of 0.5.4)
+  - The chats go into the store; each user can search their own (a search box above the chats).
+    Off: search.chats=false
+  - The catalog, the team memory, the Context, the documents and sites are now edited in the Data dictionary
+    (Settings -> Data dictionary), no longer in Settings -> Chat settings. A save answers at once.
+  - Categories of the knowledge: classified by the LLM with the daily learning (400 items a day at most).
+  - Not changed: the classic pipeline answers (agent.pipeline = classic); the reranker is off.
+  - Superset's database: 6 new tables (supagent_route, supagent_facet, supagent_tag, supagent_link,
+    supagent_classified, supagent_item_use) and the schema supagent_store; no existing table or column
+    changes, nothing is deleted. superset_config.py does not change.
+
+A. Before the day (nothing changes yet)
+
+ 1. PostgreSQL, connected to Superset's database with psql (SHOW shared_preload_libraries needs a superuser or
+    a role with pg_read_all_settings; the two SELECTs work for any user, Superset's too):
+
+      SHOW shared_preload_libraries;
+      SELECT extname, extversion, extnamespace::regnamespace AS schema FROM pg_extension
+       WHERE extname IN ('vector', 'pg_trgm', 'pg_textsearch');
+      SELECT has_database_privilege('<Superset database user>', current_database(), 'CREATE');
+
+    - pg_textsearch 0.5.x in shared_preload_libraries: take it out (or upgrade pg_textsearch to 1.x), then
+      restart PostgreSQL, BEFORE the upgrade. With 0.5.x a ROLLBACK after an error can fail ("ResourceOwnerEnlarge
+      called after release started") and leave the session stuck; preloaded, that is every session, Superset's
+      own too, with 0.5.4 already. Not preloaded, it is loaded only by the store's sessions, which never run a
+      transaction. 1.x has the fix (and must be preloaded).
+    - The extensions must be in Superset's database itself (CREATE EXTENSION is per database), in any schema.
+    - CREATE privilege "f": GRANT CREATE ON DATABASE <Superset database> TO <Superset database user>;
+      or keep the store off (step 8). Without it init says "knowledge store: not built" and the search of
+      0.5.4 answers.
+ 2. Check the wheel (sha256sum -c SHA256SUMS) and keep the 0.5.4 wheel for a rollback.
+
+B. The upgrade (Superset stopped for a few minutes)
+
+ 3. Stop the web servers, the Celery workers and Celery beat, on every host.
+    (A running 0.5.4 process must not load files of 0.6.0: install while everything is stopped.)
+ 4. Back up (PY: the Python of Superset's virtualenv, as in step 1 of a new install):
+      PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
+      pg_dump -Fc -f superset-before-0.6.0.dump "<Superset's database>"
+      $PY -m pip freeze > pip-before-0.6.0.txt
+ 5. Install, on every host that runs Superset (web servers, workers, beat):
+      PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
+      $PY -m pip install supagent-0.6.0-py3-none-any.whl
+      $PY -m pip show supagent | head -2                     (Version: 0.6.0)
+    No other package is installed or changed (pydantic is already there). supagent[graph] is not needed.
+ 6. Once, on one host:
+      superset supagent init
+    It prints, among other lines (the rehearsal of this upgrade on a copy of the lab's database):
+      tables: schema version 7 -> 9
+      knowledge store: built (2064 pieces, 14146 names, pg_textsearch 0.5.0, vectors 1024) in 10.8 s
+    and the warnings to read (e.g. pg_textsearch 0.5.0 is a pre-release: see step 1). "knowledge store: not
+    used" or "not built" + the reason: the search of 0.5.4 answers; check with superset supagent store status.
+    init takes a few minutes: the store (the lab at scale: 10,000 pieces, 380,000 names in 107 s), then the
+    vectors of the last 2,000 chats' questions, older ones hourly after (the rehearsal: 3 minutes in all, the
+    embeddings on a CPU). To keep the stop short: superset supagent settings --set search.store=off before init,
+    and after step 9:
+      superset supagent settings --set search.store=auto
+      superset supagent store rebuild           (while people work; the search of 0.5.4 answers meanwhile)
+ 7. The LLM and embeddings are unchanged; check them from this host: superset supagent test-llm
+ 8. Optional: start with 0.5.4's behaviour and switch the new parts on later:
+      superset supagent settings --set agent.router=false --set search.store=off
+    (back on: --set agent.router=true --set search.store=auto, then superset supagent store rebuild if init
+    did not build it)
+ 9. Start the web servers, the workers and beat.
+
+C. Checks
+
+10. superset supagent store status         extensions, versions, rows; read its "warnings"
+    superset supagent check-knowledge      exit code 0: everything the team put in reaches the agent
+    superset supagent ask --user <admin> "<a question your team often asks>"
+    In Superset: Chat (one question; the search box above the chats), Settings -> Data dictionary (tabs To
+    review, Knowledge, Data, Learned by the agent, Search); Settings -> Chat settings shows "supagent 0.6.0
+    (tables v9)".
+11. Categories, once (needs the LLM; then every day with the learning; a later run continues):
+      superset supagent classify --minutes 30
+    Then Data dictionary -> To review: the new categories, the unsure tags, the "same as" relations (the
+    tags on a new category come up once the category is approved; classify counts them already). The
+    rehearsal: 93 items in 3 minutes (12 LLM calls), 18 new categories and 42 tags to review.
+
+D. Roll back to 0.5.4
+
+12. Stop everything; on every host: $PY -m pip install supagent-0.5.4-py3-none-any.whl; once:
+    superset supagent init (it records schema 7 again); start everything. The new tables and the schema
+    supagent_store stay, unused by 0.5.4 (to drop the store, before going back, with 0.6.0:
+    superset supagent store wipe --yes). The vectors are still in supagent_chunk: nothing to embed again.
+    The backup (step 4) is only for a damaged database (services stopped; as Superset's database user, the
+    errors "must be owner of extension ..." are expected: the extensions stay; then init of the version installed):
+      pg_restore --clean --if-exists -d "<Superset's database>" superset-before-0.6.0.dump
+    Back to 0.6.0 later: steps 3, 5, 6, 9, then superset supagent store sync (the chats of the meantime).
+
+E. Later, optional
+
+    - pg_textsearch 1.x (fixed; in shared_preload_libraries), then: superset supagent store rebuild
+    - A cross-encoder reranker (serve it next to the embeddings, e.g. Qwen3-Reranker-0.6B or
+      bge-reranker-v2-m3 on llama.cpp --reranking, vLLM, Infinity or text-embeddings-inference; measure it on
+      your data first, see the guide):
+        superset supagent settings --set rerank.url=http://<gateway>:8092/v1/rerank --set rerank.api=jina
+          [--set rerank.model=<name>] [--set rerank.auth=llm]        (tei: --set rerank.api=tei)
+    - The governed pipeline (the model fills a plan, code checks it and writes the queries; see the guide):
+        $PY -m pip freeze | grep -iv '^supagent' > /tmp/pinned.txt        # what is installed stays as it is
+        $PY -m pip install "supagent-0.6.0-py3-none-any.whl[graph]" -c /tmp/pinned.txt
+                    # without [graph]: no LangGraph, no MCP servers (the governed pipeline runs its steps in order)
+        superset supagent ask --user <name> --pipeline governed "How many ... on 23 September?"   (try first)
+        superset supagent settings --set agent.pipeline=governed         # back: --set agent.pipeline=classic
+        restart the web servers and the workers
+    - Other MCP servers as sources (needs [graph]):
+        superset supagent settings --set 'mcp.servers=[{"name": "tickets", "transport": "streamable_http",
+          "url": "https://tickets.example/mcp", "headers": {"Authorization": "Bearer ..."},
+          "description": "Support tickets of the teams", "write": ["close_ticket"]}]'
+    - A backup of Superset's database without the store (it is rebuilt from the rest):
+        pg_dump --exclude-schema=supagent_store ...
+
+Older upgrades: pip install the new wheel, superset supagent init, restart.
+   From a 0.6.0 test version (0.6.0b1 to 0.6.0b7): the same; 0.6.0 is 0.6.0b7.
    0.5.4 / 0.5.3 / 0.5.2 / 0.5.1: no new table. Several databases with the same indices or metrics: optionally
    superset supagent settings --set "agent.preferred_databases=<name or id>,<name or id>"
    0.5.0: init adds the tables supagent_context and supagent_llm_call and the column
@@ -103,7 +239,7 @@ Upgrade: pip install the new wheel, superset supagent init, restart.
    From 0.1: init adds the new tables and columns and splits the catalog into entries (the
    former catalog is kept as a backup in supagent_document).
    From 0.2.0 / 0.2.1: learned answers now come only from Helpful. init sends the ones users
-   marked Helpful to review (Data dictionary -> Learned answers: Confirm / Reject); the ones
+   marked Helpful to review (Data dictionary -> To review: Confirm / Reject); the ones
    those versions saved by themselves are no longer listed nor used; to delete them:
    superset supagent remove-auto-learned
    Then, once: superset supagent tidy-learned   (generic questions and chat names, duplicates merged;

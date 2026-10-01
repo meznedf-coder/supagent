@@ -78,8 +78,44 @@ def init() -> None:
             added.append(f"{perm} on {view}")
     db.session.commit()
     click.echo(f"role {ROLE!r}: " + (", ".join(added) if added else "up to date"))
+    _init_store()
     click.echo("Next: give users the role (superset supagent grant <user>, or Superset's user list), set the LLM "
                "(Settings page or superset supagent settings --set ...), then superset supagent learn.")
+
+
+def _init_store() -> None:
+    """The knowledge store built at the first init that finds its extensions (a rebuild later: store rebuild)."""
+    from supagent import settings as S
+    from supagent.knowledge import pgstore
+
+    if (S.get("search.store") or "auto") == "off":
+        return
+    try:
+        e = pgstore.engine()
+        if e is None:
+            click.echo("knowledge store: not used (Superset's database is not PostgreSQL; search.store_uri to use one)")
+            return
+        st = pgstore.status()
+        if st.get("error"):
+            click.echo(f"knowledge store: not built: {st['error'][:300]}")
+            return
+        caps = st.get("extensions") or {}
+        if not (caps.get("vector") or caps.get("pg_textsearch") or caps.get("pg_trgm")):
+            click.echo("knowledge store: not used (no pgvector, pg_textsearch or pg_trgm in that database)")
+            return
+        if (st.get("state") or {}).get("version"):
+            click.echo(f"knowledge store: version {st['state']['version']} ({st.get('rows')})")
+        else:
+            out = pgstore.rebuild()
+            if out.get("skipped"):
+                click.echo(f"knowledge store: not built now ({out['skipped']})")
+            else:
+                click.echo(f"knowledge store: built ({out['docs']} pieces, {out['names']} names, {out['bm25']}, "
+                           f"vectors {out['dims'] or 'none'}) in {out['seconds']} s")
+        for w in pgstore.status().get("warnings") or []:
+            click.echo(f"knowledge store: {w}")
+    except Exception as ex:  # pylint: disable=broad-except   (the search of 0.5 still answers)
+        click.echo(f"knowledge store: not built: {type(ex).__name__}: {str(ex)[:300]}")
 
 
 def _print_settings() -> None:
@@ -349,13 +385,16 @@ def describe(topic: str | None, name: str | None, user: str | None) -> None:
 @click.argument("question")
 @click.option("--user", required=True, help="Superset user the agent acts as")
 @click.option("--steps/--no-steps", default=True, help="Print the tool calls")
+@click.option("--pipeline", type=click.Choice(["classic", "governed"]), default=None,
+              help="This question with this pipeline (default: agent.pipeline)")
 @with_appcontext
-def ask(question: str, user: str, steps: bool) -> None:
+def ask(question: str, user: str, steps: bool, pipeline: str | None) -> None:
     from supagent.agent import Agent
+    from supagent.governed.pipeline import GovernedAgent, make_agent
     from supagent.security import acting_as
 
     with acting_as(user):
-        agent = Agent(user)
+        agent = {"classic": Agent, "governed": GovernedAgent}[pipeline](user) if pipeline else make_agent(user)
         try:
             if agent.superset.error:
                 click.echo(f"(note: {agent.superset.error})", err=True)
@@ -380,6 +419,83 @@ def index(refresh_docs: bool) -> None:
         for r in refresh_due():
             click.echo(f"document {r['id']}: {r['status']}, {r['pages']} page(s) {r.get('error') or ''}")
     click.echo(json.dumps(index_knowledge(), indent=2, default=str))
+
+
+@supagent.command(help="Classify the knowledge that changed (categories and relations, with the LLM), now")
+@click.option("--minutes", default=15, show_default=True, type=int)
+@click.option("--limit", default=400, show_default=True, type=int)
+@with_appcontext
+def classify(minutes: int, limit: int) -> None:
+    from supagent.knowledge.facets import classify as run, review_counts
+    from supagent.llm import LLM, llm_task
+
+    with llm_task("classify"):
+        out = run(LLM(), seconds=minutes * 60.0, limit=limit)
+    out["waiting_for_review"] = review_counts()
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@supagent.group(help="The knowledge store in PostgreSQL (BM25, near spellings, vectors, chats)")
+def store() -> None:
+    pass
+
+
+@store.command("status", help="Where it is, its extensions and versions, its size, the warnings to read")
+@with_appcontext
+def store_status() -> None:
+    from supagent.knowledge import pgstore
+
+    click.echo(json.dumps(pgstore.status(), indent=2, default=str))
+
+
+@store.command("rebuild", help="Build it again from Superset's database (beside the one in use, then switched)")
+@with_appcontext
+def store_rebuild() -> None:
+    from supagent.knowledge import pgstore
+
+    click.echo(json.dumps(pgstore.rebuild(), indent=2, default=str))
+
+
+@store.command("sync", help="Bring it in step now (it is, hourly and after each change)")
+@with_appcontext
+def store_sync() -> None:
+    from supagent.knowledge import pgstore
+
+    click.echo(json.dumps(pgstore.maintain(), indent=2, default=str))
+
+
+@store.command("wipe", help="Drop it (the search of 0.5 answers until the next rebuild)")
+@click.option("--yes", is_flag=True, help="Do not ask")
+@with_appcontext
+def store_wipe(yes: bool) -> None:
+    from supagent.knowledge import pgstore
+
+    if not yes and not click.confirm(f"Drop the schema {pgstore.schema()} and everything in it?"):
+        return
+    click.echo("dropped" if pgstore.wipe() else "no store")
+
+
+@store.command("search", help="Search it as a user would (each piece with how it was found)")
+@click.argument("query")
+@click.option("--user", default=None, help="As this user (default: the learning user)")
+@click.option("--limit", default=8, show_default=True, type=int)
+@click.option("--chats", is_flag=True, help="The user's own chats instead")
+@with_appcontext
+def store_search(query: str, user: str | None, limit: int, chats: bool) -> None:
+    from flask import g
+
+    from supagent.knowledge import pgstore
+    from supagent.knowledge.learner import learning_username
+    from supagent.security import acting_as
+
+    with acting_as(user or learning_username()):
+        if chats:
+            for c in pgstore.chats(query, g.user.id, k=limit):
+                click.echo(f"{c['at']}  {c['question'][:120]}\n        tables {c['tables']}  {c['answer'][:160]!r}")
+            return
+        for f in pgstore.search(query, limit):
+            click.echo(f"{f['score']:.4f}  [{f['kind']}] {f['title'][:100]}  via {f['via']} {f['ranks']}"
+                       + (f"  spelled {[(x['word'], x['name']) for x in f['spelled'][:3]]}" if f["spelled"] else ""))
 
 
 @supagent.command("check-knowledge", help="Is everything the team put in the knowledge given to the agent? "

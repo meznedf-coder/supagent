@@ -486,6 +486,11 @@ def recipes_for(question: str, limit: int = 3) -> list[dict[str, Any]]:
         if len(common) < max(2, len(ws) // 3):
             continue
         scored.append((len(common) + (2 if r.status == "confirmed" else 0) + min(r.uses or 1, 5) * 0.2, r))  # admin first
+    from supagent.knowledge.ranking import adjust, demoted, usefulness
+
+    use = usefulness([f"recipe:{r.id}" for _s, r in scored]) if scored else {}   # what the discussions said
+    scored = [(sc + 2.0 * adjust(use.get(f"recipe:{r.id}")), r) for sc, r in scored
+              if not demoted(use.get(f"recipe:{r.id}")) or r.status == "confirmed"]    # an admin's stays
     from supagent.knowledge.resolve import gone_names, mentions_gone
 
     out = []

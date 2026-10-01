@@ -16,7 +16,7 @@ from superset.extensions import encrypted_field_factory
 
 from supagent.textsafe import SafeString, SafeText
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 
 def _now() -> dt.datetime:
@@ -428,8 +428,107 @@ class ContextPage(db.Model):  # type: ignore[name-defined]
     updated_at = sa.Column(sa.DateTime, default=_now)
 
 
+class Route(db.Model):  # type: ignore[name-defined]
+    """What the decider showed for a question (the candidate tables with their features and scores), what
+    it chose, what the answer's queries read, and what a person said of the answer: the gate learns from
+    the confirmed ones (governed.gate)."""
+
+    __tablename__ = "supagent_route"
+    id = sa.Column(sa.Integer, primary_key=True)
+    message_id = sa.Column(sa.Integer, index=True)    # the answer (no foreign key: old chats are purged)
+    user_id = sa.Column(sa.Integer)
+    question = sa.Column(SafeText)
+    terms = sa.Column(SafeText)                     # the question's words (stems), space separated
+    shown = sa.Column(sa.JSON)                      # [{"subject", "features", "score"}]
+    chosen = sa.Column(sa.JSON)                     # subjects the decider chose
+    used = sa.Column(sa.JSON)                       # subjects the queries of the answer read
+    signal = sa.Column(SafeString(16))              # helpful | confirmed | clarified | not_helpful
+    signal_at = sa.Column(sa.DateTime)
+    created_at = sa.Column(sa.DateTime, default=_now)
+    moa = sa.Column(SafeString(16), index=True)     # the router's route (supagent.router), other: the normal way
+    moa_by = sa.Column(SafeString(16))              # llm | examples | admin example | fallback | off
+    moa_confidence = sa.Column(SafeString(8))
+    moa_followed = sa.Column(sa.Boolean)            # the execution kept to the route (only these teach)
+    moa_detail = sa.Column(sa.JSON)                 # what the LLM said, the examples it was shown
+
+
+class Facet(db.Model):  # type: ignore[name-defined]
+    """A value of a category of the knowledge, in the deployment's own words: a subject, an application, a
+    component (the aspect, functional or technical, is fixed). Seeded from what people wrote and from the data
+    (approved), proposed by the LLM (used once an admin approves it)."""
+
+    __tablename__ = "supagent_facet"
+    __table_args__ = (sa.UniqueConstraint("facet", "value", name="uq_supagent_facet"),)
+    id = sa.Column(sa.Integer, primary_key=True)
+    facet = sa.Column(SafeString(24), nullable=False, index=True)   # aspect | subject | application | component
+    value = sa.Column(SafeString(128), nullable=False)
+    description = sa.Column(SafeText)
+    synonyms = sa.Column(sa.JSON)
+    status = sa.Column(SafeString(16), default="proposed")          # approved | proposed | rejected
+    source = sa.Column(SafeString(16))                              # seed | data | llm | admin
+    created_at = sa.Column(sa.DateTime, default=_now)
+    reviewed_by = sa.Column(SafeString(255))
+    reviewed_at = sa.Column(sa.DateTime)
+
+
+class Tag(db.Model):  # type: ignore[name-defined]
+    """A knowledge item (entry:3, memory:5, doc:2, context:7, recipe:9, object:44) under a category value."""
+
+    __tablename__ = "supagent_tag"
+    __table_args__ = (sa.UniqueConstraint("ref", "facet_id", name="uq_supagent_tag"),)
+    id = sa.Column(sa.Integer, primary_key=True)
+    ref = sa.Column(SafeString(128), nullable=False, index=True)
+    facet_id = sa.Column(sa.Integer, nullable=False, index=True)
+    confidence = sa.Column(sa.Float)
+    source = sa.Column(SafeString(16))                              # llm | admin | family
+    status = sa.Column(SafeString(16), default="approved")          # approved | proposed | rejected
+    created_at = sa.Column(sa.DateTime, default=_now)
+    reviewed_by = sa.Column(SafeString(255))
+
+
+class Link(db.Model):  # type: ignore[name-defined]
+    """A relation between two knowledge items, or an item and a table (data:<database>:<name>), found by the LLM
+    in the texts (about, depends_on, part_of, explains, runs_on), used once approved or confident."""
+
+    __tablename__ = "supagent_link"
+    __table_args__ = (sa.UniqueConstraint("a_ref", "b_ref", "kind", name="uq_supagent_link"),)
+    id = sa.Column(sa.Integer, primary_key=True)
+    a_ref = sa.Column(SafeString(128), nullable=False, index=True)
+    b_ref = sa.Column(SafeString(128), nullable=False, index=True)
+    kind = sa.Column(SafeString(24), nullable=False)
+    confidence = sa.Column(sa.Float)
+    source = sa.Column(SafeString(16))
+    status = sa.Column(SafeString(16), default="approved")
+    created_at = sa.Column(sa.DateTime, default=_now)
+    reviewed_by = sa.Column(SafeString(255))
+
+
+class Classified(db.Model):  # type: ignore[name-defined]
+    """An item the LLM classified, with the hash of its text then: classified again only when it changes."""
+
+    __tablename__ = "supagent_classified"
+    ref = sa.Column(SafeString(128), primary_key=True)
+    content_hash = sa.Column(SafeString(64))
+    classified_at = sa.Column(sa.DateTime, default=_now)
+
+
+class ItemUse(db.Model):  # type: ignore[name-defined]
+    """A knowledge item given to the LLM for an answer (what the agent learned is ranked from it and from what
+    people said of the answers)."""
+
+    __tablename__ = "supagent_item_use"
+    id = sa.Column(sa.Integer, primary_key=True)
+    ref = sa.Column(SafeString(128), nullable=False, index=True)
+    route_id = sa.Column(sa.Integer, index=True)
+    message_id = sa.Column(sa.Integer, index=True)
+    user_id = sa.Column(sa.Integer)
+    how = sa.Column(SafeString(16))                                 # given | chosen | used
+    created_at = sa.Column(sa.DateTime, default=_now, index=True)
+
+
 TABLES = [Meta, Setting, Source, KObject, Relation, Run, Change, Conversation, Message, File, Example, Document,
-          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association, Usage, ContextPage, LLMCall]
+          Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association, Usage, ContextPage, LLMCall,
+          Route, Facet, Tag, Link, Classified, ItemUse]
 
 
 def _add_missing_columns(engine: sa.engine.Engine) -> list[str]:

@@ -1114,6 +1114,26 @@ def search_knowledge(query: str, kind: str | None = None, limit: int = 8) -> dic
 
 
 @mcp.tool
+def search_my_chats(query: str, days: int | None = None, limit: int = 6) -> dict:
+    """Search the user's own earlier chats (their questions, the beginning of the answers, their dates and
+    the tables they read) for a question about something asked before ("as last week", "the number you gave
+    me"). The numbers of an old answer are of its date: run the query again for today's numbers."""
+    try:
+        with _as_user():
+            from flask import g
+
+            from supagent.knowledge import pgstore
+
+            if not pgstore.active():
+                return {"error": "the chats are searched in the knowledge store only (superset supagent store rebuild)"}
+            uid = getattr(getattr(g, "user", None), "id", None)
+            found = pgstore.chats(query, uid, k=max(1, min(int(limit or 6), 12)), days=days)
+            return {"query": query, "chats": found}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
+
+
+@mcp.tool
 def data_changes(days: int = 7) -> dict:
     """What the daily learning found different in the last days: new or gone metrics, indices,
     fields and labels, changed types or units, big changes of series counts or distinct values."""

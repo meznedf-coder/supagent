@@ -222,3 +222,38 @@ def test_a_follow_up_with_another_day_is_not_answered_from_the_chat(ctx, monkeyp
     b, _ran = agent_with(monkeypatch, [say("ok")])
     last = b.prompt("The CPU of srv-amer-002 yesterday.", history)[-1]["content"]
     assert last.endswith("The CPU of srv-amer-002 yesterday.")          # a new question, not a completion
+
+
+def test_a_date_alone_on_a_field_with_times_is_sent_back(world):
+    """A date field whose values carry a time (stored at 00:00 UTC, read at 02:00 here; or real times) finds
+    nothing with = '2026-09-23': sent back once with the day's range; a field of dates alone passes."""
+    from superset.extensions import db
+
+    from supagent.knowledge.period import refusal
+    from supagent.models import KObject
+
+    src = db.session.query(KObject).filter(KObject.kind == "index", KObject.name == "jobs").one().source_id
+    timed = KObject(source_id=src, kind="field", parent="jobs", name="RUN_DATE", data_type="date",
+                    stats={"min": "2026-07-01 02:00", "max": "2026-09-25 02:00"})
+    plain = KObject(source_id=src, kind="field", parent="jobs", name="COB", data_type="date",
+                    stats={"min": "2026-07-01", "max": "2026-09-25 00:00"})
+    db.session.add_all([timed, plain])
+    db.session.commit()
+    try:
+        q = "How many jobs ran on 23 September?"
+        back = refusal(q, "execute_sql", _sql('SELECT COUNT(*) FROM "jobs" WHERE "RUN_DATE" = \'2026-09-23\''), TODAY)
+        assert back.startswith("tool error (not run: date)") and "\"RUN_DATE\" < '2026-09-24'" in back
+        assert "e.g. 2026-09-25 02:00" in back
+        inlist = refusal(q, "execute_sql", _sql('SELECT COUNT(*) FROM "jobs" WHERE RUN_DATE IN (\'2026-09-23\')'), TODAY)
+        assert inlist and "not run: date" in inlist
+        ranged = refusal(q, "execute_sql", _sql(
+            "SELECT COUNT(*) FROM \"jobs\" WHERE \"RUN_DATE\" >= '2026-09-23' AND \"RUN_DATE\" < '2026-09-24' "
+            "AND \"ts\" >= '2026-09-23 00:00' AND \"ts\" < '2026-09-24 00:00'"), TODAY)
+        assert ranged is None
+        assert "not run: date" not in (refusal(q, "execute_sql", _sql(
+            "SELECT COUNT(*) FROM \"jobs\" WHERE \"COB\" = '2026-09-23' AND \"ts\" >= '2026-09-23 00:00' "
+            "AND \"ts\" < '2026-09-24 00:00'"), TODAY) or "")                   # dates alone: equality works
+    finally:
+        db.session.delete(timed)
+        db.session.delete(plain)
+        db.session.commit()

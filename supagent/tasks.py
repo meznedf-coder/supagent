@@ -140,6 +140,9 @@ def learn_tick() -> None:
             log.exception("supagent: clean-up of the queue")
         try:
             from supagent import settings
+            from supagent.knowledge.ranking import purge as purge_uses
+
+            purge_uses()                     # the uses of the learned items older than a year and a month
             from supagent.knowledge.usage import purge as purge_calls
 
             purge_calls(int(settings.get("usage.keep_days") or 0))      # the LLM usage page's old calls
@@ -154,6 +157,20 @@ def learn_tick() -> None:
 
             refresh_due()
             index_knowledge()
+        try:                                     # the decider's gate from the answers people confirmed
+            from supagent.governed.gate import learn
+
+            learn()
+        except Exception:  # pylint: disable=broad-except
+            db.session.rollback()
+            log.exception("supagent: the decider's gate was not learned")
+        try:                                     # the knowledge store: chats, routes, names, new vectors
+            from supagent.knowledge.pgstore import maintain
+
+            maintain()
+        except Exception:  # pylint: disable=broad-except
+            db.session.rollback()
+            log.exception("supagent: the knowledge store was not kept in step")
         from supagent.knowledge.context import build_context, context_due
 
         if context_due():                    # the nightly Context, after the day's learning

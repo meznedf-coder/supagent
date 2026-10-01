@@ -1,10 +1,56 @@
-/* supagent data dictionary page */
+/* supagent data dictionary page: the tabs (one controller, deep links #catalog, #review, ...), the data learned
+   (browse, relations, changes), the Context, what the agent learned, the search. The knowledge editors and the
+   review are in knowledge.js, which registers its tabs here. */
 (function () {
   "use strict";
   var S = window.supagent, el = S.el, esc = S.esc;
-  var state = { page: 0, size: 50, total: 0, admin: false };
+  var state = { page: 0, size: 50, total: 0, admin: S.isAdmin };
   var $ = function (id) { return document.getElementById(id); };
   var KIND = { metric: "metric", label: "label", family: "family", index: "index", field: "field" };
+
+  // ------------------------------------------------------------------ tabs: one controller for the page
+  var MAIN = ["review", "knowledge", "data", "learned", "search"];
+  var SUBS = { knowledge: ["catalog", "memory", "context", "docs", "categories"], data: ["browse", "relations", "changes"] };
+  var ADMIN_ONLY = ["review", "categories"];
+  var loaders = {}, current = {}, active = null;
+
+  function mainOf(name) {
+    if (MAIN.indexOf(name) >= 0) return name;
+    return Object.keys(SUBS).filter(function (k) { return SUBS[k].indexOf(name) >= 0; })[0] || null;
+  }
+  function allowed(name) { return !!mainOf(name) && (state.admin || ADMIN_ONLY.indexOf(name) < 0); }
+
+  function show(name, quiet) {
+    var redirected = !allowed(name);              // an admin's tab asked by someone else: the catalog, said so
+    if (redirected) name = "catalog";
+    var main = mainOf(name);
+    var sub = SUBS[main] ? (SUBS[main].indexOf(name) >= 0 ? name : current[main] || SUBS[main][0]) : null;
+    if (sub && !allowed(sub)) sub = SUBS[main][0];
+    MAIN.forEach(function (t) { $("tab-" + t).hidden = t !== main; });
+    document.querySelectorAll(".maintabs button[data-tab]").forEach(function (b) {
+      var on = b.dataset.tab === main;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    if (SUBS[main]) {
+      SUBS[main].forEach(function (s) { $("sub-" + s).hidden = s !== sub; });
+      $("tab-" + main).querySelectorAll(".subnav button").forEach(function (b) { b.classList.toggle("on", b.dataset.sub === sub); });
+      current[main] = sub;
+    }
+    active = sub || main;
+    if (!quiet || redirected) {
+      try { history.replaceState(null, "", "#" + active); } catch (e) { /* not in a browser that allows it */ }
+    }
+    if (loaders[active]) loaders[active]();
+  }
+
+  document.querySelectorAll(".maintabs button[data-tab]").forEach(function (b) {
+    b.addEventListener("click", function () { show(b.dataset.tab); });
+  });
+  document.querySelectorAll(".subnav button[data-sub]").forEach(function (b) {
+    b.addEventListener("click", function () { show(b.dataset.sub); });
+  });
+  if (!state.admin) document.querySelectorAll(".admin-only").forEach(function (x) { x.hidden = true; });
 
   /* a "Copy" link; where the browser blocks the clipboard (plain http), the text is selected */
   function copyLink(label, getText) {
@@ -26,7 +72,6 @@
 
   function summary() {
     return S.dict("GET", "summary").then(function (data) {
-      state.admin = !!data.is_admin;
       var box = $("sources");
       box.innerHTML = "";
       var sel = $("f-source");
@@ -42,7 +87,8 @@
           el("div", { class: "counts" }, parts.filter(function (p) { return p[1]; }).map(function (p) {
             return el("span", { text: S.num(p[1]) + " " + p[0] });
           }).concat([el("span", { text: S.num(s.described) + " described" }),
-                     s.unverified ? el("span", { html: S.num(s.unverified) + ' <span class="badge llm">AI-written</span> to check' }) : null]))
+                     s.unverified ? el("button", { type: "button", class: "linkish", html: S.num(s.unverified) + ' <span class="badge llm">AI-written</span> to check',
+                       onclick: function () { browseUnverified(s.id); } }) : null]))
         ]);
         box.appendChild(card);
         if (!sel.querySelector('option[value="' + s.id + '"]')) sel.appendChild(el("option", { value: s.id, text: s.database }));
@@ -50,9 +96,17 @@
       if (!(data.sources || []).length) {
         box.appendChild(el("div", { class: "source muted", text: "Nothing learned yet for the databases you may query. An admin can start a learning run in Settings → Chat settings." }));
       }
+      var src = data.sources || [], learned = src.filter(function (s) { return s.last_learned_at; }).length;
+      var described = src.reduce(function (n, s) { return n + (s.described || 0); }, 0);
+      var unverified = src.reduce(function (n, s) { return n + (s.unverified || 0); }, 0);
+      $("sources-line").textContent = src.length ? S.num(src.length) + " database" + (src.length > 1 ? "s" : "") + " you may query · " +
+        S.num(learned) + " learned · " + S.num(described) + " objects described" +
+        (unverified ? " · " + S.num(unverified) + " AI-written to check" : "") : "No database learned yet";
+      if (!learned) $("sources-box").open = true;
     });
   }
 
+  // ------------------------------------------------------------------ Data: browse
   function query() {
     var p = ["page=" + state.page, "size=" + state.size];
     [["source", "f-source"], ["kind", "f-kind"], ["show", "f-show"], ["q", "f-q"]].forEach(function (x) {
@@ -75,7 +129,7 @@
   }
 
   function load() {
-    S.dict("GET", "objects?" + query()).then(function (data) {
+    return S.dict("GET", "objects?" + query()).then(function (data) {
       var tb = $("objects").querySelector("tbody");
       tb.innerHTML = "";
       state.total = data.total || 0;
@@ -120,8 +174,14 @@
     ["top", "Most frequent"], ["labels", "Labels"], ["parts", "Parts"], ["sampled_docs", "Documents sampled"], ["note", "Note"],
     ["profiled_at", "Profiled"]];
 
-  function detail(id) {
-    S.dict("GET", "objects/" + id).then(function (o) {
+  function openDrawer() {
+    $("drawer").hidden = false;
+    $("d-close").focus();
+  }
+
+  /* an object of the dictionary in the side panel; after: called when an admin saved or approved it */
+  function detail(id, after) {
+    return S.dict("GET", "objects/" + id).then(function (o) {
       if (o.error) return;
       var b = $("d-body");
       b.innerHTML = "";
@@ -134,7 +194,7 @@
       b.appendChild(kv(o, [["metric_type", "Metric type"], ["data_type", "Type"], ["unit", "Unit"], ["category", "Category"],
                            ["synonyms", "Also called"], ["backend_help", "HELP text of the source"], ["first_seen", "First seen"],
                            ["last_seen", "Last seen"]]));
-      if (state.admin) b.appendChild(editor(o));
+      if (state.admin) b.appendChild(editor(o, after));
       var st = o.stats || {};
       if (Object.keys(st).length) {
         b.appendChild(el("div", { class: "section" }, [el("h3", { text: "Measured" }), kv(st, STAT_KEYS)]));
@@ -157,7 +217,7 @@
           row.appendChild(el("div", { class: "nm", text: r.text }));
           row.appendChild(el("div", { class: "muted", text: (r.origin === "curated" ? "written in the catalog" : r.relation === "family_part" ? "same metric family" : "measured on the data") +
                                                             (r.confidence !== null && r.confidence !== undefined ? " · confidence " + Math.round(r.confidence * 100) + "%" : "") }));
-          row.appendChild(el("button", { type: "button", class: "btn small", text: "Open " + (r.other.parent ? r.other.parent + " \u203a " : "") + r.other.name,
+          row.appendChild(el("button", { type: "button", class: "btn small", text: "Open " + (r.other.parent ? r.other.parent + " › " : "") + r.other.name,
                                          onclick: function () { detail(r.other.id); } }));
           rs.appendChild(row);
         });
@@ -170,12 +230,11 @@
         });
         b.appendChild(cs);
       }
-      $("drawer").hidden = false;
-      $("d-close").focus();
+      openDrawer();
     });
   }
 
-  function editor(o) {
+  function editor(o, after) {
     var ta = el("textarea", { rows: "3", "aria-label": "Description" });
     ta.value = o.description || "";
     var cat = el("input", { type: "text", "aria-label": "Category", placeholder: "category" });
@@ -185,23 +244,30 @@
     var syn = el("input", { type: "text", "aria-label": "Also called", placeholder: "also called (comma separated)" });
     syn.value = (o.synonyms || []).join(", ");
     var res = el("span", { class: "result" });
+    var done = function (r) {
+      res.textContent = r.error || "saved";
+      res.className = "result " + (r.error ? "bad" : "good");
+      if (!r.error) {
+        if (D.saved) D.saved();
+        detail(o.id, after);
+        if (active === "browse") load();
+        if (after) after();
+      }
+    };
     var save = el("button", { type: "button", class: "btn primary small", text: "Save as curated", onclick: function () {
-      S.dict("POST", "objects/" + o.id, { description: ta.value, category: cat.value, unit: unit.value, synonyms: syn.value }).then(function (r) {
-        res.textContent = r.error || "saved";
-        res.className = "result " + (r.error ? "bad" : "good");
-        if (!r.error) { detail(o.id); load(); }
-      });
+      S.dict("POST", "objects/" + o.id, { description: ta.value, category: cat.value, unit: unit.value, synonyms: syn.value }).then(done);
     } });
     var kids = [el("h3", { text: "Edit (admins)" }), ta, el("div", { class: "actions" }, [cat, unit]), syn, el("div", { class: "actions" }, [save])];
     if (o.description_source === "llm" && !o.verified) {
       kids[kids.length - 1].appendChild(el("button", { type: "button", class: "btn small", text: "Approve the AI text", onclick: function () {
-        S.dict("POST", "objects/" + o.id, { approve: true }).then(function () { detail(o.id); load(); });
+        S.dict("POST", "objects/" + o.id, { approve: true }).then(done);
       } }));
     }
     kids[kids.length - 1].appendChild(res);
     return el("div", { class: "edit section" }, kids);
   }
 
+  // ------------------------------------------------------------------ Data: relations, changes
   var pages = { relations: { page: 0, size: 50, total: 0 }, changes: { page: 0, size: 50, total: 0 },
                 timings: { page: 0, size: 50, total: 0 } };
   function paged(name) { var p = pages[name]; return "page=" + p.page + "&size=" + p.size; }
@@ -258,7 +324,7 @@
     b.appendChild(el("h2", { id: "d-title", text: title }));
     b.appendChild(el("pre", { class: "entry-text", text: text || "" }));
     (extra || []).forEach(function (x) { if (x) b.appendChild(x); });
-    $("drawer").hidden = false;
+    openDrawer();
   }
   function emptyRow(cols, text) { return el("tr", {}, [el("td", { colspan: String(cols), class: "muted", text: text })]); }
   function row(onclick, cells) {
@@ -266,46 +332,16 @@
       onkeydown: function (ev) { if (ev.key === "Enter") onclick(); } }, cells);
   }
 
-  function knowledge() {
-    return S.dict("GET", "knowledge").then(function (d) {
-      var tb = $("kn-entries").querySelector("tbody");
-      tb.innerHTML = "";
-      (d.entries || []).forEach(function (e) {
-        tb.appendChild(row(function () {
-          textDrawer(e.title, e.classification + (e.category ? " · " + e.category : "") + " · by " + (e.by || "?"), e.content);
-        }, [el("td", { class: "nm", text: e.title }), el("td", { text: e.classification }), el("td", { text: e.category || "" }),
-            el("td", { text: e.by || "" }), el("td", { text: S.when(e.updated_at) })]));
-      });
-      if (!(d.entries || []).length) tb.appendChild(emptyRow(5, "No catalog entry yet."));
-      var td = $("kn-docs").querySelector("tbody");
-      td.innerHTML = "";
-      (d.docs || []).forEach(function (x) {
-        td.appendChild(row(function () {
-          textDrawer(x.title, (x.url || "uploaded file") + (x.category ? " · " + x.category : ""),
-            x.excerpt + (x.chars > (x.excerpt || "").length ? "\n\u2026 (" + S.num(x.chars) + " characters in all)" : ""));
-        }, [el("td", { class: "nm", text: x.title }), el("td", { text: x.kind === "url" ? "site" + (x.pages ? " (" + x.pages + " pages)" : "") : "file" }),
-            el("td", { text: x.status || "" }), el("td", { class: "num", text: S.num(x.chars) + " characters" }),
-            el("td", { text: S.when(x.fetched_at) })]));
-      });
-      if (!(d.docs || []).length) td.appendChild(emptyRow(5, "No document or site yet."));
-      var ul = $("kn-memory");
-      ul.innerHTML = "";
-      (d.team_memory || []).forEach(function (m) {
-        ul.appendChild(el("li", {}, [el("span", { class: "badge", text: m.kind }), " ", m.text,
-          el("span", { class: "muted", text: " · " + S.when(m.created_at) })]));
-      });
-      if (!(d.team_memory || []).length) ul.appendChild(el("li", { class: "muted", text: "No team memory yet." }));
-    });
-  }
-
-  function browseUnverified(sourceId) {             // the AI descriptions of a database, to verify
-    $("f-source").value = String(sourceId);
+  var browsed = false;
+  function browseUnverified(sourceId) {             // the AI descriptions (of a database), to verify
+    $("f-source").value = sourceId ? String(sourceId) : "";
     $("f-show").value = "unverified";
-    document.querySelector('.subtabs button[data-tab="browse"]').click();
     state.page = 0;
-    load();
+    browsed = false;
+    show("browse");
   }
 
+  // ------------------------------------------------------------------ Learned by the agent
   function agentKnowledge() {
     return S.dict("GET", "agent_knowledge").then(function (d) {
       var box = $("agent-summary");
@@ -320,9 +356,11 @@
       te.innerHTML = "";
       (d.entries || []).forEach(function (e) {
         te.appendChild(row(function () {
+          if (state.admin && D.openEntry) { D.openEntry(e.id); return; }
           textDrawer(e.title, e.classification + " · written by the agent" + (e.enabled ? "" : " · disabled"), e.content,
             [el("h3", { text: "Evidence" }), el("pre", { class: "entry-text", text: JSON.stringify(e.evidence || {}, null, 2) })]);
-        }, [el("td", { class: "nm", text: e.title }), el("td", { text: e.classification }),
+        }, [el("td", {}, [el("div", { class: "nm", text: e.title }), el("div", { class: "use-why", text: e.why || "" })]),
+            el("td", { text: e.classification }),
             el("td", { class: "nm", text: e.origin || "" }), el("td", { text: S.when(e.updated_at) })]));
       });
       if (!(d.entries || []).length) te.appendChild(emptyRow(4, "No catalog entry written by the agent yet."));
@@ -330,13 +368,73 @@
       ta.innerHTML = "";
       (d.associations || []).forEach(function (a) {
         ta.appendChild(el("tr", {}, [el("td", { class: "nm", text: a.word }),
-          el("td", { class: "nm", text: (a.parent ? a.parent + " \u203a " : "") + a.name + " (" + a.kind + ")" }),
+          el("td", { class: "nm", text: (a.parent ? a.parent + " › " : "") + a.name + " (" + a.kind + ")" }),
           el("td", { text: String(a.database) }), el("td", { class: "num", text: S.num(a.uses) })]));
       });
       if (!(d.associations || []).length) ta.appendChild(emptyRow(4, "Nothing yet: it comes from the answers of the chat."));
     });
   }
 
+  function recipes() {
+    var st = $("r-status").value;
+    return S.dict("GET", "recipes" + (st ? "?status=" + st : "")).then(function (data) {
+      var tb = $("recipes").querySelector("tbody");
+      tb.innerHTML = "";
+      (data.recipes || []).forEach(function (r) {
+        var way = el("td", { class: "nm" }, [el("div", { class: "muted", text: r.tool + (r.target ? " · " + r.target : "") }),
+                                             el("details", {}, [el("summary", { text: (r.query || "").slice(0, 90) + ((r.query || "").length > 90 ? "…" : "") }),
+                                                                el("pre", { text: r.query || "" })])]);
+        var actions = el("td", {});
+        if (data.is_admin) {
+          [["confirmed", "Confirm"], ["rejected", "Reject"]].forEach(function (a) {
+            if (r.status !== a[0] && r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: a[1], onclick: function () {
+              S.dict("POST", "recipes/" + r.id, { status: a[0] }).then(function () { if (D.saved) D.saved(); recipes(); });
+            } }));
+          });
+          actions.appendChild(el("button", { type: "button", class: "linkish", text: "Delete", onclick: function () {
+            if (this.dataset.sure) { S.dict("DELETE", "recipes/" + r.id).then(recipes); }
+            else { this.dataset.sure = "1"; this.textContent = "Delete: sure?"; }
+          } }));
+        }
+        var u = r.use || {};
+        var q = el("td", {}, [el("div", { text: r.question }), el("div", { class: "use-why" + (r.demoted ? " bad" : r.rank > 0.2 ? " good" : ""),
+          text: r.why || "" })]);
+        tb.appendChild(el("tr", { class: r.demoted ? "demoted" : "" }, [q, way,
+          el("td", { class: "num", text: r.seconds !== null && r.seconds !== undefined ? S.num(r.seconds) + " s" : "" }),
+          el("td", { class: "num", title: "answers it was given to: helpful / not helpful",
+                     text: u.given ? S.num(u.helpful || 0) + " / " + S.num(u.not_helpful || 0) : S.num(r.helpful || r.uses) }),
+          el("td", { html: '<span class="badge ' + (r.status === "confirmed" ? "ok" : r.status === "rejected" ? "bad" : r.status === "helpful" ? "warn" : "") + '">' +
+                           S.esc(r.status === "helpful" ? "helpful, to review" : r.status === "auto" ? "automatic (old)" : r.status) + "</span>" }),
+          actions]));
+      });
+      if (!(data.recipes || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted",
+        text: "Nothing learned yet: an answer marked Helpful in the chat is learned here, for an admin to confirm or reject." })]));
+    });
+  }
+
+  function timings() {
+    S.dict("GET", "timings?" + paged("timings")).then(function (data) {
+      pages.timings.total = data.total || 0;
+      S.pager($("t-pager"), pages.timings, timings);
+      var tb = $("timings").querySelector("tbody");
+      tb.innerHTML = "";
+      (data.timings || []).forEach(function (t) {
+        var q = t.pattern || "";
+        var parts = [el("summary", { text: q.length > 160 ? q.slice(0, 160) + "…" : q }), el("pre", { text: q }),
+                     copyLink("Copy", function () { return q; })];
+        if (t.last_error) parts.push(el("div", { class: "muted", text: "Last error:" }), el("pre", { class: "err", text: t.last_error }));
+        if (t.last_query) parts.push(el("div", { class: "muted", text: "Last one as it ran (admins only):" }), el("pre", { text: t.last_query }),
+                                     copyLink("Copy", function () { return t.last_query; }));
+        tb.appendChild(el("tr", {}, [el("td", { class: "nm", text: t.target || "" }),
+          el("td", { class: "nm" }, [el("details", { class: "query" }, parts)]), el("td", { class: "num", text: S.num(t.calls) }),
+          el("td", { class: "num", text: S.num(t.avg_seconds) + " s" }), el("td", { class: "num", text: S.num(t.max_seconds) + " s" }),
+          el("td", { class: "num", text: t.errors ? S.num(t.errors) : "" })]));
+      });
+      if (!(data.timings || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted", text: "No query yet." })]));
+    });
+  }
+
+  // ------------------------------------------------------------------ Knowledge: the Context
   function contextPage(id) {
     S.dict("GET", "context/" + id).then(function (p) {
       if (p.error) return;
@@ -359,21 +457,24 @@
         area.value = p.content;
         var result = el("span", { class: "result" });
         var save = el("button", { type: "button", class: "btn primary", text: "Save my version", onclick: function () {
+          save.disabled = true;
           S.dict("POST", "context/" + p.id, { content: area.value }).then(function (r) {
+            save.disabled = false;
             result.textContent = r.error || "saved: the agent will not write over it";
-            if (!r.error) contextTab();
+            result.className = "result " + (r.error ? "bad" : "good");
+            if (!r.error) { if (D.saved) D.saved(); contextTab(); }
           });
         } });
         var back = el("button", { type: "button", class: "btn", text: "Give it back to the agent", onclick: function () {
           S.dict("POST", "context/" + p.id, { reset: true }).then(function (r) {
             result.textContent = r.error || "the agent writes it again at the next build";
-            if (!r.error) contextTab();
+            if (!r.error) { if (D.saved) D.saved(); contextTab(); }
           });
         } });
         b.appendChild(el("details", { class: "context-editor" }, [el("summary", { text: "Correct this page" }), area,
           el("div", { class: "actions" }, [save, p.author !== "agent" ? back : null, result])]));
       }
-      $("drawer").hidden = false;
+      openDrawer();
     });
   }
 
@@ -401,7 +502,7 @@
       if (state.admin) {
         var res = el("span", { class: "result" });
         box.appendChild(document.createTextNode(" "));
-        box.appendChild(el("button", { type: "button", class: "btn", text: "Build now", onclick: function () {
+        box.appendChild(el("button", { type: "button", class: "btn small", text: "Build now", onclick: function () {
           S.dict("POST", "context/build", {}).then(function (r) {
             res.textContent = r.error || "started: it shows in Settings → Chat settings, runs list";
           });
@@ -411,90 +512,33 @@
     });
   }
 
-  function learned() {
-    agentKnowledge();
-    var st = $("r-status").value;
-    S.dict("GET", "recipes" + (st ? "?status=" + st : "")).then(function (data) {
-      var tb = $("recipes").querySelector("tbody");
-      tb.innerHTML = "";
-      (data.recipes || []).forEach(function (r) {
-        var way = el("td", { class: "nm" }, [el("div", { class: "muted", text: r.tool + (r.target ? " \u00b7 " + r.target : "") }),
-                                             el("details", {}, [el("summary", { text: (r.query || "").slice(0, 90) + ((r.query || "").length > 90 ? "\u2026" : "") }),
-                                                                el("pre", { text: r.query || "" })])]);
-        var actions = el("td", {});
-        if (data.is_admin) {
-          [["confirmed", "Confirm"], ["rejected", "Reject"]].forEach(function (a) {
-            if (r.status !== a[0] && r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: a[1], onclick: function () {
-              S.dict("POST", "recipes/" + r.id, { status: a[0] }).then(learned);
-            } }));
-          });
-          actions.appendChild(el("button", { type: "button", class: "linkish", text: "Delete", onclick: function () {
-            S.dict("DELETE", "recipes/" + r.id).then(learned);
-          } }));
-        }
-        tb.appendChild(el("tr", {}, [el("td", { text: r.question }), way,
-          el("td", { class: "num", text: r.seconds !== null && r.seconds !== undefined ? S.num(r.seconds) + " s" : "" }),
-          el("td", { class: "num", text: S.num(r.helpful || r.uses) }),
-          el("td", { html: '<span class="badge ' + (r.status === "confirmed" ? "ok" : r.status === "rejected" ? "bad" : r.status === "helpful" ? "warn" : "") + '">' +
-                           S.esc(r.status === "helpful" ? "helpful, to review" : r.status === "auto" ? "automatic (old)" : r.status) + "</span>" }),
-          actions]));
-      });
-      if (!(data.recipes || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted",
-        text: "Nothing learned yet: an answer marked Helpful in the chat is learned here, for an admin to confirm or reject." })]));
-    });
-    timings();
-  }
-
-  function timings() {
-    S.dict("GET", "timings?" + paged("timings")).then(function (data) {
-      pages.timings.total = data.total || 0;
-      S.pager($("t-pager"), pages.timings, timings);
-      var tb = $("timings").querySelector("tbody");
-      tb.innerHTML = "";
-      (data.timings || []).forEach(function (t) {
-        var q = t.pattern || "";
-        var parts = [el("summary", { text: q.length > 160 ? q.slice(0, 160) + "\u2026" : q }), el("pre", { text: q }),
-                     copyLink("Copy", function () { return q; })];
-        if (t.last_error) parts.push(el("div", { class: "muted", text: "Last error:" }), el("pre", { class: "err", text: t.last_error }));
-        if (t.last_query) parts.push(el("div", { class: "muted", text: "Last one as it ran (admins only):" }), el("pre", { text: t.last_query }),
-                                     copyLink("Copy", function () { return t.last_query; }));
-        tb.appendChild(el("tr", {}, [el("td", { class: "nm", text: t.target || "" }),
-          el("td", { class: "nm" }, [el("details", { class: "query" }, parts)]), el("td", { class: "num", text: S.num(t.calls) }),
-          el("td", { class: "num", text: S.num(t.avg_seconds) + " s" }), el("td", { class: "num", text: S.num(t.max_seconds) + " s" }),
-          el("td", { class: "num", text: t.errors ? S.num(t.errors) : "" })]));
-      });
-      if (!(data.timings || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted", text: "No query yet." })]));
-    });
-  }
-
-  document.querySelectorAll(".subtabs button").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      document.querySelectorAll(".subtabs button").forEach(function (x) { x.classList.toggle("on", x === btn); });
-      ["browse", "relations", "changes", "learned", "knowledge", "context", "search"].forEach(function (t) { $("tab-" + t).hidden = t !== btn.dataset.tab; });
-      if (btn.dataset.tab === "relations") relations();
-      if (btn.dataset.tab === "changes") changes();
-      if (btn.dataset.tab === "learned") learned();
-      if (btn.dataset.tab === "knowledge") knowledge();
-      if (btn.dataset.tab === "context") contextTab();
-    });
-  });
-  $("r-status").addEventListener("change", learned);
+  // ------------------------------------------------------------------ Search
   $("k-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
     var q = $("k-q").value.trim(), box = $("k-results");
     if (!q) return;
     box.innerHTML = "";
-    box.appendChild(el("div", { class: "muted", text: "Searching\u2026" }));
+    box.appendChild(el("div", { class: "muted", text: "Searching…" }));
     S.dict("GET", "search?q=" + encodeURIComponent(q) + ($("k-kind").value ? "&kind=" + $("k-kind").value : "")).then(function (d) {
       box.innerHTML = "";
       (d.results || []).forEach(function (r) {
         box.appendChild(el("div", { class: "k-hit" }, [
           el("div", {}, [el("span", { class: "badge", text: r.kind }), document.createTextNode(" "), el("strong", { text: r.title })]),
-          el("div", { class: "k-text", text: (r.text || "").slice(0, 700) + ((r.text || "").length > 700 ? "\u2026" : "") })]));
+          el("div", { class: "k-text", text: (r.text || "").slice(0, 700) + ((r.text || "").length > 700 ? "…" : "") })]));
       });
       if (!(d.results || []).length) box.appendChild(el("div", { class: "muted", text: d.error || "Nothing found." }));
     });
   });
+
+  // ------------------------------------------------------------------ wiring
+  loaders.browse = function () { if (!browsed) { browsed = true; load(); } };
+  loaders.relations = relations;
+  loaders.changes = changes;
+  loaders.context = contextTab;
+  loaders.learned = function () { agentKnowledge(); recipes(); timings(); };
+  loaders.search = function () { $("k-q").focus(); };
+
+  $("r-status").addEventListener("change", recipes);
   var timer = null;
   $("filters").addEventListener("input", function () { clearTimeout(timer); timer = setTimeout(function () { state.page = 0; load(); }, 250); });
   $("filters").addEventListener("submit", function (ev) { ev.preventDefault(); });
@@ -502,7 +546,36 @@
   $("next").addEventListener("click", function () { state.page++; load(); });
   $("c-days").addEventListener("change", function () { pages.changes.page = 0; changes(); });
   $("d-close").addEventListener("click", function () { $("drawer").hidden = true; });
-  $("drawer").addEventListener("click", function (ev) { if (ev.target === $("drawer")) $("drawer").hidden = true; });
-  document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") $("drawer").hidden = true; });
-  summary().then(load);
+  document.querySelectorAll(".drawer").forEach(function (dr) {
+    dr.addEventListener("click", function (ev) { if (ev.target === dr) dr.hidden = true; });
+  });
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape") document.querySelectorAll(".drawer").forEach(function (dr) { dr.hidden = true; });
+  });
+
+  /* what knowledge.js uses: its tabs in the same controller, the object drawer, the rows; it sets saved (a save
+     was made: follow the agent's search), openEntry (the catalog editor) and reviewWaiting (for the first tab) */
+  var D = S.dictionary = {
+    register: function (name, fn) { loaders[name] = fn; },
+    show: show, detail: detail, textDrawer: textDrawer, emptyRow: emptyRow, row: row, browseUnverified: browseUnverified,
+    isActive: function (name) { return active === name; },
+    saved: null, openEntry: null, reviewWaiting: null
+  };
+
+  function start() {
+    summary();
+    var h = (location.hash || "").replace(/^#/, "");
+    if (h && mainOf(h)) { show(h, true); return; }
+    if (state.admin && D.reviewWaiting) {
+      D.reviewWaiting().then(function (n) { show(n ? "review" : "catalog", true); }, function () { show("catalog", true); });
+      return;
+    }
+    show("catalog", true);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+  else setTimeout(start, 0);                       // after knowledge.js registered its tabs
+  window.addEventListener("hashchange", function () {
+    var h = (location.hash || "").replace(/^#/, "");
+    if (h && h !== active && mainOf(h)) show(h, true);
+  });
 })();

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "supagent"
-version = "0.5.4"
+version = "0.6.0"
 description = "An AI agent inside Apache Superset: chat page, a data dictionary learned every day (metrics and index fields, their types, units and relationships) stored in Superset's database, tools that act with the user's permissions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,8 @@ dependencies = ["pydantic>=2.8,<3"]
 
 [project.optional-dependencies]
 test = ["pytest"]
+# the governed pipeline as a LangGraph graph, and other MCP servers as sources (agent.pipeline, mcp.servers)
+graph = ["langgraph>=1.2,<2", "langchain-core>=1.6,<2", "langchain-mcp-adapters>=0.3,<0.4"]
 
 [project.entry-points."flask.commands"]
 supagent = "supagent.cli:supagent"

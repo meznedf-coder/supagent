@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from flask import Response, g, request
@@ -59,15 +60,28 @@ def abort(code: int) -> None:
 
 
 def _sync_chunks(prefix: str) -> None:
-    """The searchable pieces follow a change (words at once, vectors at the next indexing)."""
+    """The searchable pieces follow a change: in the background of this process (knowledge.apply), the save
+    answering at once; without the background (tests, knowledge.apply_background off): now."""
     try:
-        from supagent.knowledge.index import sync
-
-        _embed_few(sync((prefix,)))
+        _apply("chunks", prefix=prefix)
     except Exception:  # pylint: disable=broad-except
         from superset import db
 
         db.session.rollback()
+        log.warning("supagent: the search pieces of %s: not written", prefix, exc_info=True)
+
+
+def _apply(kind: str, **kw: Any) -> dict:
+    from supagent import settings
+    from supagent.knowledge import apply
+
+    if settings.get("knowledge.apply_background"):
+        apply.later(kind, **kw)
+        return {"applying": True}
+    jobs = {"catalog": kw.get("before") if kind == "catalog" else None,
+            "prefixes": {kw["prefix"]} if kind == "chunks" else set(),
+            "objects": set(kw.get("ids") or []) if kind == "objects" else set()}
+    return apply.run(jobs).get("catalog") or {}
 
 
 def _embed_few(out: dict[str, int]) -> None:
@@ -77,20 +91,56 @@ def _embed_few(out: dict[str, int]) -> None:
 
 
 def _catalog_changed(before: dict) -> dict:
-    """After a change of the catalog: the dictionary and the searchable pieces in step at once."""
-    from supagent.knowledge.curated import after_change
-
+    """After a change of the catalog: the dictionary and the searchable pieces in step (knowledge.apply)."""
     try:
-        out = after_change(before)
-        _embed_few(out.get("pieces") or {})
+        return _apply("catalog", before=before)
     except Exception:  # pylint: disable=broad-except
         from superset import db
 
         db.session.rollback()
         log.warning("supagent: catalog applied to the dictionary: failed", exc_info=True)
         return {}
-    out.pop("pieces", None)
+
+
+def _ref_titles(refs: Any) -> dict[str, str]:
+    """What knowledge refs are, in words (entry:3 -> the entry's title), one query per kind of ref."""
+    from superset import db
+
+    from supagent.models import ContextPage, Doc, Entry, KObject, Memory, Recipe
+
+    models = {"entry": Entry, "memory": Memory, "doc": Doc, "context": ContextPage, "recipe": Recipe,
+              "object": KObject}
+    out: dict[str, str] = {}
+    wanted: dict[str, dict[int, list[str]]] = {}
+    for ref in set(refs or ()):
+        kind, _, rest = (ref or "").partition(":")
+        if kind == "data":
+            out[ref] = rest.split(":", 1)[1] if ":" in rest else rest
+        elif kind == "family":
+            out[ref] = (rest.split(":", 1)[1] if ":" in rest else rest) + "_* metrics"
+        else:
+            ident = rest.split("#", 1)[0]
+            out[ref] = ref
+            if kind in models and ident.isdigit():
+                wanted.setdefault(kind, {}).setdefault(int(ident), []).append(ref)
+    for kind, ids in wanted.items():
+        model = models[kind]
+        try:
+            for o in db.session.query(model).filter(model.id.in_(list(ids))):
+                title = str(getattr(o, "title", None) or getattr(o, "name", None) or getattr(o, "question", None)
+                            or getattr(o, "text", "") or "")[:160]
+                if kind == "object" and getattr(o, "parent", None):
+                    title = f"{o.parent} › {title}"
+                for ref in ids.get(o.id, []):
+                    out[ref] = title or ref
+        except Exception:  # pylint: disable=broad-except
+            db.session.rollback()
     return out
+
+
+def _like(word: str) -> str:
+    """A word inside a LIKE pattern, its wildcards escaped (escape character: backslash)."""
+    return word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _is_admin() -> bool:
@@ -146,7 +196,8 @@ class ChatView(BaseView):
     method_permission_name = {"index": "read", "conversations": "read", "conversation": "read",
                               "delete_conversation": "write", "ask": "write", "message": "read",
                               "feedback": "write", "file": "read", "cancel": "write", "result_xlsx": "read",
-                              "memory": "read", "add_memory": "write", "delete_memory": "write"}
+                              "memory": "read", "add_memory": "write", "delete_memory": "write",
+                              "search_chats": "read"}
     template_folder = os.path.join(HERE, "templates")
 
     @expose("/")
@@ -331,6 +382,64 @@ class ChatView(BaseView):
                         headers={"Content-Disposition": f'attachment; filename="result-{mid}-{n + 1}.xlsx"',
                                  "X-Content-Type-Options": "nosniff"})
 
+    @expose("/api/chats/search", methods=("GET",))
+    @has_access_api
+    def search_chats(self) -> Response:
+        """The user's own chats like ?q= (the knowledge store: by words and meaning; else the words in the
+        messages), newest conversation first among the closest: [{conversation_id, message_id, title, question,
+        snippet, at}]."""
+        from sqlalchemy import func as sa_func
+        from superset import db
+
+        from supagent.models import Conversation, Message
+
+        q = " ".join((request.args.get("q") or "").split())[:200]
+        if len(q) < 2:
+            return _json({"results": [], "by": None})
+        me = g.user.id
+        hits: list[dict[str, Any]] = []
+        by = "words"
+        try:
+            from supagent.knowledge import pgstore
+
+            if pgstore.active():
+                from supagent import settings
+
+                for h in pgstore.chats(q, me, k=30, min_cos=float(settings.get("search.chat_box_similarity") or 0)):
+                    hits.append({"conversation_id": h.get("conversation_id"), "message_id": h.get("message_id"),
+                                 "question": h.get("question") or "", "snippet": (h.get("answer") or "")[:220],
+                                 "at": h.get("at")})
+                by = "store"
+        except Exception:  # pylint: disable=broad-except   (the words below)
+            log.warning("supagent: chat search in the store", exc_info=True)
+        if not hits:
+            by = "words"
+            words = [w for w in re.findall(r"\w{2,}", q.lower())][:6]
+            rows = db.session.query(Message).join(Conversation, Conversation.id == Message.conversation_id).filter(
+                Conversation.user_id == me)
+            for w in words:
+                rows = rows.filter(sa_func.lower(Message.content).like(f"%{_like(w)}%", escape="\\"))
+            for m in rows.order_by(Message.id.desc()).limit(60):
+                text_ = m.content or ""
+                at = text_.lower().find(words[0]) if words else 0
+                start = max(0, at - 80)
+                hits.append({"conversation_id": m.conversation_id, "message_id": m.id,
+                             "question": text_[:200] if m.role == "user" else "",
+                             "snippet": ("\u2026" if start else "") + text_[start:start + 220].replace("\n", " "),
+                             "at": m.created_at.isoformat(timespec="minutes") if m.created_at else None})
+        titles = {c.id: c.title for c in db.session.query(Conversation).filter(
+            Conversation.user_id == me, Conversation.id.in_({h["conversation_id"] for h in hits if h["conversation_id"]}
+                                                          or {-1}))}
+        seen: set[int] = set()
+        out = []
+        for h in hits:                           # one per conversation (its closest), only conversations still there
+            cid = h["conversation_id"]
+            if cid not in titles or cid in seen:
+                continue
+            seen.add(cid)
+            out.append({**h, "title": titles[cid] or f"Conversation {cid}"})
+        return _json({"results": out[:20], "by": by})
+
     @staticmethod
     def _memory_json(m: Any, me: int) -> dict:
         return {"id": m.id, "scope": m.scope, "kind": m.kind, "text": m.text, "category": m.category,
@@ -427,6 +536,9 @@ class ChatView(BaseView):
                                            tools=[s.get("tool") for s in m.steps or []]))
                     kept = True
         db.session.commit()
+        from supagent.governed.gate import confirm
+
+        confirm(m.id, {1: "helpful", -1: "not_helpful"}.get(value))   # the decider's route of it teaches (Helpful)
         from supagent.knowledge.experience import feedback as recipe_feedback
         from supagent.tasks import dispatch_catalog, dispatch_helpful, dispatch_memory
 
@@ -501,14 +613,20 @@ class _RecipesMixin:
             q = q.filter(Recipe.status == status)
         else:
             q = q.filter(Recipe.status != "auto")    # saved by themselves by 0.2.1 and before
+        from supagent.knowledge.ranking import adjust, demoted, reasons, usefulness
+
+        rows = [r for r in q.limit(500) if admin or (r.database_id and r.database_id in visible)]
+        use = usefulness([f"recipe:{r.id}" for r in rows])      # what the discussions said of them
         out = []
-        for r in q.limit(500):
-            if not admin and (not r.database_id or r.database_id not in visible):
-                continue                             # another database, or an unknown one
+        for r in rows:
+            u = use.get(f"recipe:{r.id}")
             out.append({"id": r.id, "question": r.question, "tool": r.tool, "database_id": r.database_id,
                         "target": r.target, "query": r.query, "seconds": r.seconds, "rows": r.rows,
                         "steps": r.steps, "status": r.status, "uses": r.uses, "created_at": r.created_at,
-                        "helpful": len(r.confirmations or []), "last_used_at": r.last_used_at})
+                        "helpful": len(r.confirmations or []), "last_used_at": r.last_used_at,
+                        "use": u, "why": reasons(u), "rank": round(adjust(u), 3), "demoted": demoted(u)})
+        if request.args.get("sort", "useful") == "useful":  # the most useful first, then the least tried
+            out.sort(key=lambda x: (x["status"] == "rejected", x["demoted"], -x["rank"], -(x["use"] or {}).get("given", 0)))
         return _json({"recipes": out, "is_admin": admin})
 
     @expose("/api/recipes/<int:rid>", methods=("POST", "DELETE"))
@@ -533,6 +651,10 @@ class _RecipesMixin:
             return _json({"error": "status: helpful, confirmed or rejected"}, 400)
         r.status = status
         db.session.commit()
+        if r.message_id:                             # the decider's route of the answer: confirmed or not
+            from supagent.governed.gate import confirm
+
+            confirm(r.message_id, {"confirmed": "confirmed", "rejected": "not_helpful"}.get(status, "helpful"))
         _sync_chunks("recipe:")
         from supagent.tasks import dispatch_catalog
 
@@ -742,10 +864,8 @@ class KnowledgeView(_RecipesMixin, BaseView):
 
         touch()                                  # every server: the next answer uses it
         db.session.commit()
-        try:                                     # and the agent's search finds it at once
-            from supagent.knowledge.index import sync_objects
-
-            _embed_few(sync_objects([o.id]))
+        try:                                     # and the agent's search finds it in a moment
+            _apply("objects", ids=[o.id])
         except Exception:  # pylint: disable=broad-except
             db.session.rollback()
             log.warning("supagent: search pieces of %s: not written", o.name, exc_info=True)
@@ -815,6 +935,13 @@ class KnowledgeView(_RecipesMixin, BaseView):
             entries.append({"id": e.id, "title": e.title, "classification": e.classification, "category": e.category,
                             "content": e.content or "", "origin": e.origin, "evidence": e.evidence or {},
                             "enabled": bool(e.enabled), "updated_at": e.updated_at})
+        from supagent.knowledge.ranking import adjust, reasons, usefulness
+
+        use = usefulness([f"entry:{e['id']}" for e in entries])
+        for e in entries:
+            u = use.get(f"entry:{e['id']}")
+            e.update(use=u, why=reasons(u), rank=round(adjust(u), 3))
+        entries.sort(key=lambda e: (-e["rank"], -(e["use"] or {}).get("given", 0)))
         by_db = {s.database_id: s.database_name for s in names.values()}
         words = [{"word": a.word, "database": by_db.get(a.database_id, a.database_id), "kind": a.kind,
                   "parent": a.parent, "name": a.name, "uses": a.uses, "updated_at": a.updated_at}
@@ -982,7 +1109,9 @@ class AdminView(BaseView):
                               "delete_entry": "write", "entry_history": "read", "restore_entry": "write",
                               "export_catalog": "read", "team_memory": "read", "set_memory": "write",
                               "docs": "read", "add_doc": "write", "refresh_doc": "write", "delete_doc": "write",
-                              "usage": "read", "usage_data": "read"}
+                              "usage": "read", "usage_data": "read", "review": "read", "facets": "read",
+                              "set_facet": "write", "set_tag": "write", "set_link": "write", "set_route": "write",
+                              "apply_status": "read"}
 
     # ---- team memory
     @expose("/api/memory", methods=("GET",))
@@ -1362,6 +1491,216 @@ class AdminView(BaseView):
         except CatalogError as ex:
             return _json({"error": str(ex)}, 400)
         return _json({"imported": counts, "applied": _catalog_changed(before)})
+
+    # ---- the review (the Data dictionary's first tab): what waits for an admin, in one place. Every action on an
+    # item takes it out: approved, corrected, rejected or removed.
+    @expose("/api/review", methods=("GET",))
+    @has_access_api
+    def review(self) -> Response:
+        from sqlalchemy import func, or_
+
+        from superset import db
+
+        from supagent.governed.gate import CONFIRMED
+        from supagent.models import Facet, KObject, Link, Memory, Recipe, Route, Tag
+
+        limit = min(max(int(request.args.get("limit", 50)), 1), 500)
+        mem_q = db.session.query(Memory).filter(Memory.scope == "team", Memory.status == "proposed")
+        memories = [{"id": m.id, "text": m.text, "kind": m.kind, "category": m.category, "source": m.source,
+                     "created_at": m.created_at} for m in mem_q.order_by(Memory.id.desc()).limit(limit)]
+        rec_q = db.session.query(Recipe).filter(Recipe.status == "helpful")
+        recipes = [{"id": r.id, "question": r.question, "tool": r.tool, "target": r.target,
+                    "query": (r.query or "")[:1500], "uses": r.uses, "created_at": r.created_at}
+                   for r in rec_q.order_by(Recipe.id.desc()).limit(limit)]
+        desc_q = db.session.query(KObject).filter(KObject.gone_at.is_(None), KObject.description.isnot(None),
+                                                  KObject.description_source == "llm", KObject.verified.isnot(True))
+        from supagent.knowledge.curated import sources_of_user
+
+        dbs = {x.id: x.database_name for x in sources_of_user()}
+        described = [{"id": o.id, "name": o.name, "parent": o.parent, "kind": o.kind, "description": o.description,
+                      "source_id": o.source_id, "database": dbs.get(o.source_id)}
+                     for o in desc_q.order_by(KObject.kind, KObject.name).limit(limit)]
+        val_q = db.session.query(Facet).filter(Facet.status == "proposed")
+        vals = val_q.order_by(Facet.facet, Facet.value).limit(limit).all()
+        n_items = dict(db.session.query(Tag.facet_id, func.count(Tag.id)).filter(
+            Tag.facet_id.in_([f.id for f in vals] or [-1])).group_by(Tag.facet_id).all())
+        values = [{"id": f.id, "facet": f.facet, "value": f.value, "description": f.description,
+                   "items": n_items.get(f.id, 0)} for f in vals]
+        tag_q = (db.session.query(Tag, Facet).join(Facet, Facet.id == Tag.facet_id)
+                 .filter(Tag.status == "proposed", Facet.status == "approved"))
+        tag_rows = tag_q.order_by(Tag.confidence.desc(), Tag.id.desc()).limit(limit).all()
+        link_q = db.session.query(Link).filter(Link.status == "proposed")
+        link_rows = link_q.order_by(Link.confidence.desc(), Link.id.desc()).limit(limit).all()
+        route_q = db.session.query(Route).filter(Route.moa.isnot(None), Route.moa != "other",
+                                                 Route.moa_followed.is_(True), Route.signal.in_(CONFIRMED),
+                                                 or_(Route.moa_by.is_(None), Route.moa_by != "admin"))
+        route_rows = route_q.order_by(Route.id.desc()).limit(limit).all()
+        titles = _ref_titles([t.ref for t, _f in tag_rows] + [x.a_ref for x in link_rows] + [x.b_ref for x in link_rows])
+        tags = [{"id": t.id, "ref": t.ref, "title": titles.get(t.ref, t.ref), "facet": f.facet, "value": f.value,
+                 "confidence": t.confidence} for t, f in tag_rows]
+        links = [{"id": x.id, "a": x.a_ref, "a_title": titles.get(x.a_ref, x.a_ref), "b": x.b_ref,
+                  "b_title": titles.get(x.b_ref, x.b_ref), "kind": x.kind, "confidence": x.confidence}
+                 for x in link_rows]
+        routes = [{"id": r.id, "question": r.question, "route": r.moa, "by": r.moa_by, "signal": r.signal,
+                   "at": r.signal_at} for r in route_rows]
+        counts = {"memory": mem_q.count(), "recipes": rec_q.count(), "descriptions": desc_q.count(),
+                  "values": val_q.count(), "tags": tag_q.count(), "links": link_q.count(), "routes": route_q.count()}
+        return _json({"memory": memories, "recipes": recipes, "descriptions": described, "values": values,
+                      "tags": tags, "links": links, "routes": routes, "counts": counts,
+                      "waiting": sum(counts[k] for k in ("memory", "recipes", "values", "tags", "links"))})
+
+    @expose("/api/facets", methods=("GET",))
+    @has_access_api
+    def facets(self) -> Response:
+        """The categories (?facet=, ?status=, ?q=), each value with its number of items and a few of them."""
+        from sqlalchemy import func
+
+        from superset import db
+
+        from supagent.models import Facet, Tag
+
+        q = db.session.query(Facet).filter(Facet.status != "rejected")
+        if request.args.get("facet"):
+            q = q.filter(Facet.facet == request.args["facet"])
+        if request.args.get("status"):
+            q = q.filter(Facet.status == request.args["status"])
+        if request.args.get("q"):
+            q = q.filter(Facet.value.ilike(f"%{request.args['q'][:100]}%"))
+        rows = q.order_by(Facet.facet, Facet.value).limit(1000).all()
+        ids = [f.id for f in rows] or [-1]
+        n_items = dict(db.session.query(Tag.facet_id, func.count(Tag.id)).filter(
+            Tag.facet_id.in_(ids), Tag.status == "approved").group_by(Tag.facet_id).all())
+        rn = func.row_number().over(partition_by=Tag.facet_id, order_by=Tag.id).label("rn")
+        sub = (db.session.query(Tag.facet_id.label("fid"), Tag.ref.label("ref"), rn)
+               .filter(Tag.facet_id.in_(ids), Tag.status == "approved").subquery())
+        some: dict[int, list[str]] = {}
+        for fid, ref in db.session.query(sub.c.fid, sub.c.ref).filter(sub.c.rn <= 5):
+            some.setdefault(fid, []).append(ref)
+        titles = _ref_titles([r for refs in some.values() for r in refs])
+        out = [{"id": f.id, "facet": f.facet, "value": f.value, "status": f.status, "source": f.source,
+                "description": f.description, "synonyms": f.synonyms or [], "items": n_items.get(f.id, 0),
+                "examples": [titles.get(r, r) for r in some.get(f.id, [])]} for f in rows]
+        order = {"aspect": 0, "subject": 1, "application": 2, "component": 3}
+        out.sort(key=lambda x: (order.get(x["facet"], 9), x["status"] != "proposed", -x["items"], x["value"].lower()))
+        return _json({"facets": out})
+
+    @expose("/api/facets/<int:fid>", methods=("POST",))
+    @has_access_api
+    def set_facet(self, fid: int) -> Response:
+        """Approve, reject, rename, describe a value, or merge it into another (its items move there)."""
+        import datetime as dt
+
+        from superset import db
+
+        from supagent.knowledge.facets import CONFIDENT
+        from supagent.knowledge.freshness import touch
+        from supagent.models import Facet, Tag
+
+        f = db.session.get(Facet, fid)
+        if f is None:
+            abort(404)
+        body = _body()
+        if body.get("merge_into"):
+            to = db.session.get(Facet, int(body["merge_into"]))
+            if to is None or to.facet != f.facet or to.id == f.id:
+                return _json({"error": "merge into another value of the same category"}, 400)
+            for t in db.session.query(Tag).filter(Tag.facet_id == f.id):
+                if db.session.query(Tag).filter(Tag.ref == t.ref, Tag.facet_id == to.id).first() is None:
+                    t.facet_id = to.id
+                else:
+                    db.session.delete(t)
+            to.synonyms = sorted(set((to.synonyms or []) + [f.value]))
+            db.session.delete(f)
+            db.session.commit()
+            touch()
+            db.session.commit()
+            return _json({"merged_into": to.id})
+        if body.get("status") in ("approved", "proposed", "rejected"):
+            f.status = body["status"]
+            if f.status == "approved":        # its confident tags are used at once
+                for t in db.session.query(Tag).filter(Tag.facet_id == f.id, Tag.status == "proposed"):
+                    if (t.confidence or 0) >= CONFIDENT:
+                        t.status = "approved"
+        if str(body.get("value") or "").strip():
+            f.value = str(body["value"]).strip()[:128]
+        if "description" in body:
+            f.description = str(body.get("description") or "").strip() or None
+        if "synonyms" in body:
+            syn = body.get("synonyms")
+            f.synonyms = [x.strip() for x in (syn if isinstance(syn, list) else str(syn or "").split(",")) if x.strip()]
+        f.reviewed_by, f.reviewed_at = g.user.username, dt.datetime.utcnow()
+        db.session.commit()
+        touch()
+        db.session.commit()
+        return _json({"id": f.id, "status": f.status, "value": f.value})
+
+    @expose("/api/tags/<int:tid>", methods=("POST",))
+    @has_access_api
+    def set_tag(self, tid: int) -> Response:
+        from superset import db
+
+        from supagent.knowledge.freshness import touch
+        from supagent.models import Tag
+
+        t = db.session.get(Tag, tid)
+        if t is None:
+            abort(404)
+        if _body().get("status") in ("approved", "rejected"):
+            t.status, t.reviewed_by = _body()["status"], g.user.username
+            db.session.commit()
+            touch()
+            db.session.commit()
+        return _json({"id": t.id, "status": t.status})
+
+    @expose("/api/links/<int:lid>", methods=("POST",))
+    @has_access_api
+    def set_link(self, lid: int) -> Response:
+        from superset import db
+
+        from supagent.models import Link
+
+        x = db.session.get(Link, lid)
+        if x is None:
+            abort(404)
+        if _body().get("status") in ("approved", "rejected"):
+            x.status, x.reviewed_by = _body()["status"], g.user.username
+            db.session.commit()
+        return _json({"id": x.id, "status": x.status})
+
+    @expose("/api/routes/<int:rid>", methods=("POST",))
+    @has_access_api
+    def set_route(self, rid: int) -> Response:
+        """A learned route: an admin keeps or corrects it ({"route": ...}: then it decides alone for the same
+        question) or removes it ({"remove": true}: it no longer teaches)."""
+        import datetime as dt
+
+        from superset import db
+
+        from supagent.governed.gate import CONFIRMED
+        from supagent.models import Route
+        from supagent.router import ROUTES
+
+        r = db.session.get(Route, rid)
+        if r is None:
+            abort(404)
+        body = _body()
+        if body.get("remove"):
+            r.moa_followed = False
+        elif body.get("route") in ROUTES:              # right as it is, or corrected: an admin's example now
+            r.moa, r.moa_by, r.moa_followed = body["route"], "admin", True
+            if r.signal not in CONFIRMED:                # the answer's own signal is kept (the route was judged)
+                r.signal, r.signal_at = "confirmed", dt.datetime.utcnow()
+        else:
+            return _json({"error": "route or remove"}, 400)
+        db.session.commit()
+        return _json({"id": r.id, "route": r.moa, "followed": r.moa_followed, "signal": r.signal})
+
+    @expose("/api/apply", methods=("GET",))
+    @has_access_api
+    def apply_status(self) -> Response:
+        from supagent.knowledge.apply import status
+
+        return _json(status())
 
     @expose("/api/status", methods=("GET",))
     @has_access_api

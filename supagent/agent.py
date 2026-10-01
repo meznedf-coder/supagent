@@ -214,6 +214,12 @@ INTENTS = {
                               r"\b(what|which|list|show)\b[^.?!\n]{0,20}\b(charts|graphs|graphiques)\b|"
                               r"\bcharts? (are|is) (in|on)\b|\b(its|their) charts\b|\bthe charts (of|in|on)\b|"
                               r"\bquels graphiques\b|\bles graphiques (du|de|des)\b", re.I),
+    "history": re.compile(r"\b(last time|as before|like before|the other day|you (told|gave|said|showed|sent) me|"
+                          r"(i|we) (already )?(asked|requested|looked at|checked)\b[^.?!\n]{0,40}\b(before|earlier|last|"
+                          r"yesterday|previously|already)|(previous|earlier|past|old) (chats?|conversations?|questions?|"
+                          r"answers?))\b|\b(la derni[èe]re fois|comme (avant|la derni[èe]re fois)|d[ée]j[àa] demand[ée]|"
+                          r"tu m'as (dit|donn[ée]|montr[ée]|envoy[ée])|(anciennes?|pr[ée]c[ée]dentes?) "
+                          r"(conversations?|questions?|r[ée]ponses?))\b", re.I),
     "sqllab": re.compile(r"\bsql ?lab\b|\bsaved? (it|this|that|the|my|as)?\s*(sql|query|queries|requ[êe]te)\b|"
                          r"\bexplore\b|\bexplorer\b|\b(link|lien|url)\b|\bopen (it|this|that|the (query|sql))\b|"
                          r"\bouvr\w+ (la|cette) requ[êe]te\b", re.I),
@@ -231,8 +237,19 @@ TOOLS_OF = {
     "status": {"get_chart_data", "get_chart_info", "list_charts", "list_dashboards", "get_dashboard_info",
                "chart_image", "compare_to_usual"},
     "investigation": {"compare_to_usual"},
+    "history": {"search_my_chats"},
 }
 INTENT_TOOLS = set().union(*TOOLS_OF.values())
+
+
+def g_user() -> Any:
+    """The current user (flask.g), or None outside a request."""
+    try:
+        from flask import g
+
+        return getattr(g, "user", None)
+    except Exception:  # pylint: disable=broad-except
+        return None
 
 
 def intents(question: str) -> set[str]:
@@ -1180,6 +1197,15 @@ class Agent:
         if "show_chart" not in disabled:
             self.specs.append(SHOW_CHART_SPEC)
         self.specs += [s for n, s in self.superset.specs.items() if n not in disabled]
+        self.mcp_tools: set[str] = set()
+        try:                                     # other MCP servers (mcp.servers): their tools too
+            from supagent import mcp_sources
+
+            extra = [x for x in mcp_sources.specs(username) if x["function"]["name"] not in disabled]
+            self.specs += extra
+            self.mcp_tools = {x["function"]["name"] for x in extra}
+        except Exception:  # pylint: disable=broad-except   (the agent works without them)
+            log.warning("supagent: the MCP servers' tools are not offered", exc_info=True)
         self.names = {s["function"]["name"] for s in self.specs}
         self.guard = ChartGuard(self)
         self.scope: Any = None                   # the databases, charts and dashboards of the question
@@ -1201,10 +1227,50 @@ class Agent:
         if not self.rich:
             return self.specs
         question = getattr(self, "intent_text", None) or question
-        wanted = set().union(*(TOOLS_OF.get(k, set()) for k in intents(question))) if intents(question) else set()
+        asked = intents(question) | self._route_intents()
+        wanted = set().union(*(TOOLS_OF.get(k, set()) for k in asked)) if asked else set()
         if self.wants_saved_chart:
             wanted |= TOOLS_OF["charts"]
         return [s for s in self.specs if s["function"]["name"] not in INTENT_TOOLS or s["function"]["name"] in wanted]
+
+    def route(self, question: str, previous: str = "") -> Any:
+        """The router's decision for this question (once per question: the governed pipeline and its classic
+        fallback share it), recorded on the answer's route row."""
+        from supagent import router
+
+        key = question                                  # once per question, whatever chat context comes with it
+        if getattr(self, "_moa_key", None) == key and getattr(self, "moa", None) is not None:
+            return self.moa
+        uid = getattr(g_user(), "id", None)
+        d = router.decide(question, previous, uid, llm=self.llm if router.enabled() else None)
+        if router.enabled():
+            self._router_usage = dict(getattr(self.llm, "last_usage", None) or {})
+            self.route_id = router.record(getattr(self, "route_id", None), question, d, uid)
+        self._moa_key, self.moa = key, d
+        return d
+
+    def _route_intents(self) -> set[str]:
+        from supagent.router import ROUTE_INTENTS
+
+        moa = getattr(self, "moa", None)
+        return set(ROUTE_INTENTS.get(moa.route, set())) if moa is not None and moa.active else set()
+
+    def after_saved(self, message_id: int) -> None:
+        """The runner saved the answer: its route row knows its message (Helpful then teaches the router)."""
+        route_id = getattr(self, "route_id", None)
+        if not route_id:
+            return
+        try:
+            from superset import db
+
+            from supagent.models import Route
+
+            r = db.session.get(Route, route_id)
+            if r is not None:
+                r.message_id = message_id
+                db.session.commit()
+        except Exception:  # pylint: disable=broad-except
+            log.warning("supagent: route not linked to its answer", exc_info=True)
 
     def _system(self, question: str, shown: set[str] | None = None) -> str:
         """The instructions: the same for every user and every question of a kind, so that the LLM
@@ -1298,8 +1364,12 @@ class Agent:
             try:
                 from supagent.knowledge.search import knowledge_block
 
-                about = intents(getattr(self, "intent_text", None) or question)
-                text += knowledge_block(question, shown, with_charts=bool(about & {"status", "read_charts", "charts"}))
+                about = intents(getattr(self, "intent_text", None) or question) | self._route_intents()
+                from supagent.router import ROUTE_KINDS
+
+                moa = getattr(self, "moa", None)
+                text += knowledge_block(question, shown, with_charts=bool(about & {"status", "read_charts", "charts"}),
+                                        prefer=ROUTE_KINDS.get(moa.route) if moa is not None and moa.active else None)
             except Exception:  # pylint: disable=broad-except
                 log.warning("supagent: knowledge found: not given", exc_info=True)
         if recipes:
@@ -1338,6 +1408,10 @@ class Agent:
                 return name, show_chart(**args)
             except Exception as ex:  # pylint: disable=broad-except
                 return name, f"tool error: {ex}"
+        if name in getattr(self, "mcp_tools", ()):
+            from supagent import mcp_sources
+
+            return name, mcp_sources.call(self.username, name, args)
         if name in self.local:
             try:
                 return name, self.registry.call_text(name, args)
@@ -1377,6 +1451,7 @@ class Agent:
         # "what charts are in it?": the tools, instructions and checks of the question it refers to, too
         self.intent_text = f"{before}\n{question}" if follow else question
         self.question = self.intent_text                  # the checks of periods and rules read it
+        self.moa = self.route(question, before if follow else "")
         try:
             from supagent.knowledge.scope import scope_for
 
@@ -1402,12 +1477,18 @@ class Agent:
         hint = f" {ANSWER_IN[lang]}" if lang else ""
         # "create a chart of that finding": where the data is, from the question it refers to
         blocks = self._question_blocks(self.intent_text, shown)
+        self.given_refs = set(shown)                    # what the prompt was given (the learned items' ranking)
         behind = queries_note(recent)                   # what "that finding" was computed from
         if behind:
             blocks = f"{blocks}\n\n{behind}" if blocks else behind
         where = self.scope.block().strip() if self.scope is not None else ""
         if where:
             blocks = f"{blocks}\n\n{where}" if blocks else where
+        if self.moa.active:                             # the router's instruction for this kind of question
+            from supagent.router import ROUTE_NOTES
+
+            note = ROUTE_NOTES.get(self.moa.route, "")
+            blocks = f"{blocks}\n\n{note}" if blocks and note else (note or blocks)
         asked = question
         if answered:                                    # the question, then the reply that settles it
             back = next((ln.strip() for ln in reversed(said.strip().splitlines()) if ln.strip()), "")[:400]
@@ -1442,6 +1523,8 @@ class Agent:
         done: set[str] = set()                         # identical successful calls: not run twice
         saved_calls: set[str] = set()                   # identical saving calls: not run again either
         self.usage = {}
+        add_usage(self.usage, getattr(self, "_router_usage", None) or {})     # the router's call, if any
+        self._router_usage = {}
         specs = self._specs_for(question)
         building = "charts" in intents(question) or self.wants_saved_chart
         steps = self.max_steps * (2 if building else 1)   # several charts and a dashboard: more calls

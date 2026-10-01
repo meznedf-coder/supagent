@@ -5,24 +5,226 @@
   <section class="dict-head">
     <div>
       <h1>Data dictionary</h1>
-      <p class="muted">Learned every day from the databases you may query: what each metric, index, field and
-        label is, its type and unit, its values, and how they relate. Texts marked <span class="badge llm">AI-written</span>
-        are guesses of the LLM until an admin approves or corrects them.</p>
+      <p class="muted">Everything the agent knows and uses in its answers: what the team wrote (the catalog, the team
+        memory, the documents), the Context written from it, and what the agent learns every day from the data and the
+        chats. Texts marked <span class="badge llm">AI-written</span> are the LLM's until an admin approves or corrects
+        them.</p>
     </div>
-    <div id="sources" class="sources"></div>
+    <details id="sources-box" class="sources-box">
+      <summary id="sources-line">Databases</summary>
+      <div id="sources" class="sources"></div>
+    </details>
   </section>
-  <nav class="subtabs" role="tablist">
-    <button type="button" role="tab" data-tab="browse" class="on">Browse</button>
-    <button type="button" role="tab" data-tab="relations">Relations</button>
-    <button type="button" role="tab" data-tab="changes">Changes</button>
-    <button type="button" role="tab" data-tab="learned">Learned</button>
+
+  <nav class="maintabs" role="tablist" aria-label="Data dictionary">
+    <button type="button" role="tab" data-tab="review" class="admin-only">To review <span class="count" id="review-count" hidden></span></button>
     <button type="button" role="tab" data-tab="knowledge">Knowledge</button>
-    <button type="button" role="tab" data-tab="context">Context</button>
+    <button type="button" role="tab" data-tab="data">Data</button>
+    <button type="button" role="tab" data-tab="learned">Learned by the agent</button>
     <button type="button" role="tab" data-tab="search">Search</button>
+    <span class="grow"></span>
+    <span id="apply-state" class="apply-state" role="status" aria-live="polite" hidden></span>
   </nav>
+
+  <!-- To review (admins): what waits for a decision, each item with its actions -->
+  <section id="tab-review" class="tab" hidden>
+    <div id="review-summary" class="review-summary"></div>
+    <div id="review"></div>
+  </section>
+
+  <!-- Knowledge: what the team gives the agent, where it is edited -->
+  <section id="tab-knowledge" class="tab" hidden>
+    <nav class="subnav" aria-label="Knowledge">
+      <button type="button" data-sub="catalog">Catalog</button>
+      <button type="button" data-sub="memory">Team memory</button>
+      <button type="button" data-sub="context">Context</button>
+      <button type="button" data-sub="docs">Documents and sites</button>
+      <button type="button" data-sub="categories" class="admin-only">Categories</button>
+    </nav>
+
+    <div id="sub-catalog" class="sub" hidden>
+      <p class="lead">What people know about the data, one entry each: the glossary, one entry per index, groups of
+        metrics, relationships, health checks, the rules the agent always follows, notes and formulas. Each entry keeps
+        its history, so a mistaken change or deletion can be restored. Entries marked
+        <span class="badge agent">agent</span> were written by the agent from evidence it can check.</p>
+      <div class="filters">
+        <select id="cat-class" aria-label="Classification"><option value="">All classifications</option></select>
+        <select id="cat-category" aria-label="Category"><option value="">All categories</option></select>
+        <select id="cat-author" aria-label="Written by"><option value="">Written by anyone</option>
+          <option value="agent">Written by the agent</option><option value="people">Written by people</option></select>
+        <input id="cat-q" type="search" placeholder="Search titles and contents" aria-label="Search the catalog">
+        <span class="admin-only actions">
+          <button type="button" class="btn primary" id="cat-new">New entry</button>
+          <button type="button" class="btn" id="cat-import">Import YAML</button>
+          <a class="btn" id="cat-export" href="#">Export YAML</a>
+        </span>
+      </div>
+      <div id="cat-warnings"></div>
+      <div class="table-wrap"><table class="grid" id="cat-list">
+        <thead><tr><th>Title</th><th>Classification</th><th>Category</th><th>State</th><th>Changed</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </div>
+
+    <div id="sub-memory" class="sub" hidden>
+      <p class="lead">Preferences, rules and facts for everyone, learned from the chats or written here. A memory
+        proposed from a chat is not used until an admin approves it.</p>
+      <div class="add-row admin-only">
+        <textarea id="mem-text" rows="2" placeholder="e.g. Yesterday means the previous business day." aria-label="New team memory"></textarea>
+        <select id="mem-kind" aria-label="Kind"><option value="rule">rule</option><option value="fact">fact</option>
+          <option value="preference">preference</option></select>
+        <input id="mem-category" type="text" placeholder="Category (optional)" aria-label="Category">
+        <button type="button" class="btn primary" id="mem-add">Add for the team</button>
+        <span id="mem-result" class="result"></span>
+      </div>
+      <div class="filters">
+        <select id="mem-status" aria-label="State"><option value="">All states</option><option value="active">Used</option>
+          <option value="proposed">Proposed</option><option value="disabled">Disabled</option>
+          <option value="catalog">Moved to the catalog</option></select>
+        <input id="mem-q" type="search" placeholder="Search the memory" aria-label="Search the team memory">
+      </div>
+      <div class="table-wrap"><table class="grid" id="team-memory">
+        <thead><tr><th>Memory</th><th>Kind</th><th>By</th><th>State</th><th></th></tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div id="sub-context" class="sub" hidden>
+      <p class="lead">What the system is, functionally and technically, written every night from what the team shares
+        (documents, catalog, team memory, the dictionary, the answers marked Helpful). A page marked
+        <span class="badge llm">AI-written</span> is the LLM's, from the sources listed under it. A page an admin
+        corrected is theirs: the agent never writes over it. You see the pages of the databases you may query.</p>
+      <div id="ctx-actions" class="agent-summary"></div>
+      <div class="context-cols">
+        <div><h2 class="section-title">Functional</h2><ul id="ctx-functional" class="plain-list"></ul></div>
+        <div><h2 class="section-title">Technical</h2><ul id="ctx-technical" class="plain-list"></ul></div>
+      </div>
+    </div>
+
+    <div id="sub-docs" class="sub" hidden>
+      <p class="lead">Documents the agent may search: text, Markdown or HTML files, and web pages read again every few
+        days (a site: the pages under the same address). Only the allowed domains are read (setting
+        docs.allowed_domains).</p>
+      <div class="add-box admin-only">
+        <div class="fields two">
+          <label class="field"><span>Address of a page or a site</span><input type="text" id="doc-url" placeholder="https://wiki.example.com/ops/runbooks/"></label>
+          <label class="field"><span>Category</span><input type="text" id="doc-category" placeholder="e.g. Runbooks"></label>
+          <label class="field"><span>Pages at most</span><input type="number" id="doc-pages" value="10" min="1" max="200"></label>
+          <label class="field"><span>Read again every (days)</span><input type="number" id="doc-days" value="7" min="1"></label>
+        </div>
+        <div class="actions">
+          <button type="button" class="btn primary" id="doc-add">Add the site</button>
+          <label class="btn" for="doc-file">Upload a file</label>
+          <input type="file" id="doc-file" accept=".txt,.md,.markdown,.html,.htm,.csv,.json,.yaml,.yml" hidden>
+          <span id="doc-result" class="result"></span>
+        </div>
+      </div>
+      <div class="table-wrap"><table class="grid" id="docs">
+        <thead><tr><th>Document</th><th>Category</th><th class="num">Pages</th><th class="num">Size</th><th>State</th><th>Read</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+
+    <div id="sub-categories" class="sub" hidden>
+      <p class="lead">Every piece of knowledge is classified, in this platform's own words: functional or technical,
+        its subjects, the applications and the components it is about. The LLM classifies what changes every day and
+        may propose new values; a new value is used once an admin approves it. The router and the search use them to
+        find the knowledge a question needs.</p>
+      <div class="filters">
+        <select id="fac-facet" aria-label="Category"><option value="">All categories</option>
+          <option value="subject">Subjects</option><option value="application">Applications</option>
+          <option value="component">Components</option><option value="aspect">Aspect</option></select>
+        <select id="fac-status" aria-label="State"><option value="">Approved and proposed</option>
+          <option value="approved">Approved</option><option value="proposed">Proposed</option></select>
+        <input id="fac-q" type="search" placeholder="Search the values" aria-label="Search the categories">
+      </div>
+      <div class="table-wrap"><table class="grid" id="facets">
+        <thead><tr><th>Value</th><th>Category</th><th class="num">Items</th><th>For example</th><th>State</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- Data: what the daily learning found in the databases -->
+  <section id="tab-data" class="tab" hidden>
+    <nav class="subnav" aria-label="Data">
+      <button type="button" data-sub="browse">Browse</button>
+      <button type="button" data-sub="relations">Relations</button>
+      <button type="button" data-sub="changes">Changes</button>
+    </nav>
+    <div id="sub-browse" class="sub" hidden>
+      <form id="filters" class="filters" autocomplete="off">
+        <select id="f-source" aria-label="Database"><option value="">All databases</option></select>
+        <select id="f-kind" aria-label="Kind">
+          <option value="">Everything</option><option value="metric">Metrics</option><option value="label">Metric labels</option>
+          <option value="family">Metric families</option><option value="index">Indices</option><option value="field">Index fields</option>
+        </select>
+        <select id="f-show" aria-label="Show">
+          <option value="">Current</option><option value="unverified">AI-written, not approved</option>
+          <option value="undescribed">Without description</option><option value="gone">Gone</option>
+        </select>
+        <input id="f-q" type="search" placeholder="Search names and descriptions" aria-label="Search">
+      </form>
+      <div class="table-wrap"><table class="grid" id="objects">
+        <thead><tr><th>Name</th><th>Kind</th><th>Type</th><th>Unit</th><th>Description</th><th class="num">Size</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div class="pager"><button type="button" class="btn" id="prev">Previous</button><span id="page-info" class="muted"></span><button type="button" class="btn" id="next">Next</button></div>
+    </div>
+    <div id="sub-relations" class="sub" hidden>
+      <p class="lead">How metrics and index fields relate: written in the catalog, or measured on the data (the values
+        two columns have in common, measured again every day). A measured relation that is wrong: an admin marks it
+        <strong>Wrong</strong> and it is never given to the agent; the right one is a catalog entry of classification
+        <em>relationships</em>.</p>
+      <div class="table-wrap"><table class="grid" id="relations">
+        <thead><tr><th>Relation</th><th>Origin</th><th class="num">Confidence</th><th></th></tr></thead><tbody></tbody>
+      </table></div>
+      <div class="pager" id="rel-pager" hidden></div>
+    </div>
+    <div id="sub-changes" class="sub" hidden>
+      <div class="filters"><label>Last <select id="c-days"><option>1</option><option selected>7</option><option>30</option></select> days</label></div>
+      <div class="table-wrap"><table class="grid" id="changes">
+        <thead><tr><th>When</th><th>Change</th><th>What</th><th>Database</th><th>Detail</th></tr></thead><tbody></tbody>
+      </table></div>
+      <div class="pager" id="c-pager" hidden></div>
+    </div>
+  </section>
+
+  <!-- Learned by the agent -->
+  <section id="tab-learned" class="tab" hidden>
+    <p class="lead">What the agent learned by itself, on the databases you may query: the answers people marked
+      Helpful, where the data of the questions was, the catalog entries it wrote from evidence, and how long each kind
+      of query takes.</p>
+    <div id="agent-summary" class="agent-summary"></div>
+    <h2 class="section-title">Learned answers</h2>
+    <p class="muted">Answers marked <strong>Helpful</strong> in the chat, under a short generic question, with the way
+      to the result; the most useful first: what people said of the answers each was given to, its query run again
+      and whether it worked. One that people keep saying is wrong is no longer proposed. <strong>helpful</strong>:
+      waiting for an admin; <strong>confirmed</strong>: approved and proposed first; <strong>rejected</strong>: never
+      proposed.</p>
+    <div class="filters"><select id="r-status" aria-label="Status"><option value="">All</option>
+      <option value="helpful">Helpful, to review</option><option value="confirmed">Confirmed</option>
+      <option value="rejected">Rejected</option><option value="auto">Saved automatically (0.2.1 and before)</option>
+      </select></div>
+    <div class="table-wrap"><table class="grid" id="recipes">
+      <thead><tr><th>Question</th><th>Way</th><th class="num">Time</th><th class="num">Helpful / not</th><th>Status</th><th></th></tr></thead>
+      <tbody></tbody></table></div>
+    <h2 class="section-title">Catalog entries the agent wrote</h2>
+    <div class="table-wrap"><table class="grid" id="agent-entries">
+      <thead><tr><th>Entry</th><th>Classification</th><th>From</th><th>Updated</th></tr></thead>
+      <tbody></tbody></table></div>
+    <h2 class="section-title">Where the data of the questions was</h2>
+    <div class="table-wrap"><table class="grid" id="associations">
+      <thead><tr><th>Word of the questions</th><th>Where the data was</th><th>Database</th><th class="num">Uses</th></tr></thead>
+      <tbody></tbody></table></div>
+    <h2 class="section-title">Query timings</h2>
+    <p class="muted">How long each kind of query took (values replaced by ?), slowest first: the agent sees them next
+      to the metric or index it is about to query.</p>
+    <div class="table-wrap"><table class="grid" id="timings">
+      <thead><tr><th>On</th><th>Kind of query</th><th class="num">Calls</th><th class="num">Average</th>
+        <th class="num">Slowest</th><th class="num">Failed</th></tr></thead><tbody></tbody></table></div>
+    <div class="pager" id="t-pager" hidden></div>
+  </section>
+
+  <!-- Search: as the agent searches for each question -->
   <section id="tab-search" class="tab" hidden>
-    <p class="muted">Search everything the agent knows, as the agent does for each question: the dictionary, the
-      catalog's notes, rules and formulas, the learned answers, the memory, the documents.</p>
+    <p class="lead">Search everything the agent knows, as the agent does for each question.</p>
     <form id="k-form" class="filters" autocomplete="off">
       <input id="k-q" type="search" placeholder="e.g. why do jobs fail on a saturated server" aria-label="Search the knowledge">
       <select id="k-kind" aria-label="Kind"><option value="">Everything</option><option value="metric">Metrics</option>
@@ -35,109 +237,56 @@
     </form>
     <div id="k-results" class="k-results"></div>
   </section>
-  <section id="tab-context" class="tab" hidden>
-    <p class="muted">What the system is, functionally and technically, written every night from what the team
-      shares: the documents and sites, the catalog, the team memory, the data dictionary and the answers marked
-      Helpful. Pages marked <span class="badge llm">AI-written</span> are written by the LLM from the sources listed
-      under them; the others are facts taken from the dictionary and the catalog. An admin can correct a page: the
-      agent then never writes over it. You see the pages of the databases you may query.</p>
-    <div id="ctx-actions" class="agent-summary"></div>
-    <div class="context-cols">
-      <div><h2 class="section-title">Functional</h2><ul id="ctx-functional" class="plain-list"></ul></div>
-      <div><h2 class="section-title">Technical</h2><ul id="ctx-technical" class="plain-list"></ul></div>
-    </div>
-  </section>
-  <section id="tab-knowledge" class="tab" hidden>
-    <p class="muted">What the team gave the agent, read only (admins change it in Settings → Chat settings): the
-      catalog, the documents and sites, and the team memory. The agent reads them for every question.</p>
-    <h2 class="section-title">Catalog</h2>
-    <div class="table-wrap"><table class="grid" id="kn-entries">
-      <thead><tr><th>Entry</th><th>Classification</th><th>Category</th><th>By</th><th>Updated</th></tr></thead>
-      <tbody></tbody></table></div>
-    <h2 class="section-title">Documents and sites</h2>
-    <div class="table-wrap"><table class="grid" id="kn-docs">
-      <thead><tr><th>Document</th><th>Kind</th><th>Status</th><th class="num">Size</th><th>Read</th></tr></thead>
-      <tbody></tbody></table></div>
-    <h2 class="section-title">Team memory</h2>
-    <ul id="kn-memory" class="plain-list"></ul>
-  </section>
-  <section id="tab-browse" class="tab">
-    <form id="filters" class="filters" autocomplete="off">
-      <select id="f-source" aria-label="Database"><option value="">All databases</option></select>
-      <select id="f-kind" aria-label="Kind">
-        <option value="">Everything</option><option value="metric">Metrics</option><option value="label">Metric labels</option>
-        <option value="family">Metric families</option><option value="index">Indices</option><option value="field">Index fields</option>
-      </select>
-      <select id="f-show" aria-label="Show">
-        <option value="">Current</option><option value="unverified">AI-written, not approved</option>
-        <option value="undescribed">Without description</option><option value="gone">Gone</option>
-      </select>
-      <input id="f-q" type="search" placeholder="Search names and descriptions" aria-label="Search">
-    </form>
-    <div class="table-wrap"><table class="grid" id="objects">
-      <thead><tr><th>Name</th><th>Kind</th><th>Type</th><th>Unit</th><th>Description</th><th class="num">Size</th></tr></thead>
-      <tbody></tbody>
-    </table></div>
-    <div class="pager"><button type="button" class="btn" id="prev">Previous</button><span id="page-info" class="muted"></span><button type="button" class="btn" id="next">Next</button></div>
-  </section>
-  <section id="tab-relations" class="tab" hidden>
-    <p class="muted">How metrics and index fields relate: written in the catalog, or measured on the data (the values two
-      columns have in common, measured again every day). The agent uses them to join indices and to match metric labels
-      with index fields. A measured relation that is wrong: an admin marks it <strong>Wrong</strong>, it is never
-      measured again nor given to the agent. To state the right one, add a catalog entry of classification
-      <em>relationships</em> (Settings → Chat settings → Catalog): it always wins.</p>
-    <div class="table-wrap"><table class="grid" id="relations">
-      <thead><tr><th>Relation</th><th>Origin</th><th class="num">Confidence</th><th></th></tr></thead><tbody></tbody>
-    </table></div>
-    <div class="pager" id="rel-pager" hidden></div>
-  </section>
-  <section id="tab-changes" class="tab" hidden>
-    <div class="filters"><label>Last <select id="c-days"><option>1</option><option selected>7</option><option>30</option></select> days</label></div>
-    <div class="table-wrap"><table class="grid" id="changes">
-      <thead><tr><th>When</th><th>Change</th><th>What</th><th>Database</th><th>Detail</th></tr></thead><tbody></tbody>
-    </table></div>
-    <div class="pager" id="c-pager" hidden></div>
-  </section>
-  <section id="tab-learned" class="tab" hidden>
-    <h2 class="section-title">Learned by the agent</h2>
-    <p class="muted">What the agent learned by itself, on the databases you may query: the catalog entries it is
-      certain of (with their evidence), where the data of the questions was found, the relations it measured and the
-      descriptions it wrote that nobody verified yet.</p>
-    <div id="agent-summary" class="agent-summary"></div>
-    <div class="table-wrap"><table class="grid" id="agent-entries">
-      <thead><tr><th>Its catalog entries</th><th>Classification</th><th>From</th><th>Updated</th></tr></thead>
-      <tbody></tbody></table></div>
-    <div class="table-wrap"><table class="grid" id="associations">
-      <thead><tr><th>Word of the questions</th><th>Where the data was</th><th>Database</th><th class="num">Uses</th></tr></thead>
-      <tbody></tbody></table></div>
-    <h2 class="section-title">Learned answers</h2>
-    <p class="muted">The answers users marked <strong>Helpful</strong> in the chat, under a short generic question
-      the agent wrote, with the way to the result (the final query, or the chart that was saved) and how long it
-      took. The agent starts from them for similar questions. <strong>helpful</strong>: waiting for an admin;
-      <strong>confirmed</strong>: approved by an admin (proposed first); <strong>rejected</strong>: never proposed.
-      You only see what concerns the databases you may query.</p>
-    <div class="filters"><select id="r-status" aria-label="Status"><option value="">All</option>
-      <option value="helpful">Helpful, to review</option><option value="confirmed">Confirmed</option>
-      <option value="rejected">Rejected</option><option value="auto">Saved automatically (0.2.1 and before)</option>
-      </select></div>
-    <div class="table-wrap"><table class="grid" id="recipes">
-      <thead><tr><th>Question</th><th>Way</th><th class="num">Time</th><th class="num">Helpful</th><th>Status</th><th></th></tr></thead>
-      <tbody></tbody></table></div>
-    <h2 class="section-title">Query timings</h2>
-    <p class="muted">How long each kind of query took (values replaced by ?), slowest first: the agent sees them
-      next to the metric or index it is about to query. Open a query to read it whole and its last error; admins
-      also see the last one as it ran.</p>
-    <div class="table-wrap"><table class="grid" id="timings">
-      <thead><tr><th>On</th><th>Kind of query</th><th class="num">Calls</th><th class="num">Average</th>
-        <th class="num">Slowest</th><th class="num">Failed</th></tr></thead><tbody></tbody></table></div>
-    <div class="pager" id="t-pager" hidden></div>
-  </section>
 </div>
+
 <div id="drawer" class="drawer" hidden>
   <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="d-title">
     <button type="button" class="close" id="d-close" aria-label="Close">&times;</button>
     <div id="d-body"></div>
   </div>
 </div>
+<div id="entry-drawer" class="drawer" hidden>
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="entry-title-h">
+    <button type="button" class="close" id="entry-close" aria-label="Close">&times;</button>
+    <h2 id="entry-title-h">Entry</h2>
+    <div class="edit">
+      <label class="field"><span>Title</span><input type="text" id="e-title" maxlength="255"></label>
+      <div class="fields two">
+        <label class="field"><span>Classification</span><select id="e-class"></select></label>
+        <label class="field"><span>Category</span><input type="text" id="e-category" list="e-categories" maxlength="128"
+          placeholder="e.g. Batch jobs, Servers, Network"><datalist id="e-categories"></datalist></label>
+        <label class="field"><span>Format</span><select id="e-fmt"><option value="yaml">YAML</option>
+          <option value="text">Text</option><option value="markdown">Markdown</option></select></label>
+        <label class="field check"><input type="checkbox" id="e-enabled"><span>Enabled (used by the agent)</span></label>
+      </div>
+      <div class="help" id="e-help"></div>
+      <div class="evidence" id="e-evidence" hidden></div>
+      <textarea id="e-content" rows="18" spellcheck="false" aria-label="Content"></textarea>
+      <div class="actions">
+        <button type="button" class="btn primary" id="e-save">Save</button>
+        <button type="button" class="btn" id="e-delete">Delete</button>
+        <span id="e-confirm" hidden>Delete this entry? It can be restored from its history.
+          <button type="button" class="btn small stop" id="e-delete-yes">Delete</button>
+          <button type="button" class="btn small" id="e-delete-no">Cancel</button></span>
+        <span id="e-result" class="result"></span>
+      </div>
+      <details id="e-history-box"><summary>History</summary><div id="e-history"></div></details>
+    </div>
+  </div>
+</div>
+<div id="import-drawer" class="drawer" hidden>
+  <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="import-h">
+    <button type="button" class="close" id="import-close" aria-label="Close">&times;</button>
+    <h2 id="import-h">Import a catalog (YAML)</h2>
+    <p class="muted">The file is split into entries (glossary, one per index, metrics by name prefix,
+      relationships, checks). Entries with the same title are updated, the others added.</p>
+    <textarea id="import-text" rows="18" spellcheck="false" aria-label="Catalog YAML"></textarea>
+    <label class="field check"><input type="checkbox" id="import-replace"><span>Also delete the structured entries this
+      file does not have</span></label>
+    <div class="actions"><button type="button" class="btn primary" id="import-go">Import</button>
+      <span id="import-result" class="result"></span></div>
+  </div>
+</div>
 {% endblock %}
-{% block scripts %}<script src="{{ supagent_static('dictionary.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}
+{% block scripts %}<script src="{{ supagent_static('dictionary.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
+<script src="{{ supagent_static('knowledge.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

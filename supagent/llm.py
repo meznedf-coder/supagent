@@ -244,6 +244,8 @@ class LLM:
                                          timeout=self.cfg.timeout, **kw)
             except requests.exceptions.SSLError as ex:
                 raise LLMError(f"LLM {self.base}: TLS refused ({ex}); check llm.ca_bundle") from ex
+            except requests.exceptions.ReadTimeout as ex:    # it has the question and did not answer in time: asking
+                raise LLMError(f"LLM {self.base}: no answer within {self.cfg.timeout} s") from ex   # again doubles it
             except requests.exceptions.RequestException as ex:
                 if attempt < len(RETRY_DELAYS):
                     time.sleep(RETRY_DELAYS[attempt])
@@ -382,3 +384,20 @@ class LLM:
         out["answer"] = (msg.get("content") or "").strip()[:80]
         out["seconds"] = round(time.time() - t0, 2)
         return out
+
+
+@contextmanager
+def bounded(llm: Any, seconds: float):
+    """The calls of this LLM bounded to `seconds` (never more than llm.timeout) while inside: a step that must be
+    quick (the router, the governed plan) gives up sooner and the normal way answers. Test doubles: unchanged."""
+    real = llm if hasattr(llm, "cfg") else getattr(getattr(llm, "agent", None), "llm", None)
+    cfg = getattr(real, "cfg", None)
+    if cfg is None or not getattr(cfg, "timeout", None):
+        yield llm
+        return
+    before = cfg.timeout
+    cfg.timeout = min(float(before), float(seconds))
+    try:
+        yield llm
+    finally:
+        cfg.timeout = before

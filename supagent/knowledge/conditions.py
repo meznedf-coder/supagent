@@ -230,18 +230,23 @@ def _value_said(value: Any, column: str, support: Support) -> bool:
             return True                                 # le = '2700' for "45 minutes"
     except ValueError:
         pass
+    words = support.words
+    if re.search(r"[a-z0-9]_[a-z0-9]", core):             # a code (FX_SPOT): a part said inside another code
+        free = re.sub(r"[a-z0-9À-ÿ]+(?:_[a-z0-9À-ÿ]+)+", " ", support.text)   # (FX_OPT_G10) does not say it
+        raw = set(re.findall(r"[a-z0-9À-ÿ]+", free))
+        words = raw | {stem(w) for w in raw}
     for token in re.findall(r"[a-z0-9À-ÿ]+", core):
         if len(token) < 2:
             continue
         s = stem(token)
-        if s in support.words:
+        if s in words:
             return True
         family = next((k for k, v in VALUE_WORDS.items() if s == k or s in v or token in v), None)
         if family:                                      # "succeeded" says SUCCESS, "errors" FAILED
             fam = VALUE_WORDS[family] | {family}
-            if any(w in fam or any(len(f) >= 4 and w.startswith(f) for f in fam) for w in support.words):
+            if any(w in fam or any(len(f) >= 4 and w.startswith(f) for f in fam) for w in words):
                 return True
-        if len(s) >= 4 and any(len(w) >= 4 and (w.startswith(s) or s.startswith(w)) for w in support.words):
+        if len(s) >= 4 and any(len(w) >= 4 and (w.startswith(s) or s.startswith(w)) for w in words):
             return True
     return False
 

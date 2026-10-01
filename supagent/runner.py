@@ -27,10 +27,27 @@ FILE_TOOLS = ("export_excel", "chart_from_sql", "chart_image")
 LIVE = ("pending", "running")
 
 
+def json_safe(value: Any) -> Any:
+    """A value PostgreSQL's JSON accepts: NaN and infinities (a sum over no row, a share of nothing) as null.
+    SQLite stores them; PostgreSQL refuses the whole row, and the answer was lost."""
+    import math
+
+    if isinstance(value, float):
+        return None if math.isnan(value) or math.isinf(value) else value
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value
+
+
 def _save(message_id: int, live: tuple[str, ...] = LIVE, **values: Any) -> bool:
     """Write the progress or the end of an answer, only while it is being answered: False (and
     nothing written) once it was stopped. A stopped answer is never written over, even by a
     step that was already running when Stop was pressed."""
+    for key in ("steps", "results", "files"):              # JSON columns: no NaN (PostgreSQL refuses it)
+        if key in values:
+            values[key] = json_safe(values[key])
     values["updated_at"] = dt.datetime.utcnow()          # progress: the answer is alive
     n = (db.session.query(Message).filter(Message.id == message_id, Message.status.in_(live))
          .update(values, synchronize_session=False))
@@ -350,14 +367,14 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
         db.session.commit()
         return status != "running"
 
-    from supagent.agent import Agent
+    from supagent.governed.pipeline import make_agent
 
     agent = None
     trace: list[dict] = []
     started = time.time()
     try:
         with acting_as(username):
-            agent = Agent(username, on_step=on_step, rich_results=True, should_stop=should_stop)
+            agent = make_agent(username, on_step=on_step, rich_results=True, should_stop=should_stop)
             try:
                 with llm_task("answer", user_id=user_id, message_id=message_id):
                     answer, trace = agent.ask(question, history)
@@ -382,6 +399,12 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
                     db.session.commit()
                 return True
             _record_usage(message_id, user_id, time.time() - started, getattr(agent, "usage", None) or {}, trace)
+            if hasattr(agent, "after_saved"):
+                agent.after_saved(message_id)            # the governed pipeline: its route knows its answer
+            from supagent.knowledge.ranking import record as record_uses
+
+            record_uses(message_id, user_id, getattr(agent, "given_refs", None), trace,
+                        route_id=getattr(agent, "route_id", None))      # what it was given and used: the ranking
             from supagent.knowledge.experience import learn_from_answer
 
             learn_from_answer(message_id, user_id, question, trace)      # query timings

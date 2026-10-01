@@ -423,6 +423,22 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                         db.session.rollback()
                         stats["generic_questions"] = {"error": str(ex)[:300]}
                     steps.end(**_flat(stats["generic_questions"]))
+                if llm:                               # the categories of what changed (the router's evidence)
+                    from supagent.knowledge.facets import classify
+
+                    steps.begin("categories of the knowledge")
+                    try:
+                        from supagent.llm import LLM, llm_task
+
+                        with llm_task("classify"):
+                            stats["classified"] = classify(LLM(), seconds=max(60.0, llm_deadline - time.time()),
+                                                           limit=int(settings.get("learn.classify_per_run") or 400))
+                    except LearningStopped:
+                        raise
+                    except Exception as ex:  # pylint: disable=broad-except
+                        db.session.rollback()
+                        stats["classified"] = {"error": str(ex)[:300]}
+                    steps.end(**_flat(stats["classified"]))
                 check(force=True)
                 steps.begin("search index and embeddings")
                 stats["index"] = index_knowledge()

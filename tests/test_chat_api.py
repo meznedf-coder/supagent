@@ -119,6 +119,40 @@ def test_feedback_keeps_the_sql_as_an_example(app):
         assert ex.sql == "SELECT 1" and ex.question == "How many jobs failed?"
 
 
+def test_helpful_teaches_the_deciders_route(app):
+    """Helpful on an answer confirms the route the decider recorded for it (the gate learns from it); taking the
+    mark back takes the confirmation back."""
+    with app.app_context():
+        from superset.extensions import db
+
+        from supagent.models import Route
+
+        _cid, mid, _ = _conversation("alice")
+        r = Route(question="How many jobs failed?", terms="job fail", shown=[], used=["data:1:jobs"], message_id=mid)
+        db.session.add(r)
+        db.session.commit()
+        rid = r.id
+    with app.test_client() as c:
+        login(c, "alice")
+        c.post(f"/supagent/api/messages/{mid}/feedback", json={"value": 1})
+        with app.app_context():
+            from superset.extensions import db
+
+            from supagent.models import Route
+
+            assert db.session.get(Route, rid).signal == "helpful"
+        c.post(f"/supagent/api/messages/{mid}/feedback", json={"value": 0})
+    with app.app_context():
+        from superset.extensions import db
+
+        from supagent.models import Route
+
+        route = db.session.get(Route, rid)
+        assert route.signal is None
+        db.session.delete(route)
+        db.session.commit()
+
+
 def _background_done(seconds: float = 30.0) -> None:
     """The background threads of earlier tests (Helpful, memory) must not read a table changed here."""
     import threading

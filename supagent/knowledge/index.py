@@ -246,9 +246,20 @@ def _superset_pieces() -> Iterator[dict[str, Any]]:
                        f'"{db_names.get(database_id, "")}": ' + "; ".join(charts[:40])}
 
 
+def _mcp_pieces() -> Iterator[dict[str, Any]]:
+    """The tools of the other MCP servers (mcp.servers): the decider routes questions to them."""
+    try:
+        from supagent import mcp_sources
+
+        if mcp_sources.servers():
+            yield from mcp_sources.pieces()
+    except Exception:  # pylint: disable=broad-except   (a server down: its pieces stay as they were)
+        log.warning("supagent index: MCP tools not read", exc_info=True)
+
+
 KINDS = (("object:", _object_pieces), ("entry:", _entry_pieces), ("recipe:", _recipe_pieces),
          ("memory:", _memory_pieces), ("doc:", _doc_pieces), ("context:", _context_pieces),
-         ("superset:", _superset_pieces))
+         ("superset:", _superset_pieces), ("mcp:", _mcp_pieces))
 
 
 def pieces(prefixes: tuple[str, ...] | None = None) -> Iterator[dict[str, Any]]:
@@ -340,7 +351,21 @@ def _write(existing: dict[str, Chunk], wanted: Iterator[dict[str, Any]], dry_run
             qdrant_delete([c.id for c in gone])
         except Exception as ex:  # pylint: disable=broad-except
             log.warning("supagent: qdrant delete: %s", ex)
+    if out["added"] or out["changed"] or out["removed"]:
+        _store_sync(tuple(sorted({ref.split(":")[0] + ":" for ref in seen} | {c.ref.split(":")[0] + ":"
+                                                                               for c in gone})))
     return out
+
+
+def _store_sync(prefixes: tuple[str, ...] | None) -> None:
+    """The knowledge store (pgstore) in step with the pieces just written (their kinds only)."""
+    try:
+        from supagent.knowledge import pgstore
+
+        if pgstore.active():
+            pgstore.sync(prefixes=prefixes, chats=False)
+    except Exception as ex:  # pylint: disable=broad-except   (the hourly sync catches up)
+        log.warning("supagent: the knowledge store was not updated: %s", str(ex)[:300])
 
 
 def embed_few(out: dict[str, int]) -> None:
@@ -380,6 +405,8 @@ def embed_pending(limit: int | None = None) -> dict[str, Any]:
         db.session.commit()
         done += len(part)
     left = db.session.query(Chunk).filter((Chunk.vector.is_(None)) | (Chunk.embed_model != model)).count()
+    if done:
+        _store_sync(None)                          # the new vectors into the store
     return {"embedded": done, "left": left}
 
 

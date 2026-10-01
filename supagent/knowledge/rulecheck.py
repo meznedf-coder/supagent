@@ -95,6 +95,78 @@ def _checkable(rule: dict[str, Any], asked: str) -> tuple[set[str], list[str]] |
     return names, values
 
 
+_CONCERNS: dict[str, tuple[float, set[str]]] = {}
+CONCERNS_S = 60.0
+RULE_WORDS = {"not", "never", "always", "only", "unless", "except", "exclude", "excluding", "include", "including",
+              "add", "its", "their", "record", "records", "value", "values", "use", "used", "using", "instead",
+              "count", "counts", "question", "questions", "asks", "ask", "asked", "when", "then", "otherwise",
+              "same", "each", "every", "all"}     # the words of any rule: they say how, not what data it is about
+
+
+def value_possible(table: str, field: str, value: str) -> bool | None:
+    """Can this field of this table have this value? False when its values are all known (learned) and the value
+    is not one of them ("BOOK = 'ALL'" on an index whose 24 books are all known); None when it cannot be said."""
+    from supagent.models import KObject
+
+    o = db.session.query(KObject).filter(KObject.kind.in_(("field", "label")), KObject.parent == table,
+                                         KObject.name == field, KObject.gone_at.is_(None)).first()
+    return possible_in((o.stats or {}) if o is not None else {}, value)
+
+
+def possible_in(stats: dict[str, Any], value: str) -> bool | None:
+    known = [str(v) for v in (stats.get("values") or [])]
+    if not known:
+        return None
+    if str(value).lower() in {k.lower() for k in known}:
+        return True
+    card = stats.get("cardinality")
+    full = (isinstance(card, int) or str(card or "").isdigit()) and int(card) <= len(known) and not stats.get("partial")
+    return False if full else None
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.split(r"[^a-z0-9]+", (text or "").lower()) if len(w) >= 3}
+
+
+def concerns(rule: dict[str, Any], names: set[str]) -> set[str] | None:
+    """The tables a rule is about, among those that have its field: the ones whose data carries the rule's
+    distinguishing subject (a word of the rule naming a field, a value or the table itself in some of them and
+    not in the others: "The VaR of a desk is its record with BOOK = 'ALL'" is about the index whose values say
+    VaR, not every index with a BOOK). None: no distinguishing word, every table with the field."""
+    import time
+
+    from supagent.knowledge.describe import STOP
+    from supagent.models import KObject
+
+    key = rule["text"]
+    hit = _CONCERNS.get(key)
+    if hit is not None and time.time() - hit[0] < CONCERNS_S:
+        return hit[1] or None
+    tables = {p for (p,) in db.session.query(KObject.parent).filter(
+        KObject.kind.in_(("field", "label")), KObject.name.in_(list(names)), KObject.gone_at.is_(None))}
+    data: dict[str, set[str]] = {t: _words(t) for t in tables}
+    for o in db.session.query(KObject).filter(KObject.kind.in_(("field", "label")), KObject.parent.in_(list(tables)),
+                                              KObject.gone_at.is_(None)):
+        ws = data.setdefault(o.parent, set())
+        ws |= _words(o.name)
+        for v in ((o.stats or {}).get("values") or [])[:300]:
+            ws |= _words(str(v))
+    said = {w for w in _words(rule["text"]) if w not in STOP and w not in RULE_WORDS}
+    distinct = {w for w in said if 0 < sum(w in ws for ws in data.values()) < len(data)}
+    about = {t for t, ws in data.items() if ws & distinct} if distinct else set()
+    _CONCERNS[key] = (time.time(), about)
+    return about or None
+
+
+GROUP_BY = re.compile(r"\bGROUP\s+BY\b(.*?)(?:\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|$)", re.I | re.S)
+
+
+def grouped_by(query: str) -> set[str]:
+    """The fields a query groups by (a rule's filter on one of them would keep one group of a list)."""
+    m = GROUP_BY.search(query or "")
+    return {x.strip('"`') for x in re.findall(r'"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*', m.group(1))} if m else set()
+
+
 def _fields_of(tables: set[str], names: set[str]) -> set[str]:
     """The rule's fields or labels that these tables have (the dictionary)."""
     from supagent.models import KObject
@@ -117,13 +189,20 @@ def details(question: str, queries: list[str]) -> list[dict[str, Any]]:
         if found is None:
             continue
         names, values = found
+        about = concerns(rule, names)
         for q in reversed(queries):                    # the last query on such data decides (a query run
             tables = _tables(q)                        # again with the rule makes up for the first one)
+            if about is not None:
+                tables = tables & about                # the tables the rule is about, not all with its field
             if not tables:
                 continue
             has = _fields_of(tables, names)
             if not has:
                 continue
+            if values and all(value_possible(t, f, values[0]) is False for t in tables for f in has):
+                break                                  # its value cannot be in this data: it filters nothing here
+            if has & grouped_by(q):                    # per BOOK: every book, not the rule's one
+                break
             if not any(re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", q) for n in has):
                 out.append(_detail(rule, has, values, tables))
             break
@@ -186,7 +265,12 @@ def chart_refusal(question: str, dataset: Any, config: dict) -> str | None:
         if found is None:
             continue
         names, values = found
+        about = concerns(rule, names)
+        if about is not None and dataset.table_name not in about:
+            continue
         has = _fields_of({dataset.table_name}, names)
+        if has and values and all(value_possible(dataset.table_name, f, values[0]) is False for f in has):
+            continue
         if has and not (has & used):
             return _refusal(_detail(rule, has, values, {dataset.table_name}), "generate_chart")
     return None

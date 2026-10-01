@@ -81,7 +81,8 @@
     input.focus();
   }
 
-  function open(id) {
+  // focus: a message to show (a chat found by the search), else the end of the conversation
+  function open(id, focus) {
     stopPolling();
     S.chat("GET", "conversations/" + id).then(function (data) {
       if (data.error) { welcome(); return; }
@@ -93,10 +94,43 @@
       var last = msgs[msgs.length - 1];
       if (last && last.role === "assistant" && /^(pending|running|cancelling)$/.test(last.status)) poll(last.id);
       else busy(null);
-      scrollDown();
+      var node = focus ? box.querySelector('.msg[data-id="' + focus + '"]') : null;
+      if (node) {
+        var prev = node.previousElementSibling;
+        (node.classList.contains("assistant") && prev && prev.classList.contains("user") ? prev : node).scrollIntoView({ block: "start" });
+        node.classList.add("found-flash");
+        setTimeout(function () { node.classList.remove("found-flash"); }, 2500);
+      } else {
+        scrollDown();
+      }
       markList();
     });
   }
+
+  // ---------------------------------------------------------------- search in the user's own chats
+  var search = document.getElementById("conv-search"), found = document.getElementById("conv-found");
+  var searchTimer = null, searchSeq = 0;
+  function searchChats() {
+    var q = search.value.trim();
+    if (q.length < 2) { searchSeq++; found.hidden = true; found.innerHTML = ""; list.hidden = false; return; }
+    var seq = ++searchSeq;
+    S.chat("GET", "chats/search?q=" + encodeURIComponent(q)).then(function (d) {
+      if (seq !== searchSeq) return;                  // a newer search was typed meanwhile
+      found.innerHTML = "";
+      (d.results || []).forEach(function (r) {
+        found.appendChild(el("li", { class: "found" }, [el("a", { href: "#", title: r.title,
+          onclick: function (ev) { ev.preventDefault(); open(r.conversation_id, r.message_id); } }, [
+            el("span", { class: "found-title", text: r.title }),
+            el("span", { class: "found-text", text: r.question && r.question !== r.title ? r.question : r.snippet }),
+            el("span", { class: "found-when", text: S.when(r.at) })])]));
+      });
+      if (!(d.results || []).length) found.appendChild(el("li", { class: "found-none", text: d.error || "No chat found." }));
+      list.hidden = true;
+      found.hidden = false;
+    });
+  }
+  search.addEventListener("input", function () { clearTimeout(searchTimer); searchTimer = setTimeout(searchChats, 300); });
+  search.addEventListener("keydown", function (ev) { if (ev.key === "Escape") { search.value = ""; searchChats(); } });
 
   function remove(id) {
     S.chat("DELETE", "conversations/" + id).then(function () {
@@ -497,6 +531,8 @@
     var fold = function (open) { convs.classList.toggle("open", open); toggle.setAttribute("aria-expanded", open ? "true" : "false"); };
     toggle.addEventListener("click", function () { fold(!convs.classList.contains("open")); });
     list.addEventListener("click", function (ev) { if (ev.target.closest("a")) fold(false); });
+    found.addEventListener("click", function (ev) { if (ev.target.closest("a")) fold(false); });
+    search.addEventListener("input", function () { if (search.value.trim()) fold(true); });
     document.getElementById("new-chat").addEventListener("click", function () { fold(false); });
     document.addEventListener("click", function (ev) {
       var a = ev.target.closest && ev.target.closest("a[href]");

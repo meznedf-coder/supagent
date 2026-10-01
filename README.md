@@ -28,11 +28,11 @@ It adds:
     * **what changed** since the day before: new, gone or back objects, changed types or units,
       big changes in series counts.
 
-    Its tabs: *Browse*, *Relations*, *Changes*, *Learned* (what the agent learned by itself: its
-    catalog entries with their evidence, where the data of the questions was found, the relations it
-    measured, the AI descriptions still to verify; then the learned answers and the query timings),
-    *Knowledge* (the catalog, the documents and sites and the team memory, read only), *Context*
-    (below) and *Search*. Everyone sees only what concerns the databases they may query.
+    Its tabs (0.6): *To review* (what waits for an admin), *Knowledge* (the catalog, the team
+    memory, the Context, the documents and sites, the categories: edited there by admins, read
+    only for the others), *Data* (browse, relations, changes), *Learned by the agent* and
+    *Search* (see *The Data dictionary* below). Everyone sees only what concerns the databases
+    they may query.
 
     Descriptions come from your catalog first, then from the source (the exporters' HELP
     texts), then from the LLM. LLM texts are marked *AI-written* until an admin approves or
@@ -45,14 +45,23 @@ It adds:
 * **knowledge search** (0.2): every question comes with the few pieces of knowledge that match
   it (dictionary, catalog, learned answers, memory, your documents and sites), found by words
   (PostgreSQL full-text search) and by meaning (an embedding model such as BGE-M3). No
-  database extension: the vectors are kept in Superset's database, or in Qdrant.
+  database extension is needed: the vectors are kept in Superset's database, or in Qdrant.
+  With the PostgreSQL extensions pgvector, pg_trgm and pg_textsearch, the **knowledge store**
+  (0.6, optional) searches in PostgreSQL itself: BM25, near spellings, meaning, and each
+  user's own chats.
+* **a router** (0.6): before each answer, one short LLM call chooses the kind of work the
+  question needs (functional, technical, incident, charts, observability, infrastructure) from
+  its meaning and the team's knowledge, and gives that kind's knowledge and tools first; not
+  sure, the normal way. The knowledge is **classified** daily by the LLM (subjects,
+  applications, components, relations), an admin reviewing only what is new or unsure.
 * **a catalog in separate entries** (0.2): title, classification, category and content, each
   edited on its own with its history. The agent adds entries itself when the evidence is
   certain (formulas of answers marked Helpful, approved team rules, definitions quoted from your
   documents), marked as written by the agent.
 * **a settings page for admins** (*Settings → Chat settings*): the LLM, including company
-  token middleware; the daily learning; knowledge search, memory, documents and sites; the
-  catalog entries; the learning runs.
+  token middleware; the daily learning; knowledge search; the learning runs. The catalog, the
+  team memory, the documents and sites and the review of what the agent proposes are in the
+  **Data dictionary** (0.6).
 
 Everything is Python, HTML and JavaScript served by Superset itself: there is no JavaScript
 build, no external script, no Docker and no extra service. The pages work with Superset's
@@ -60,10 +69,9 @@ Content-Security-Policy (Talisman nonces).
 
 ## Requirements
 
-* Apache Superset 6.x in a Python 3.10–3.12 virtualenv. Tested with 6.1.0 on PostgreSQL
-  (production-like, with Celery workers and beat) and on SQLite; the test suite also passes on
-  6.0.0. supagent needs `pydantic>=2.8`, which Superset 6.1 already has; on 6.0 pip installs it
-  (offline: the small `pydantic` wheelhouse delivered with supagent).
+* Apache Superset 6.1 in a Python 3.10–3.12 virtualenv. Tested with 6.1.0 on PostgreSQL
+  (production-like, with Celery workers and beat) and on SQLite. supagent needs
+  `pydantic>=2.8`, which Superset 6.1 already has: nothing else to install, offline too.
 * Saving Superset charts and dashboards from the chat uses Superset 6.1's own MCP service
   (package `fastmcp`, which Superset 6.1 installs with its `mcp` extra). Without it everything
   else works; the agent says that it cannot save charts.
@@ -76,16 +84,19 @@ Content-Security-Policy (Talisman nonces).
   `superset supagent learn` from cron.
 * An OpenAI-compatible LLM with tool calls (llama.cpp `--jinja`, vLLM, a company gateway...).
 * Optional: an OpenAI-compatible **embedding** endpoint (`/embeddings`, e.g. BGE-M3 behind the
-  same gateway) for search by meaning. Without it the search uses words only. No `pgvector`
-  or other database extension is needed.
+  same gateway) for search by meaning. Without it the search uses words only. No database
+  extension is needed.
+* Optional (0.6): the PostgreSQL extensions `vector` (pgvector 0.7 or later), `pg_trgm` and
+  `pg_textsearch` in Superset's database, for the knowledge store (PostgreSQL 17 or 18; tested
+  on 18.3 with pgvector 0.8.1 and 0.8.6, pg_textsearch 0.5.0 and 1.4.0; see *The knowledge store
+  in PostgreSQL*).
 
 ## Install (pip only)
 
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.5.4-py3-none-any.whl          # Superset 6.1: nothing else to install
-# Superset 6.0 offline: add  --find-links ./wheelhouse-pydantic  (pydantic is not in 6.0)
+$PY -m pip install supagent-0.6.0-py3-none-any.whl          # Superset 6.1: nothing else to install
 ```
 
 One line in `superset_config.py` registers it. It holds no logic:
@@ -109,6 +120,170 @@ Restart the web server, the Celery workers and beat.
 The role **AI Agent** gives the chat and the data dictionary; the settings stay with the
 Admin role. `superset init` never gives these pages to Gamma or Alpha. What a user can query
 through the agent stays what Superset lets that user query.
+
+## Upgrade from 0.5.4 to 0.6.0
+
+The same steps are in `INSTALL.txt`. What changes (each one can be switched off):
+
+* **The router (MOA)**: before each answer, one short LLM call (60 s at most) chooses the kind
+  of work. Off: `agent.router=false`.
+* **The knowledge store**, when `vector`, `pg_trgm` or `pg_textsearch` is in Superset's
+  database: `init` builds it, then the search runs in PostgreSQL. Off: `search.store=off`
+  (the search of 0.5.4).
+* **The chats** go into the store; each user can search their own (a search box above the
+  chats). Off: `search.chats=false`.
+* **The Data dictionary**: the catalog, the team memory, the Context, the documents and sites
+  are now edited there, no longer in *Settings → Chat settings*. A save answers at once.
+* **Categories** of the knowledge: classified by the LLM with the daily learning (400 items a
+  day at most, `learn.classify_per_run`).
+* Not changed: the classic pipeline answers (`agent.pipeline = classic`); the reranker is off.
+* Superset's database: 6 new tables (`supagent_route`, `supagent_facet`, `supagent_tag`,
+  `supagent_link`, `supagent_classified`, `supagent_item_use`) and the schema
+  `supagent_store`; no existing table or column changes, nothing is deleted.
+  `superset_config.py` does not change.
+
+### A. Before the day (nothing changes yet)
+
+**1. PostgreSQL**, connected to Superset's database (`SHOW shared_preload_libraries` needs a
+superuser or a role with `pg_read_all_settings`; the two `SELECT`s work for any user, Superset's
+too):
+
+```sql
+SHOW shared_preload_libraries;
+SELECT extname, extversion, extnamespace::regnamespace AS schema FROM pg_extension
+ WHERE extname IN ('vector', 'pg_trgm', 'pg_textsearch');
+SELECT has_database_privilege('<Superset database user>', current_database(), 'CREATE');
+```
+
+* **pg_textsearch 0.5.x in `shared_preload_libraries`**: take it out (or upgrade
+  pg_textsearch to 1.x), then restart PostgreSQL, *before* the upgrade. With 0.5.x a
+  `ROLLBACK` after an error can fail (`ResourceOwnerEnlarge called after release started`) and
+  leave the session stuck; preloaded, that is every session, Superset's own too, with 0.5.4
+  already. Not preloaded, it is loaded only by the store's sessions, which never run a
+  transaction. 1.x has the fix (and must be preloaded).
+* The extensions must be in Superset's database itself (`CREATE EXTENSION` is per database),
+  in any schema.
+* CREATE privilege `f`: `GRANT CREATE ON DATABASE <Superset database> TO <Superset database
+  user>;`, or keep the store off (step 8). Without it `init` says *knowledge store: not built*
+  and the search of 0.5.4 answers.
+
+**2.** Check the wheel (`sha256sum -c SHA256SUMS`) and keep the 0.5.4 wheel for a rollback.
+
+### B. The upgrade (Superset stopped for a few minutes)
+
+**3.** Stop the web servers, the Celery workers and Celery beat, on every host. A running 0.5.4
+process must not load files of 0.6.0: install while everything is stopped.
+
+**4. Back up:**
+
+```bash
+PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')     # the Python of Superset's virtualenv
+pg_dump -Fc -f superset-before-0.6.0.dump "<Superset's database>"
+$PY -m pip freeze > pip-before-0.6.0.txt
+```
+
+**5. Install**, on every host that runs Superset (web servers, workers, beat). No other package
+is installed or changed (pydantic is already there); `supagent[graph]` is not needed.
+
+```bash
+PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
+$PY -m pip install supagent-0.6.0-py3-none-any.whl
+$PY -m pip show supagent | head -2                     # Version: 0.6.0
+```
+
+**6. Once, on one host:**
+
+```bash
+superset supagent init
+```
+
+It prints, among other lines (the rehearsal of this upgrade on a copy of the lab's database):
+
+```
+tables: schema version 7 -> 9
+knowledge store: built (2064 pieces, 14146 names, pg_textsearch 0.5.0, vectors 1024) in 10.8 s
+```
+
+and the warnings to read (e.g. pg_textsearch 0.5.0 is a pre-release: see step 1). *knowledge
+store: not used* or *not built* with the reason: the search of 0.5.4 answers; check with
+`superset supagent store status`. `init` takes a few minutes: the store (the lab at scale:
+10,000 pieces and 380,000 names in 107 s), then the vectors of the last 2,000 chats' questions,
+older ones hourly after (the rehearsal: 3 minutes in all, embeddings on a CPU). To keep the stop
+short, build it after the start instead:
+
+```bash
+superset supagent settings --set search.store=off       # before init
+# after step 9, while people work (the search of 0.5.4 answers meanwhile):
+superset supagent settings --set search.store=auto
+superset supagent store rebuild
+```
+
+**7.** The LLM and the embeddings are unchanged; check them from this host:
+`superset supagent test-llm`.
+
+**8. Optional:** start with 0.5.4's behaviour and switch the new parts on later:
+
+```bash
+superset supagent settings --set agent.router=false --set search.store=off
+# back on, later:
+superset supagent settings --set agent.router=true --set search.store=auto
+superset supagent store rebuild                         # if init did not build it
+```
+
+**9.** Start the web servers, the workers and beat.
+
+### C. Checks
+
+**10. Check:**
+
+```bash
+superset supagent store status        # extensions, versions, rows; read its "warnings"
+superset supagent check-knowledge     # exit code 0: everything the team put in reaches the agent
+superset supagent ask --user <admin> "<a question your team often asks>"
+```
+
+In Superset: *Chat* (one question; the search box above the chats), *Settings → Data
+dictionary* (tabs To review, Knowledge, Data, Learned by the agent, Search); *Settings → Chat
+settings* shows "supagent 0.6.0 (tables v9)".
+
+**11. Categories**, once (needs the LLM; then every day with the learning; a later run
+continues). Then *Data dictionary → To review*: the new categories, the unsure tags, the "same
+as" relations (the tags on a new category come up once the category is approved; `classify`
+counts them already). The rehearsal: 93 items in 3 minutes (12 LLM calls), 18 new categories
+and 42 tags to review.
+
+```bash
+superset supagent classify --minutes 30
+```
+
+### D. Roll back to 0.5.4
+
+**12.** Stop everything, then:
+
+```bash
+$PY -m pip install supagent-0.5.4-py3-none-any.whl      # on every host
+superset supagent init                                  # once: it records schema 7 again
+```
+
+and start everything. The new tables and the schema `supagent_store` stay, unused by 0.5.4 (to
+drop the store, before going back, with 0.6.0: `superset supagent store wipe --yes`). The
+vectors are still in `supagent_chunk`: nothing to embed again. The backup of step 4 is only for
+a damaged database (services stopped; as Superset's database user, the errors *must be owner of
+extension ...* are expected: the extensions stay; then `superset supagent init` of the version
+installed):
+
+```bash
+pg_restore --clean --if-exists -d "<Superset's database>" superset-before-0.6.0.dump
+```
+
+Back to 0.6.0 later: steps 3, 5, 6, 9, then `superset supagent store sync` (the chats of the
+meantime).
+
+### E. Later, optional
+
+pg_textsearch 1.x (then `superset supagent store rebuild`); a cross-encoder reranker
+(`rerank.url`, measure it first: see *A cross-encoder reranker*); the governed pipeline and
+other MCP servers (`pip install "supagent[graph]"`, see `INSTALL.txt`).
 
 ## Celery workers and beat
 
@@ -340,7 +515,7 @@ line and column of an error before it is saved). Every change is kept and can be
 deleting is soft; two admins editing the same entry cannot overwrite each other.
 
 When two entries define the same index, metric, term or check, the most recent change wins,
-except that **a person's entry always wins over the agent's**; the settings page lists such
+except that **a person's entry always wins over the agent's**; the catalog (Data dictionary) lists such
 conflicts. `superset supagent import-catalog catalog.yaml` splits a whole catalog (the format
 of the osagg bundle's `catalog.yaml`) into entries (`--replace` also deletes the structured
 entries the file does not have); `export-catalog` merges them back into one YAML. Upgrading
@@ -557,6 +732,79 @@ While it answers, the agent:
   unusual, and in investigations): the same window on the previous weeks, median and median
   absolute deviation per series, a verdict normal / high / low (unknown with fewer than 3 weeks).
 
+## The governed pipeline (0.6, optional)
+
+`superset supagent settings --set agent.pipeline=governed` (back: `classic`, the default). The model no longer
+writes queries; each answer goes through:
+
+1. **the decider**: the tables (an index or a metric in one database) and the knowledge the question needs,
+   chosen from every source. Candidates come from the dictionary directly (names, descriptions, synonyms,
+   associations, the values the question names, the database or chart it names, learned answers, the team's
+   charts), ranked by a small learned gate, then one LLM call chooses among the best and says what is ambiguous
+   or missing. The gate learns only from answers a person confirmed (Helpful, an admin's confirmation, the
+   reply to a question back), hourly, around fixed defaults;
+2. **the plan**: one LLM call fills a typed plan (tables, measures, groups, conditions, period, top N) where
+   every condition names its source (the question's words, the chat, a knowledge item, an earlier step);
+3. **the checks**, by code: a condition nobody gave, a period that is not the question's, a top N nobody asked
+   for, a value the data does not have, a dimension the question asks per that is not grouped, a counter
+   averaged, a unit that cannot be converted are sent back once; the team's rules are added by code;
+4. **the queries**, built by code from the plan: through Superset's chart data API when the table has a
+   dataset (its permissions and row-level security apply), else as execute_sql with the user's permissions;
+5. **the answer**: written from a figures sheet made by code, its numbers checked, with a line saying how it
+   was counted (each condition with its source).
+
+Charts and dashboards to save, files, e-mails, screenshots, status and "is it normal" questions, questions for
+another MCP source, and a question no plan passed the checks for, go to the classic agent (its steps say so).
+With `pip install "supagent[graph]"` the pipeline runs as a LangGraph graph and other MCP servers can be added
+(`mcp.servers`, see INSTALL.txt).
+
+### The router (MOA, 0.6)
+
+Before each answer, one short LLM call reads what the question asks and chooses the kind of work it needs:
+*functional* (the business meaning or figures of the data), *technical* (how the systems work), *incident*
+(what went wrong and why over a past period), *charts* (Superset charts and dashboards themselves),
+*observability* (is it normal, anomalies, health) or *infrastructure* (servers and services: CPU, memory,
+latency, errors, availability). Nothing in it is about one business: what is specific to a deployment comes from
+its own knowledge (shown to the router with its categories) and its own confirmed examples. The route gives the
+knowledge of its kind first, the tools it needs and a short instruction; in the governed pipeline, *charts*,
+*observability* and *incident* go to the classic agent. The LLM scores every kind (0-100); when the best is not
+clearly ahead, nothing is routed: the normal way, as before (`agent.router`, `router.min_confidence`).
+
+It learns from the answers people confirmed whose execution followed the route. Similar questions of the team
+are shown to the LLM (how this team names things); the same question asked again is not: its examples only vote,
+and decide alone when two or more agree or when an admin set the route (*Data dictionary → To review*). An admin
+confirming an answer judged the answer, not its route: that is not an admin example. On the lab's two benchmarks
+(the 94 questions of the held-out test half): 82% routed right with no example (57% before 0.6.0b3), 88% with
+examples, 83% with a wrong confirmed example of the same question (31% before).
+
+## The Data dictionary (0.6)
+
+One page for everything the agent knows, in five tabs (deep links: `#review`, `#catalog`, `#memory`,
+`#context`, `#docs`, `#categories`, `#browse`, `#relations`, `#changes`, `#learned`, `#search`):
+
+* **To review** (admins; the page opens on it when something waits, the count is on the tab and in Settings): the
+  team memory proposed from the chats, the answers marked Helpful, the categories and relations the LLM proposes,
+  each a card with its actions (approve, correct, merge, reject; approve all shown); then, folded, what the agent
+  already uses and an admin may check (AI-written descriptions, the kinds of work learned by the router);
+* **Knowledge**: the catalog, the team memory, the Context, the documents and sites, the categories, edited here
+  (they left the Settings page); read only for users who are not admins;
+* **Data**: browse the dictionary, the relations, the changes; **Learned by the agent**: the learned answers, most
+  useful first (below), the catalog entries the agent wrote, where the data of the questions was, query timings;
+  **Search**: the knowledge as the agent searches it.
+
+A save answers at once; what follows (the catalog applied to the dictionary, the search pieces, their vectors,
+the knowledge store) runs in the background of the process that saved (`knowledge.apply_background`), and the line
+next to the tabs says when the agent's search is up to date (on the lab: saves 0.03-0.5 s instead of 0.8-1.6 s,
+up to date about 2 s later; a process that stops meanwhile loses nothing: the hourly indexing catches up).
+
+**Categories** (0.6, `superset supagent classify`, and every day with the learning): every piece of knowledge
+(catalog entries, memories, documents, Context pages, learned answers, indices, metric families) is classified by
+the LLM: functional or technical, its subjects, the applications and the components it is about, and its
+relations to other items and tables (about, depends on, part of, explains, runs on). The values come first from
+what people wrote (the catalog's categories, the values of application-like fields); the LLM may propose new ones.
+Tags the LLM is fairly sure of, on approved values, are used at once; an admin reviews the new values, the unsure
+tags and the relations that say two items are the same. The router and the search read the approved ones.
+
 ## Learning from the chats
 
 * **Learned answers** (0.2.2): only an answer marked *Helpful* is learned: its final successful
@@ -568,6 +816,16 @@ While it answers, the agent:
   withdraws it, unless an admin confirmed it. A similar question of anyone in the team starts
   from the confirmed ones first, then the helpful ones, on the databases the user may query.
   The first answer of a chat names it the same way (a 2-6 word generic title).
+* **Ranked by what happened** (0.6): after every answer, the items its prompt was given (learned
+  answers, catalog entries, memories, documents, Context pages), the tables its queries read, and the
+  learned queries it ran again (and whether they worked) are recorded. Each learned item's usefulness
+  comes from what people said of the answers it was given to (Helpful, Not helpful): the learned answers
+  proposed for a question follow it, one that people keep saying is wrong is no longer proposed (unless
+  an admin confirmed it), and *Data dictionary → Learned by the agent* lists them most useful first with
+  their reasons; one unused for 90 days says so (retire it there).
+* **Search your own chats** (0.6): the box above the conversations finds a user's own earlier chats (the
+  knowledge store: every word typed, or close in meaning, `search.chat_box_similarity`; else the words in
+  the messages) and opens the one chosen on the message found.
 * **Where the data was** (0.3, `learn.associations`): after each answer, the words of the
   question and the metrics or indices its successful queries read; the next questions with those
   words find them first. *Not helpful* takes them back; one that sent the agent to data that was
@@ -605,7 +863,7 @@ While it answers, the agent:
   that tells something ("STATUS_INFO = KO means the job failed") is read the same way. Every
   question gets at most `memory.prompt_chars` characters of them (rules, then preferences, then
   facts); the facts left out are still found by the knowledge search. Users see and delete
-  theirs with the chat's *Memory* button; admins review the team's on the settings page.
+  theirs with the chat's *Memory* button; admins review the team's in *Data dictionary → To review*.
 
 ## Measuring it
 
@@ -666,6 +924,58 @@ reaches nothing), rules not given in full (the first 30, 1,500 characters each, 
 instructions; the others are found by the search), team memories and learned answers waiting for
 an admin, documents that could not be read. Exit code 1 when there is a problem.
 
+### A cross-encoder reranker (0.6, optional)
+
+`rerank.url` (empty: none): the first `rerank.depth` pieces the search found (40) are read with the question by a
+reranker model served over HTTP (a cross-encoder reads the question and the piece together, which the words and
+the vectors cannot), then ordered by both ranks, the search's and the reranker's (`rerank.weight`). APIs:
+`rerank.api = jina` (Jina, Cohere, vLLM, llama.cpp's server with `--reranking`, Infinity) or `tei`
+(text-embeddings-inference); `rerank.auth` none, token or the LLM's (on the same gateway as the embeddings). A
+reranker that fails or answers later than `rerank.timeout` (2 s) is skipped for a minute: the search's own order.
+The router never waits for it. Serve a multilingual model next to the embeddings (e.g. Qwen3-Reranker-0.6B or
+bge-reranker-v2-m3), and measure it on your data before switching it on: on the lab at production size (64,016
+objects, no learned answers yet), a generic multilingual cross-encoder (jina-reranker-v2-base-multilingual) made
+the decider's ranking worse (MRR 0.535 to 0.49 with equal weights; worse with more weight), preferring the short,
+on-topic descriptions of look-alike metrics over the real tables' pieces; on a CPU it also took 8.5 s per question.
+
+### The knowledge store in PostgreSQL (0.6)
+
+With PostgreSQL and its extensions **pgvector** (`vector`, 0.7 or later for `halfvec`), **pg_trgm** and **pg_textsearch**
+(PostgreSQL 17 or 18; each extension is optional, the store uses those it finds), the search runs in PostgreSQL instead (`supagent/knowledge/pgstore.py`), three ways at once, the ranks fused:
+
+* **words**: BM25 of pg_textsearch (a rare word counts more than a common one), on the words of each piece (names
+  cut at `_` and at capitals, light stems, English and French stop words out); without pg_textsearch, PostgreSQL's
+  full-text search with an index;
+* **near spellings**: pg_trgm on the names and values of the data (metrics, indices, labels, fields, the values
+  seen, synonyms, glossary terms): a name or a value typed with a typo or as a variant (`BILLNG`,
+  `node_cpu_secnds_total`) still finds its table;
+* **meaning**: the vectors of `embed.model` in an HNSW index (`halfvec`), so no process holds them in memory,
+  however many pieces there are.
+
+It also keeps **each user's chats** (their questions, the beginning of the answers, the tables they read; found by
+their owner only: the tool `search_my_chats`, offered when a question refers to an earlier chat) and the **routes
+people confirmed** (Helpful, an admin's confirmation, the reply to a question back): the governed decider counts
+the tables that answered the questions most like a new one (`neighbors`, with the pieces found by near spelling as
+`spelling`), and its gate learns how much to trust them.
+
+The store is derived and can be wiped at any time: it lives in a schema of its own (`search.store_schema`, default
+`supagent_store`) in Superset's database, or in another PostgreSQL (`search.store_uri`); `superset supagent init`
+builds it the first time it finds the extensions, `superset supagent store rebuild` builds a new version beside the
+one in use and then switches to it, `store wipe` drops the schema (the search of 0.5 answers until the next
+rebuild), `store status` shows the extensions, their versions, the size and the warnings, `store search` searches it
+as a user would. It follows the pieces as they change, hourly for the chats, routes and names, and is built again
+when the embedding model changes. Its connections are its own (autocommit, closed after use). `search.store = off`
+goes back to the search of 0.5 without touching anything else, and the vectors stay in `supagent_chunk`, so going
+back to 0.5.4 needs no new embedding. Settings: `search.store`, `search.store_uri`, `search.store_schema`,
+`search.bm25`, `search.chats`, `search.chat_days`, `embed.query_instruction`.
+
+**pg_textsearch before 0.6.1**: tested on PostgreSQL 18.3 with 0.5.0, a `ROLLBACK` after an error inside a
+transaction can fail with `ResourceOwnerEnlarge called after release started` (pg_textsearch issue #247). That
+happens in every session when the library is in `shared_preload_libraries`, and without it in sessions that touched
+a BM25 index. The session is then stuck in its aborted transaction until it is closed. The store never runs a
+transaction there, but Superset's own sessions do: do not preload 0.5.x, and upgrade to 1.x (it needs the preload
+and has the fix). `store status` warns about it.
+
 ## Documents and sites
 
 Admins add documents (text, Markdown or HTML files) and web pages or whole sites (the pages
@@ -693,7 +1003,17 @@ columns of newer versions.
 | supagent_memory | preferences, rules and facts (personal or team) |
 | supagent_doc | documents and sites (their text) |
 | supagent_chunk | the searchable pieces of knowledge (text and vector) |
+| supagent_association | words of the questions and the data they led to |
+| supagent_context | the Context pages |
+| supagent_usage, supagent_llm_call | where the time of the answers goes; the LLM calls (the LLM usage page) |
+| supagent_route | per answer: the tables shown, chosen and read, and the router's route (0.6) |
+| supagent_facet, supagent_tag, supagent_link, supagent_classified | the categories, the items' tags and relations, what was classified (0.6) |
+| supagent_item_use | which learned items each answer was given and used (their ranking, 0.6) |
+| supagent_meta | the schema version and the workers' heartbeats |
 | supagent_document | the 0.1 catalog, kept as a backup after the upgrade |
+
+The knowledge store (0.6, optional) is a schema of its own, `supagent_store` (`search.store_schema`),
+derived from these tables: `superset supagent store wipe` drops it, `store rebuild` builds it again.
 
 Files are kept in the database so that the web server can serve what a worker on another
 host wrote. Files bigger than `tools.max_file_mb` (default 50 MB) are named but not kept.
@@ -719,7 +1039,10 @@ superset supagent check-knowledge [--json]                               is ever
 superset supagent search "words" [--user U]                              what the agent would find
 superset supagent knowledge [--changes DAYS]
 superset supagent describe "words" [--name INDEX_OR_METRIC] [--user U]   what the agent reads
-superset supagent ask "question" --user U                                 an answer in this process
+superset supagent ask "question" --user U [--pipeline classic|governed]  an answer in this process
+superset supagent classify [--minutes N] [--limit N]                      categories of the knowledge, now
+superset supagent store status | rebuild | sync | wipe [--yes] | search "words" [--user U] [--chats]
+                                                                          the knowledge store (0.6)
 superset supagent grant USER...
 superset supagent push-descriptions [--labels] | push-metrics            catalog -> datasets
 superset supagent mcp [--host 127.0.0.1 --port 5009]                     the tools for other agents
@@ -764,7 +1087,8 @@ behind your gateway.
 * **Stop**: the chat's Stop button stops the answer at once: the chat takes the next question
   right away. A step already running (an LLM call, a query) ends on its own in the
   background; its result is thrown away and the agent does nothing more for that answer.
-* **Upgrade**: `pip install` the new wheel, `superset supagent init`, then restart. From 0.1:
+* **Upgrade**: `pip install` the new wheel, `superset supagent init`, then restart (from 0.5.4
+  to 0.6.0: *Upgrade from 0.5.4 to 0.6.0* above, with the checks before). From 0.1:
   `init` adds the new tables and columns and splits the catalog into entries (the former
   catalog is kept as a backup). From 0.2.0 / 0.2.1: learned answers users marked *Helpful*
   wait for an admin's review; the ones those versions saved by themselves are no longer

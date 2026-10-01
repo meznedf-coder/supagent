@@ -110,9 +110,17 @@ def _cached(key: Any, make: Any, fresh: bool = True) -> Any:
     return value
 
 
+FAILED_TTL = 60.0                 # a live list that failed is not asked again for this long (Mimir down)
+
+
 def _metric_names(database: Any) -> list[tuple[str, list[str]]]:
     """(name, its tokens) of every metric of a metrics database, from the live list."""
     from supagent.tools import _promagg_connection
+
+    with _LOCK:
+        failed = _CACHE.get(("failed", database.id))
+    if failed and time.time() - failed[0] < FAILED_TTL:
+        raise ConnectionError(f"the metric list of {database.database_name} failed less than a minute ago")
 
     def make() -> list[tuple[str, list[str]]]:
         conn = _promagg_connection(database)
@@ -121,7 +129,12 @@ def _metric_names(database: Any) -> list[tuple[str, list[str]]]:
         finally:
             conn.close()
 
-    return _cached(("metrics", database.id), make, fresh=False)      # the live list: not the dictionary
+    try:
+        return _cached(("metrics", database.id), make, fresh=False)      # the live list: not the dictionary
+    except Exception:
+        with _LOCK:
+            _CACHE[("failed", database.id)] = (time.time(), None, "")
+        raise
 
 
 def _dictionary(source_ids: tuple[int, ...]) -> list[dict[str, Any]]:
@@ -240,8 +253,8 @@ def tenants_of(database_id: int) -> list[str]:
         return []
 
 
-def resolve(question: str) -> list[dict[str, Any]]:
-    """The metrics, indices and fields a question most likely needs, best first."""
+def resolve(question: str, limit: int = DETAILED + NAMED) -> list[dict[str, Any]]:
+    """The metrics, indices and fields a question most likely needs, best first (`limit` of them)."""
     from supagent.knowledge.store import source_for
 
     q = terms(question)
@@ -319,7 +332,7 @@ def resolve(question: str) -> list[dict[str, Any]]:
                                    else "the one learned" if d.id in learned else "the first one"))
         best[key] = top
     ranked = sorted(best.values(), key=lambda c: -c["score"])
-    return ranked[:DETAILED + NAMED]
+    return ranked[:limit]
 
 
 def _named(question: str, databases: list[Any]) -> dict[int, str]:
@@ -501,24 +514,46 @@ def value_places(question: str, databases: list[Any] | None = None) -> dict[str,
     """Where the values the question names are ("BILLING_API": the field APPLICATION of an index and the
     label application of metrics), when they are in more than one kind of data or database and the
     question does not say which data it means: {value: [{database_id, database, kind, name, tables}]}."""
+    tokens = value_tokens(question)
+    if not tokens:
+        return {}
+    databases = databases if databases is not None else _databases()
+    names = {d.id: d.database_name for d in databases}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for token, places in value_rows(tokens, databases).items():
+        kinds = {k for (_i, k, _n) in places}
+        dbs = {i for (i, _k, _n) in places}
+        if len(kinds) < 2 and len(dbs) < 2:
+            continue                                    # one kind of data in one database: nothing to choose
+        subjects = {t for parents in places.values() for p in parents for t in name_tokens(p)}
+        if set(terms(question)) & subjects:
+            continue                                    # "jobs of BILLING": the question says which data
+        out[token] = [{"database_id": i, "database": names.get(i, ""), "kind": kind, "name": name,
+                       "tables": sorted(set(parents))} for (i, kind, name), parents in sorted(places.items())]
+    return out
+
+
+def value_tokens(question: str) -> list[str]:
+    """The words of a question that look like values (BILLING_API, ORDERS, srv-a-1), at most MAX_VALUES."""
+    return [t for t in dict.fromkeys(VALUE_TOKEN.findall(question or "")) if not t.isdigit()][:MAX_VALUES]
+
+
+def value_rows(tokens: list[str], databases: list[Any]) -> dict[str, dict[tuple[int, str, str], list[str]]]:
+    """Where each value is: {value: {(database id, "field" or "label", its name): [indices or metrics]}}."""
     from sqlalchemy import Text, cast, func
 
     from supagent.models import KObject, Source
 
-    tokens = [t for t in dict.fromkeys(VALUE_TOKEN.findall(question or "")) if not t.isdigit()][:MAX_VALUES]
-    if not tokens:
-        return {}
-    databases = databases if databases is not None else _databases()
     by_source = {sid: d for sid, d in ((s.id, next((d for d in databases if d.id == s.database_id), None))
                                        for s in db.session.query(Source)) if d is not None}
-    if not by_source:
+    if not by_source or not tokens:
         return {}
     # a label of the same name has much the same values in every metric: one of them is read (tens of
     # thousands of labels stay unread), and the metrics that have it are counted
     reps = (db.session.query(func.min(KObject.id)).filter(KObject.kind == "label", KObject.gone_at.is_(None),
                                                           KObject.source_id.in_(list(by_source)))
             .group_by(KObject.source_id, KObject.name))
-    out: dict[str, list[dict[str, Any]]] = {}
+    out: dict[str, dict[tuple[int, str, str], list[str]]] = {}
     for token in tokens:
         like = cast(KObject.stats, Text).like(f'%"{token}"%')
         rows = (db.session.query(KObject.source_id, KObject.kind, KObject.parent, KObject.name, KObject.stats)
@@ -535,16 +570,8 @@ def value_places(question: str, databases: list[Any] | None = None) -> dict[str,
                 places.setdefault((by_source[sid].id, kind, name), []).extend(p for (p,) in parent_rows)
                 continue
             places.setdefault((by_source[sid].id, kind, name), []).append(parent or "")
-        kinds = {k for (_i, k, _n) in places}
-        dbs = {i for (i, _k, _n) in places}
-        if len(kinds) < 2 and len(dbs) < 2:
-            continue                                    # one kind of data in one database: nothing to choose
-        subjects = {t for parents in places.values() for p in parents for t in name_tokens(p)}
-        if set(terms(question)) & subjects:
-            continue                                    # "jobs of BILLING": the question says which data
-        names = {d.id: d.database_name for d in databases}
-        out[token] = [{"database_id": i, "database": names.get(i, ""), "kind": kind, "name": name,
-                       "tables": sorted(set(parents))} for (i, kind, name), parents in sorted(places.items())]
+        if places:
+            out[token] = places
     return out
 
 

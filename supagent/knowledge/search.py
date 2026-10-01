@@ -1,5 +1,6 @@
 """Searching the knowledge for a question: words (PostgreSQL full-text search, built in) and
-meaning (vectors of the embedding model, when one is set), ranks fused. Only what the user may
+meaning (vectors of the embedding model, when one is set), ranks fused; with the knowledge store
+(pgstore, 0.6) BM25, near spellings and pgvector in PostgreSQL instead. Only what the user may
 see is searched: pieces about databases the user may query, the team's pieces and the user's
 own (personal memories); the filter is applied before ranking."""
 
@@ -94,14 +95,29 @@ def _lexical(q: Any, terms: list[str], limit: int = 50) -> list[int]:
 
 
 def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = None,
-           lower: dict[str, int] | None = None, skip: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+           lower: dict[str, int] | None = None, skip: tuple[str, ...] = (), rerank: bool = True) -> list[dict[str, Any]]:
     """The pieces for a query, best first. `lower`: kinds counted as found that many places lower
-    (default: the Context, CONTEXT_PLACES); `skip`: kinds left out."""
-    from supagent.knowledge import embeddings as E
-
-    lower = {"context": CONTEXT_PLACES} if lower is None else lower
+    (default: the Context, CONTEXT_PLACES); `skip`: kinds left out; `rerank`: the reranker orders the first
+    ones again (rerank.url; the router, which must be quick, does without)."""
+    from supagent.knowledge import rerank as R
 
     k = int(k or settings.get("search.top_k"))
+    if not (rerank and R.enabled()):
+        return _search(query, k, kinds, lower, skip)
+    depth = max(k, int(settings.get("rerank.depth") or 40))
+    return R.rerank(query, _search(query, depth, kinds, lower, skip), k)
+
+
+def _search(query: str, k: int, kinds: tuple[str, ...] | None, lower: dict[str, int] | None,
+            skip: tuple[str, ...]) -> list[dict[str, Any]]:
+    from supagent.knowledge import embeddings as E, pgstore
+
+    lower = {"context": CONTEXT_PLACES} if lower is None else lower
+    if pgstore.active():                          # the knowledge store (0.6): BM25, near spellings, pgvector
+        try:
+            return pgstore.search(query, k, kinds=kinds, lower=lower, skip=skip)
+        except Exception as ex:  # pylint: disable=broad-except   (the search of 0.5 answers)
+            log.warning("supagent search: the store failed, searched without it: %s", str(ex)[:300])
     q = _allowed_query(kinds)
     if skip:
         q = q.filter(Chunk.kind.notin_(list(skip)))
@@ -155,18 +171,21 @@ PAGE_WORDS = ("context ai written overview application data source inventory how
 SUPERSET_KINDS = ("chart", "dashboard")
 
 
-def knowledge_block(question: str, shown: set[str] | None = None, with_charts: bool = False) -> str:
+def knowledge_block(question: str, shown: set[str] | None = None, with_charts: bool = False,
+                    prefer: dict[str, int] | None = None) -> str:
     """The knowledge relevant to a question, for the agent's prompt (short). `shown`: what the
     other blocks give already (refs, titles of the metrics and indices): not given twice, nor a
     metric or an index of the same name in another database, so that the room goes to the
     catalog, the documents and the Context. Superset's charts and dashboards only `with_charts` (a
     question about them, or about what is happening now)."""
-    shown = shown or set()
+    shown = set() if shown is None else shown        # the caller's set: it learns what was given (ranking)
     top_k = int(settings.get("search.top_k"))
     try:
+        lower = {"context": CONTEXT_PLACES, **{kind: OBJECT_PLACES for kind in OBJECT_KINDS + SUPERSET_KINDS}}
+        for kind, places in (prefer or {}).items():         # the router's kind of question: its knowledge first
+            lower[kind] = lower.get(kind, 0) + places
         found = search(question, k=top_k + len(shown),     # data objects, charts: "Where the data is" and the
-                       lower={"context": CONTEXT_PLACES,     # tools give them; the room is for the team's words
-                              **{kind: OBJECT_PLACES for kind in OBJECT_KINDS + SUPERSET_KINDS}},
+                       lower=lower,                          # tools give them; the room is for the team's words
                        skip=() if with_charts else SUPERSET_KINDS)    # charts: for questions about them
     except Exception as ex:  # pylint: disable=broad-except
         log.warning("supagent search: %s", ex)
@@ -198,6 +217,13 @@ def knowledge_block(question: str, shown: set[str] | None = None, with_charts: b
     pages = ([f for f in pages if about_it(f)] + [f for f in pages if not about_it(f)])[:CONTEXT_LINES]
     found = [f for f in kept if f["kind"] != "context" or f in pages][:top_k]
     found.sort(key=lambda f: f["kind"] == "context" and not about_it(f))   # the others' order kept
+    try:                                 # their categories (the application, the subject): which rule is whose
+        from supagent.knowledge.facets import facets_of
+
+        cats = facets_of([f["ref"] for f in found])
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        cats = {}
     budget = int(settings.get("search.prompt_chars"))
     lines = ["\n\nBackground that looks relevant to this question (from the data dictionary, the catalog, the "
              "team's learned answers and memory, the documents). It is a summary, not an answer: call "
@@ -205,8 +231,10 @@ def knowledge_block(question: str, shown: set[str] | None = None, with_charts: b
              "gives more:"]
     for f in found:
         text = " ".join((f["text"] or "").split())
-        line = f"- [{f['kind']}] {f['title']}: {text[:450]}"
+        about = [t.split(": ", 1)[1] for t in cats.get(f["ref"], []) if not t.startswith("aspect")][:3]
+        line = f"- [{f['kind']}] {f['title']}" + (f" ({', '.join(about)})" if about else "") + f": {text[:450]}"
         if sum(len(x) for x in lines) + len(line) > budget:
             break
         lines.append(line)
+        shown.add(f["ref"])
     return "\n".join(lines) if len(lines) > 1 else ""

@@ -1,5 +1,166 @@
 # Changes
 
+## 0.6.0 (2026-10-01)
+
+The release of the 0.6.0 test versions: the code of 0.6.0b7 with one fix, found by rehearsing the upgrade from
+0.5.4 on a copy of the lab's database owned by an ordinary role (not a superuser, as Superset's database user is
+as a rule):
+
+* **The knowledge store with a database user that is not a superuser**: it read `shared_preload_libraries`, which
+  PostgreSQL shows only to superusers and `pg_read_all_settings`; the store was then never built (`init` said "not
+  used (no pgvector, pg_textsearch or pg_trgm...)" with the three there) and the search of 0.5.4 kept answering.
+  Now read where PostgreSQL leaves it out instead of failing; when it is not shown, `store status` says to check
+  it as a superuser. `init` prints the store's real error, if any.
+
+What 0.6.0 brings, by test version below:
+
+* **The router (MOA)** (on; `agent.router`): the kind of work each question needs, from its meaning, the knowledge
+  it touches and the routes people confirmed; nothing in it is about one business.
+* **The Data dictionary redesigned**: To review, Knowledge (the catalog, team memory, Context, documents and sites,
+  categories: moved from the Settings page), Data, Learned by the agent, Search; saves answer at once.
+* **Categories of the knowledge** (`superset supagent classify`, daily) and **the learned items ranked by the
+  discussions**.
+* **The knowledge store in PostgreSQL** (optional: pgvector, pg_trgm, pg_textsearch; `superset supagent store`),
+  with each user's chats and **a search box for them**.
+* **A cross-encoder reranker** (optional, off: `rerank.url`).
+* **The governed pipeline** (optional, off: `agent.pipeline = governed`) and other MCP servers as sources
+  (`supagent[graph]`).
+* The fixes the domain benchmark (PnL, risk, pricing, trades, reports) found: team rules only where their value
+  can be, dates said as days on timed fields, NaN results saved, a stuck LLM call not waited for twice, qualified
+  counts.
+
+Upgrade from 0.5.4: INSTALL.txt, "Upgrade from 0.5.4 to 0.6.0" (6 new tables, schema 9; checks of PostgreSQL
+before; a rollback to 0.5.4 needs no restore).
+
+## 0.6.0b7 (test version, 2026-10-01)
+
+* **An LLM that does not answer in time is not asked again**: a read timeout was retried, so one stuck call of the
+  governed plan held the answer 2 x llm.timeout (half an hour on the lab). Quick steps have their own bound: the
+  router 60 s, the decider's choice 120 s, the plan 180 s; then the normal way (the classic agent) answers.
+* **A count the question qualifies needs that condition**: "How many jobs failed" planned without a condition on
+  the field that says FAILED counted every job (the lab, once its glossary term was missing: all 73,769 jobs said
+  "failed"); such a plan is sent back with the field and its values.
+
+## 0.6.0b6 (test version, 2026-10-01)
+
+* **An answer whose results hold NaN is saved** (a sum over no row): PostgreSQL's JSON refused the whole row and the
+  answer was lost ("The agent could not answer"); NaN and infinities are stored as null. SQLite (the tests) took it.
+* A condition the planning model copies from a team rule follows the rule's limits, like the ones code adds: not on
+  a step grouped by its field (per BOOK), not where its value cannot be.
+
+## 0.6.0b5 (test version, 2026-10-01)
+
+Found on the domain benchmark's dev half with 0.6.0b4:
+
+* A rule's condition does not concern a table where its value cannot be (BOOK = 'ALL' on an index whose books are
+  all known and none is ALL); the words every rule has ("not", "unless"...) no longer pick its tables.
+* Governed plans: a day said as an equality on a date field (COB_DATE = 2026-09-23) becomes the step's period or
+  that day's range; a code is not said by a part of another code ("FX_OPT_G10" does not say the desk FX_SPOT; both
+  pipelines); a question back ends with its question, its options first, so that the reply is read as its answer.
+
+## 0.6.0b4 (test version, 2026-10-01)
+
+Found by the domain benchmark (PnL, risk, pricing, trades, reports) on 0.6.0b3:
+
+* **A team rule applies to the data it is about**: a rule on a field (BOOK = 'ALL', "the VaR of a desk") was
+  added to every table with that field (PnL, trades), which then found nothing. A rule now concerns the tables
+  carrying its distinguishing subject (VaR: the risk index), and a query or step per that field (per BOOK) never
+  gets its filter. Both pipelines.
+* **A date alone on a date field with times** (`"TRADE_DATE" = '2026-09-23'` on dates stored at 00:00 UTC, or
+  with real times) matches nothing: the classic agent's query is sent back once with the day's range.
+* A unit the model puts on a measure that nobody asked for (a PnL "in percent") is removed by code.
+* A governed step that fails (a learned count ">=200" read as a number crashed the plan's check) hands the question
+  to the classic agent instead of ending the answer in an error; such counts are read as "at least".
+
+* The knowledge given with a question names each piece's application and subject; the categories list the most
+  used first; a one-letter code is not an application; no near-spelling search in a store built without pg_trgm.
+
+## 0.6.0b3 (test version, 2026-10-01)
+
+**The router (MOA)**: before each answer one short LLM call chooses the kind of work a question needs
+(functional, technical, incident, charts, observability, infrastructure), from its meaning, the knowledge it
+touches (with its categories) and the routes people confirmed; the route gives the knowledge of its kind first,
+its tools and a short instruction; not sure: the normal way. Nothing in it is about one business. It learns only
+from confirmed answers whose execution followed the route; the same question's examples never decide alone
+(two agreeing, or an admin's route decision). Lab, held-out half: 82% routed right cold (57% with the first
+definitions), 88% with examples, 83% with a wrong example (31%).
+
+**The Data dictionary redesigned**: To review (what waits for an admin, each item with its actions), Knowledge
+(catalog, team memory, Context, documents and sites, categories: moved from the Settings page), Data, Learned by
+the agent, Search; deep links. **Saves answer at once**: the agent's search follows in the background, the page
+says when it is up to date (lab: 0.03-0.5 s instead of 0.8-1.6 s).
+
+**Categories of the knowledge** (`superset supagent classify`, daily): functional or technical, subjects,
+applications, components, and the relations between items, by the LLM; an admin reviews only the new values, the
+unsure tags and the same-as relations.
+
+**What the agent learned is ranked by the discussions**: the items each answer was given, the tables it read, the
+learned queries it ran again (worked or not), and what people said of those answers; the learned answers proposed
+follow it; the Learned tab is sorted by it with its reasons.
+
+**A search box for the user's own chats**; **a cross-encoder reranker** for the knowledge search (optional,
+`rerank.url`, fails open).
+
+Upgrade: `superset supagent init` (tables of schema 9: categories, tags, relations, uses).
+
+## 0.6.0b2 (test version, 2026-09-30)
+
+**The knowledge store in PostgreSQL** (pgvector, pg_trgm, pg_textsearch; `superset supagent store ...`): the search
+runs in PostgreSQL, by words (BM25), near spellings (a name or a value typed with a typo) and meaning (an HNSW index:
+no vectors in the processes' memory), the ranks fused, with the user's permissions applied inside the queries. It
+also keeps each user's chats (the tool `search_my_chats`, their own only) and the routes people confirmed (the
+governed decider's `neighbors` votes; near spellings as `spelling`). Derived and rebuildable: a schema of its own,
+built by `init` when the extensions are there, `store rebuild|sync|wipe|status|search`, `search.store = off` to go
+back at once; its connections are autocommit and closed after use. pg_textsearch before 0.6.1: see the README (a
+ROLLBACK after an error can fail in sessions that loaded it; do not preload 0.5.x).
+
+**The governed plan counts what the question names**: a value of the data it names (BILLING, UAT, a server) is a
+condition or a group of the plan, a glossary term it uses is counted as the glossary defines it, a unit it asks
+for (in GiB, in minutes) is on a measure and converted by code, and a time bucket only when it asks for one (per
+hour, daily, when...); no total of rows a query cut; an explanation that does not say the knowledge gives the
+knowledge's own text; explore links, SQL Lab and questions about earlier chats go to the classic agent.
+
+## 0.6.0b1 (test version, 2026-09-30)
+
+**A second way to answer: the governed pipeline** (setting `agent.pipeline = governed`; `classic` stays the
+default, so installing this version changes nothing until an admin switches it). In the classic pipeline the
+model writes SQL and checks read it afterwards. In the governed one the model never writes a query:
+
+* **the decider** chooses the knowledge a question needs before anything else: candidate tables (an index or a
+  metric in one database) from the dictionary itself (names, descriptions, synonyms, associations, the values the
+  question names, the database, chart or dashboard it names, the learned answers, the team's charts), ranked by a
+  small learned gate (readable weights, learned only from answers a person confirmed: Helpful, an admin's
+  confirmation, the reply to a question back; bounded around the defaults); one LLM call then chooses among the
+  best ones and says what is ambiguous or missing; the chosen tables are given in full (fields, labels, values,
+  units, verified or AI-written descriptions) with the team's rules on their fields, the glossary terms, the notes
+  and learned answers;
+* **the plan**: one LLM call fills a typed plan (tables, measures, groups, conditions, period, top N). Every
+  condition carries its source (the question's own words, the chat, a knowledge item, an earlier step); code checks
+  it: a condition nobody gave, a period that is not the question's, a limit nobody asked for, a value the data does
+  not have, a counter averaged, a unit it cannot convert, are sent back once; the team's rules are added by code
+  (not when the question asks for their value);
+* **the queries are built by code** from the plan (OpenSearch and Prometheus), run with the user's permissions
+  (execute_sql);
+* **the answer** is written from a figures sheet made by code; its numbers are checked against the results; code
+  adds how it was counted ("failed jobs in jobs (database 1) · STATUS = FAILED (you said "failed") · ENV ≠ UAT
+  (the team's rule ...) · 23 Sep 2026"), a value that is not in the data, a period outside the data;
+* questions back, answers from the knowledge alone, and "the data cannot answer" are kinds of plans;
+* chart, dashboard, e-mail and export requests, status questions ("is everything normal"), questions for another
+  MCP source, and a question no valid plan could be written for go to the classic agent (the steps say which way).
+
+The pipeline runs as a LangGraph graph when `supagent[graph]` is installed, else the same steps in order.
+
+**Other MCP servers as sources** (setting `mcp.servers`, needs `supagent[graph]`): their tools are offered to the
+agent (named `<server>_<tool>`), indexed as knowledge (the decider routes questions to them), run with the
+server's own headers (`{username}` replaced); a tool that changes something runs only when an admin allowed it
+(`allow_write`); `roles` limits a server to some users.
+
+Also: a metrics database whose live list of metrics failed is not asked again for a minute (a Mimir outage no
+longer costs every question a timeout); `superset supagent ask --pipeline governed|classic`.
+
+Install and roll back: see INSTALL.txt. The new table (supagent_route: what the decider showed, chose and read for
+each answer) is ignored by 0.5.x.
+
 ## 0.5.4 (2026-09-30)
 
 * The same code as 0.5.3, published under a new version number. Everything below 0.5.3 applies.

@@ -17,6 +17,8 @@ SECRET_KEY = "supagent-tests-" + "x" * 32
 WTF_CSRF_ENABLED = False
 TALISMAN_ENABLED = False
 TESTING = True
+SUPAGENT_AGENT_ROUTER = False          # the router's LLM call only in its own tests (scripted LLMs elsewhere)
+SUPAGENT_KNOWLEDGE_APPLY_BACKGROUND = False   # saves apply at once (the background has its own test)
 from supagent import init_app as FLASK_APP_MUTATOR
 ''')
 os.environ["SUPERSET_CONFIG_PATH"] = _CONFIG
@@ -54,6 +56,7 @@ def app():
                             password=PASSWORD)
         db.session.commit()
         db.session.remove()
+        import supagent.governed.pipeline  # noqa: F401  (imported once as the app does: before any test patches)
     yield app                    # no context held open: every request and test has its own g
 
 
