@@ -32,7 +32,8 @@ CLASSIC_KINDS = ("action", "status", "other")
 # saved charts and dashboards, files, e-mails, screenshots, "is it normal", "what is happening", "why": the classic
 # agent (its tools), whatever the decider's model said
 ROUTER_CLASSIC = ("charts", "observability", "incident")        # routes the classic agent's tools answer
-CLASSIC_INTENTS = {"charts", "files", "images", "status", "usual", "investigation", "read_charts", "sqllab", "history"}
+CLASSIC_INTENTS = {"charts", "files", "images", "status", "usual", "investigation", "read_charts", "sqllab", "history",
+                   "notes"}
 PLAN_TRIES = 2
 
 
@@ -41,6 +42,7 @@ class GovernedAgent(Agent):
 
     route_id: int | None = None
     way: str = ""                           # governed | classic: <why>
+    second_opinion: bool = False            # a cross-check (crosscheck.py): no classic agent, an empty answer instead
 
     def ask(self, question: str, history: list[dict] | None = None) -> tuple[str, list[dict]]:
         from supagent.governed.graph import run
@@ -161,6 +163,8 @@ class GovernedAgent(Agent):
     def _n_classic(self, st: dict[str, Any]) -> dict[str, Any]:
         why = st.get("why") or "no plan"
         self.way = f"classic: {why}"
+        if self.second_opinion:                 # the classic agent answered already: no second opinion here
+            return {"answer": ""}
         trace = st["trace"]
         step = self._begin(trace, "classic", {"why": why})
         self._end(step, trace, "done", why)

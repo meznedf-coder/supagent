@@ -184,6 +184,9 @@ def expire_stale(messages: list) -> bool:
     return changed
 
 
+SEARCH_ALL = 500        # the Data dictionary's search lists at most this many pieces (page by page)
+
+
 def _body() -> dict:
     data = request.get_json(silent=True)
     return data if isinstance(data, dict) else {}
@@ -197,7 +200,8 @@ class ChatView(BaseView):
                               "delete_conversation": "write", "ask": "write", "message": "read",
                               "feedback": "write", "file": "read", "cancel": "write", "result_xlsx": "read",
                               "memory": "read", "add_memory": "write", "delete_memory": "write",
-                              "search_chats": "read"}
+                              "search_chats": "read", "notes": "read", "add_note": "write", "change_note": "write",
+                              "delete_note": "write", "promote_note": "write"}
     template_folder = os.path.join(HERE, "templates")
 
     @expose("/")
@@ -493,6 +497,105 @@ class ChatView(BaseView):
         _sync_chunks("memory:")
         return _json({"deleted": mem_id})
 
+    # ---- notes (0.7): written in a few seconds by any user, for the team or for themselves; read in the chat's
+    # Notes drawer and the Data dictionary; found by the agent with their author and day (not verified)
+    @expose("/api/notes", methods=("GET",))
+    @has_access_api
+    def notes(self) -> Response:
+        """A page of the notes this user may read (?q= every word, ?offset=, ?limit=, ?mine=1, ?tag=), pinned
+        first then the newest; on the first page, the catalog's notes with the same words (read only)."""
+        from supagent.knowledge import notes as N
+
+        args = request.args
+        try:
+            offset, limit = max(0, int(args.get("offset") or 0)), max(1, min(100, int(args.get("limit") or 20)))
+        except ValueError:
+            return _json({"error": "offset and limit are numbers"}, 400)
+        q = (args.get("q") or "").strip()
+        rows, total = N.listing(g.user.id, q, offset, limit, mine=args.get("mine") == "1", tag=args.get("tag") or None)
+        admin = _is_admin()
+        names = N.authors({n.user_id for n in rows if n.user_id})
+        out: dict[str, Any] = {"notes": [N.to_json(n, g.user.id, admin, names) for n in rows], "total": total,
+                               "offset": offset, "limit": limit, "is_admin": admin}
+        if not offset:
+            out["catalog"] = N.catalog_notes(q, 5)
+        return _json(out)
+
+    @expose("/api/notes", methods=("POST",))
+    @has_access_api
+    def add_note(self) -> Response:
+        from supagent.knowledge import notes as N
+
+        body = _body()
+        try:
+            n = N.add(g.user.id, str(body.get("text") or ""), title=body.get("title"),
+                      scope=str(body.get("scope") or "team"), tags=body.get("tags"), meeting_on=body.get("meeting_on"),
+                      source="command" if body.get("source") == "command" else "page", by=g.user.username)
+        except N.NoteError as ex:
+            return _json({"error": str(ex)}, 400)
+        _sync_chunks("note:")
+        return _json({"note": N.to_json(n, g.user.id, _is_admin(), N.authors({n.user_id}))})
+
+    def _note(self, note_id: int) -> Any:
+        """The note if this user may change it (its author; an admin for a team note), else 404."""
+        from superset import db
+
+        from supagent.knowledge import notes as N
+        from supagent.models import Note
+
+        n = db.session.get(Note, note_id)
+        if n is None or not N.can_change(n, g.user.id, _is_admin()):
+            abort(404)
+        return n
+
+    @expose("/api/notes/<int:note_id>", methods=("POST",))
+    @has_access_api
+    def change_note(self, note_id: int) -> Response:
+        from superset import db
+
+        from supagent.knowledge import notes as N
+
+        n = self._note(note_id)
+        body = _body()
+        try:
+            N.update(n, {k: v for k, v in body.items() if k in ("text", "title", "tags", "meeting_on", "scope")},
+                     by=g.user.username)
+        except N.NoteError as ex:
+            return _json({"error": str(ex)}, 400)
+        if "pinned" in body and _is_admin():               # pinned for everyone: an admin's
+            n.pinned = bool(body.get("pinned"))
+            db.session.commit()
+        _sync_chunks("note:")
+        return _json({"note": N.to_json(n, g.user.id, _is_admin(), N.authors({n.user_id}))})
+
+    @expose("/api/notes/<int:note_id>", methods=("DELETE",))
+    @has_access_api
+    def delete_note(self, note_id: int) -> Response:
+        from supagent.knowledge import notes as N
+
+        N.remove(self._note(note_id))
+        _sync_chunks("note:")
+        return _json({"deleted": note_id})
+
+    @expose("/api/notes/<int:note_id>/promote", methods=("POST",))
+    @has_access_api
+    def promote_note(self, note_id: int) -> Response:
+        """An admin makes a catalog entry (a verified note) of a team note."""
+        from supagent.knowledge import notes as N
+        from supagent.knowledge.catalog import CatalogError
+        from supagent.knowledge.curated import catalog_texts
+
+        if not _is_admin():
+            abort(404)
+        n = self._note(note_id)
+        before = catalog_texts()
+        try:
+            e = N.promote(n, by=g.user.username)
+        except (N.NoteError, CatalogError) as ex:
+            return _json({"error": str(ex)}, 400)
+        return _json({"entry_id": e.id, "applied": _catalog_changed(before),
+                      "note": N.to_json(n, g.user.id, True, N.authors({n.user_id}))})
+
     @expose("/api/messages/<int:mid>/feedback", methods=("POST",))
     @has_access_api
     def feedback(self, mid: int) -> Response:
@@ -688,21 +791,40 @@ class KnowledgeView(_RecipesMixin, BaseView):
     class_permission_name = "AIAgentDictionary"
     method_permission_name = {"index": "read", "summary": "read", "objects": "read", "obj": "read",
                               "changes": "read", "relations": "read", "edit": "write", "recipes": "read",
-                              "set_recipe": "write", "timings": "read", "search": "read", "set_relation": "write",
+                              "set_recipe": "write", "timings": "read", "search": "read", "item": "read",
+                              "set_relation": "write",
                               "knowledge": "read", "agent_knowledge": "read", "context": "read",
-                              "context_page": "read", "context_edit": "write", "context_build": "write"}
+                              "context_page": "read", "context_edit": "write", "context_build": "write",
+                              "where_data": "read", "forget_where": "write"}
 
     @expose("/api/search", methods=("GET",))
     @has_access_api
     def search(self) -> Response:
-        from supagent.knowledge.search import search
+        """The knowledge for a query, as the agent searches it. ?all=1 (the Data dictionary's search): every
+        piece found (at most SEARCH_ALL), each with where it is read or edited ("link"); else the best k."""
+        from supagent.knowledge.search import link_of, search, search_all
 
         q = (request.args.get("q") or "").strip()
         kind = request.args.get("kind") or None
         if not q:
             return _json({"results": []})
-        return _json({"results": search(q, k=min(int(request.args.get("k") or 12), 30),
-                                        kinds=(kind,) if kind else None)})
+        kinds = (kind,) if kind else None
+        if request.args.get("all"):
+            found = search_all(q, kinds=kinds, cap=SEARCH_ALL)
+            out = [{"ref": r["ref"], "kind": r["kind"], "title": r["title"], "via": r.get("via"),
+                    "text": (r.get("text") or "")[:700] + ("…" if len(r.get("text") or "") > 700 else ""),
+                    "link": link_of(r["ref"])} for r in found]
+            return _json({"results": out, "total": len(out), "capped": len(out) >= SEARCH_ALL})
+        return _json({"results": search(q, k=min(int(request.args.get("k") or 12), 30), kinds=kinds)})
+
+    @expose("/api/item", methods=("GET",))
+    @has_access_api
+    def item(self) -> Response:
+        """One piece of the knowledge (?ref=memory:5), for a user who may search it: the page's links open it."""
+        from supagent.knowledge.search import item
+
+        got = item(request.args.get("ref") or "")
+        return _json(got) if got else _json({"error": "not found, or not yours to read"}, 404)
     template_folder = os.path.join(HERE, "templates")
 
     @expose("/")
@@ -911,6 +1033,91 @@ class KnowledgeView(_RecipesMixin, BaseView):
                           .order_by(Memory.created_at.desc()))]
         return _json({"entries": entries, "docs": docs, "team_memory": team})
 
+    @expose("/api/where_data", methods=("GET",))
+    @has_access_api
+    def where_data(self) -> Response:
+        """Where the data of the questions was, learned from the answers, one row per table: the words of the
+        questions that led there (each with its uses and the other tables and databases it also led to), how many
+        answers (Helpful among them), the last one; ?q= a word or a table, ?database= an id, a page (?offset=,
+        ?limit=). The questions themselves are not shown (each user's chats are their own)."""
+        from collections import defaultdict
+
+        from superset import db
+        from superset.models.core import Database
+
+        from supagent.models import Association, Message
+
+        try:
+            offset, limit = max(0, int(request.args.get("offset") or 0)), max(1, min(100, int(request.args.get("limit") or 25)))
+            only_db = int(request.args["database"]) if request.args.get("database") else None
+        except ValueError:
+            return _json({"error": "offset, limit and database are numbers"}, 400)
+        q = " ".join((request.args.get("q") or "").lower().split())
+        dbs = _visible_databases()
+        names = {i: n for i, n in db.session.query(Database.id, Database.database_name).filter(Database.id.in_(dbs or [-1]))}
+        rows = db.session.query(Association).filter(Association.database_id.in_(dbs or [-1])).all()
+        tables: dict[tuple, dict[str, Any]] = defaultdict(lambda: {"words": [], "uses": 0, "messages": set(),
+                                                                   "updated_at": None})
+        leads: dict[str, set[tuple]] = defaultdict(set)
+        for a in rows:
+            key = (a.database_id, a.kind, a.parent or "", a.name)
+            t = tables[key]
+            t["words"].append(a)
+            t["uses"] += a.uses or 0
+            t["messages"] |= set(a.messages or [])
+            if a.updated_at is not None and (t["updated_at"] is None or a.updated_at > t["updated_at"]):
+                t["updated_at"] = a.updated_at
+            leads[a.word].add(key)
+        if q:
+            from supagent.knowledge.describe import stem
+
+            stems = {stem(w) for w in q.split()}
+            tables = {k: t for k, t in tables.items() if q in k[3].lower()
+                      or any(a.word in stems or a.word.startswith(q) for a in t["words"])}
+        if only_db is not None:
+            tables = {k: t for k, t in tables.items() if k[0] == only_db}
+        items = sorted(tables.items(), key=lambda kv: (-kv[1]["uses"], kv[0][3]))
+        page = items[offset:offset + limit]
+        ids = sorted(set().union(*[t["messages"] for _k, t in page])) if page else []
+        helpful: set[int] = set()
+        for i in range(0, len(ids), 500):
+            helpful |= {m for (m,) in db.session.query(Message.id).filter(Message.id.in_(ids[i:i + 500]),
+                                                                          Message.feedback == 1)}
+        out = []
+        for (dbid, kind, parent, name), t in page:
+            words = sorted(t["words"], key=lambda a: -(a.uses or 0))[:12]
+            out.append({"database_id": dbid, "database": names.get(dbid, str(dbid)), "kind": kind, "parent": parent,
+                        "name": name, "uses": t["uses"], "answers": len(t["messages"]),
+                        "helpful": len(t["messages"] & helpful), "updated_at": t["updated_at"],
+                        "words": [{"word": a.word, "uses": a.uses or 0,
+                                   "elsewhere": len(leads[a.word]) - 1,
+                                   "other_databases": sorted({names.get(k[0], str(k[0])) for k in leads[a.word]
+                                                              if k[0] != dbid})} for a in words]})
+        return _json({"tables": out, "total": len(items), "offset": offset, "limit": limit,
+                      "databases": [{"id": i, "name": n} for i, n in sorted(names.items(), key=lambda x: x[1])],
+                      "is_admin": _is_admin()})
+
+    @expose("/api/where_data/forget", methods=("POST",))
+    @has_access_api
+    def forget_where(self) -> Response:
+        """An admin: this word does not lead to this table (the association goes; it is learned again only from
+        new answers)."""
+        from superset import db
+
+        from supagent.models import Association
+
+        if not _is_admin():
+            abort(404)
+        b = _body()
+        n = (db.session.query(Association).filter(Association.word == str(b.get("word") or ""),
+                                                  Association.database_id == int(b.get("database_id") or -1),
+                                                  Association.kind == str(b.get("kind") or ""),
+                                                  Association.parent == str(b.get("parent") or ""),
+                                                  Association.name == str(b.get("name") or ""))
+             .delete(synchronize_session=False))
+        db.session.commit()
+        return _json({"forgotten": n})
+
     @expose("/api/agent_knowledge", methods=("GET",))
     @has_access_api
     def agent_knowledge(self) -> Response:
@@ -1110,7 +1317,10 @@ class AdminView(BaseView):
                               "export_catalog": "read", "team_memory": "read", "set_memory": "write",
                               "docs": "read", "add_doc": "write", "refresh_doc": "write", "delete_doc": "write",
                               "usage": "read", "usage_data": "read", "review": "read", "facets": "read",
-                              "set_facet": "write", "set_tag": "write", "set_link": "write", "set_route": "write",
+                              "add_facet": "write", "set_facet": "write", "facet_map": "read",
+                              "facet_categories": "read", "set_tag": "write",
+                              "set_link": "write",
+                              "set_route": "write",
                               "apply_status": "read"}
 
     # ---- team memory
@@ -1524,8 +1734,26 @@ class AdminView(BaseView):
         vals = val_q.order_by(Facet.facet, Facet.value).limit(limit).all()
         n_items = dict(db.session.query(Tag.facet_id, func.count(Tag.id)).filter(
             Tag.facet_id.in_([f.id for f in vals] or [-1])).group_by(Tag.facet_id).all())
+        # what a value is (said to be) part of, and the known value the LLM thinks it names (a merge)
+        rel_q = (db.session.query(Facet).filter(Facet.status == "approved", Facet.suggested.isnot(None)))
+        rel_all = [f for f in rel_q.order_by(Facet.facet, Facet.value) if (f.suggested or {}).get("parents")]
+        rel_rows = rel_all[:limit]
+        named = {int(x) for f in list(vals) + rel_rows
+                 for x in list(f.parents or []) + list((f.suggested or {}).get("parents") or [])
+                 + ([(f.suggested or {}).get("same_as")] if (f.suggested or {}).get("same_as") else [])
+                 if str(x).isdigit()}
+        others = {x.id: x for x in db.session.query(Facet).filter(Facet.id.in_(named or [-1]), Facet.status != "rejected")}
+
+        def brief(ids: Any) -> list[dict]:
+            return [{"id": others[i].id, "facet": others[i].facet, "value": others[i].value}
+                    for i in (ids or []) if i in others]
+
         values = [{"id": f.id, "facet": f.facet, "value": f.value, "description": f.description,
-                   "items": n_items.get(f.id, 0)} for f in vals]
+                   "items": n_items.get(f.id, 0), "parents": brief(f.parents),
+                   "same_as": (brief([(f.suggested or {}).get("same_as")]) or [None])[0]} for f in vals]
+        relations = [{"id": f.id, "facet": f.facet, "value": f.value, "parents": brief(f.parents),
+                      "suggested": brief((f.suggested or {}).get("parents")),
+                      "from": [t for t in ((f.suggested or {}).get("from") or {}).values()][:5]} for f in rel_rows]
         tag_q = (db.session.query(Tag, Facet).join(Facet, Facet.id == Tag.facet_id)
                  .filter(Tag.status == "proposed", Facet.status == "approved"))
         tag_rows = tag_q.order_by(Tag.confidence.desc(), Tag.id.desc()).limit(limit).all()
@@ -1544,10 +1772,11 @@ class AdminView(BaseView):
         routes = [{"id": r.id, "question": r.question, "route": r.moa, "by": r.moa_by, "signal": r.signal,
                    "at": r.signal_at} for r in route_rows]
         counts = {"memory": mem_q.count(), "recipes": rec_q.count(), "descriptions": desc_q.count(),
-                  "values": val_q.count(), "tags": tag_q.count(), "links": link_q.count(), "routes": route_q.count()}
+                  "values": val_q.count(), "relations": len(rel_all), "tags": tag_q.count(), "links": link_q.count(),
+                  "routes": route_q.count()}
         return _json({"memory": memories, "recipes": recipes, "descriptions": described, "values": values,
-                      "tags": tags, "links": links, "routes": routes, "counts": counts,
-                      "waiting": sum(counts[k] for k in ("memory", "recipes", "values", "tags", "links"))})
+                      "relations": relations, "tags": tags, "links": links, "routes": routes, "counts": counts,
+                      "waiting": sum(counts[k] for k in ("memory", "recipes", "values", "relations", "tags", "links"))})
 
     @expose("/api/facets", methods=("GET",))
     @has_access_api
@@ -1577,22 +1806,112 @@ class AdminView(BaseView):
         for fid, ref in db.session.query(sub.c.fid, sub.c.ref).filter(sub.c.rn <= 5):
             some.setdefault(fid, []).append(ref)
         titles = _ref_titles([r for refs in some.values() for r in refs])
+        wanted = {int(x) for f in rows for x in (f.parents or []) if str(x).isdigit()}
+        names = {x.id: x for x in db.session.query(Facet).filter(Facet.id.in_(wanted or [-1]),
+                                                                 Facet.status != "rejected")}
         out = [{"id": f.id, "facet": f.facet, "value": f.value, "status": f.status, "source": f.source,
                 "description": f.description, "synonyms": f.synonyms or [], "items": n_items.get(f.id, 0),
-                "examples": [titles.get(r, r) for r in some.get(f.id, [])]} for f in rows]
+                "examples": [titles.get(r, r) for r in some.get(f.id, [])], "origins": f.origins or [],
+                "parents": [{"id": names[i].id, "facet": names[i].facet, "value": names[i].value}
+                            for i in (f.parents or []) if i in names]} for f in rows]
         order = {"aspect": 0, "subject": 1, "application": 2, "component": 3}
         out.sort(key=lambda x: (order.get(x["facet"], 9), x["status"] != "proposed", -x["items"], x["value"].lower()))
         return _json({"facets": out})
 
-    @expose("/api/facets/<int:fid>", methods=("POST",))
+    @expose("/api/facets", methods=("POST",))
     @has_access_api
-    def set_facet(self, fid: int) -> Response:
-        """Approve, reject, rename, describe a value, or merge it into another (its items move there)."""
+    def add_facet(self) -> Response:
+        """A value an admin adds by hand to a category (subject, application, component): used at once. One that
+        exists already in that category is said so (a retired one is used again, with what was written)."""
         import datetime as dt
 
         from superset import db
 
-        from supagent.knowledge.facets import CONFIDENT
+        from supagent.knowledge.facets import editable
+        from supagent.knowledge.freshness import touch
+        from supagent.models import Facet
+
+        body = _body()
+        facet = str(body.get("facet") or "").strip()
+        value = " ".join(str(body.get("value") or "").split())[:128]
+        if facet not in editable():
+            return _json({"error": "choose the category: " + ", ".join(editable())}, 400)
+        if not value:
+            return _json({"error": "write the value"}, 400)
+        f = db.session.query(Facet).filter(Facet.facet == facet, Facet.value.ilike(value)).first()
+        if f is not None and f.status != "rejected":
+            return _json({"error": f'"{f.value}" is already a value of this category', "id": f.id}, 409)
+        if f is None:
+            f = Facet(facet=facet, value=value)
+            db.session.add(f)
+        f.value, f.status, f.source = value, "approved", "admin"
+        db.session.flush()
+        if "parents" in body:
+            from supagent.knowledge.facets import clean_parents
+
+            f.parents = clean_parents(f.id, body.get("parents")) or None
+        f.description = str(body.get("description") or "").strip() or None
+        syn = body.get("synonyms")
+        f.synonyms = [x.strip() for x in (syn if isinstance(syn, list) else str(syn or "").split(",")) if x.strip()]
+        f.reviewed_by, f.reviewed_at = g.user.username, dt.datetime.utcnow()
+        db.session.commit()
+        touch()
+        db.session.commit()
+        return _json({"id": f.id, "facet": f.facet, "value": f.value, "status": f.status})
+
+    @expose("/api/facets/categories", methods=("GET", "POST"))
+    @has_access_api
+    def facet_categories(self) -> Response:
+        """The categories: subject, application, component and the deployment's own, each with the fields its
+        values are read from (categories.fields). POST {"name": "server", "fields": "^(host|node|server)$"} adds
+        or changes one (the settings categories.custom and categories.fields)."""
+        from supagent import settings
+        from supagent.knowledge.facets import BUILTIN, NAME_OK, editable
+
+        if request.method == "POST":
+            if not _is_admin():
+                abort(403)
+            body = _body()
+            name = " ".join(str(body.get("name") or "").lower().split())
+            if not NAME_OK.match(name) or name == "aspect":
+                return _json({"error": "a name of 2 to 24 letters, digits, spaces or _ (not aspect)"}, 400)
+            rx = str(body.get("fields") or "").strip()
+            if rx:
+                try:
+                    re.compile(rx)
+                except re.error as ex:
+                    return _json({"error": f"the field names pattern is not a regular expression: {ex}"}, 400)
+            if name not in BUILTIN and name not in [str(x).lower() for x in settings.get("categories.custom") or []]:
+                settings.set_value("categories.custom", list(settings.get("categories.custom") or []) + [name],
+                                   by=g.user.username)
+            fields = dict(settings.get("categories.fields") or {})
+            if rx:
+                fields[name] = rx
+            elif "fields" in body:
+                fields.pop(name, None)
+            settings.set_value("categories.fields", fields, by=g.user.username)
+        fields = dict(settings.get("categories.fields") or {})
+        return _json({"categories": [{"name": c, "builtin": c in BUILTIN, "fields": fields.get(c) or ""}
+                                     for c in editable()]})
+
+    @expose("/api/facets/map", methods=("GET",))
+    @has_access_api
+    def facet_map(self) -> Response:
+        """The system picture: the approved values, what each is part of, the items about each that exist now."""
+        from supagent.knowledge.facets import system_map
+
+        return _json({"values": system_map()})
+
+    @expose("/api/facets/<int:fid>", methods=("POST",))
+    @has_access_api
+    def set_facet(self, fid: int) -> Response:
+        """Approve, reject, rename, describe a value, move it to another category ({"facet": ...}: merged with
+        the value of the same name there, if any), or merge it into another (its items move there)."""
+        import datetime as dt
+
+        from superset import db
+
+        from supagent.knowledge.facets import CONFIDENT, editable, merge_value
         from supagent.knowledge.freshness import touch
         from supagent.models import Facet, Tag
 
@@ -1604,35 +1923,82 @@ class AdminView(BaseView):
             to = db.session.get(Facet, int(body["merge_into"]))
             if to is None or to.facet != f.facet or to.id == f.id:
                 return _json({"error": "merge into another value of the same category"}, 400)
-            for t in db.session.query(Tag).filter(Tag.facet_id == f.id):
-                if db.session.query(Tag).filter(Tag.ref == t.ref, Tag.facet_id == to.id).first() is None:
-                    t.facet_id = to.id
-                else:
-                    db.session.delete(t)
-            to.synonyms = sorted(set((to.synonyms or []) + [f.value]))
-            db.session.delete(f)
+            merge_value(f, to)
             db.session.commit()
             touch()
             db.session.commit()
             return _json({"merged_into": to.id})
+        if body.get("accept_parents") or body.get("reject_parents"):   # what the LLM said it is part of
+            from supagent.knowledge.facets import clean_parents
+
+            sug = dict(f.suggested or {})
+            proposed = list(sug.get("parents") or [])
+            if body.get("accept_parents"):
+                # true: all of them; a list: the admin's choice (some of them, or others): the rest declined
+                chosen = proposed if body["accept_parents"] is True else \
+                    [int(x) for x in body["accept_parents"] if str(x).isdigit()]
+                f.parents = clean_parents(f.id, list(f.parents or []) + chosen) or None
+                left = [p for p in proposed if p not in chosen]
+                if left:
+                    sug["declined"] = list(dict.fromkeys(list(sug.get("declined") or []) + left))
+            else:                                      # not proposed again from the same data
+                sug["declined"] = list(dict.fromkeys(list(sug.get("declined") or []) + proposed))
+            sug.pop("parents", None)
+            sug.pop("from", None)
+            f.suggested = sug or None
+            f.reviewed_by, f.reviewed_at = g.user.username, dt.datetime.utcnow()
+            db.session.commit()
+            touch()
+            db.session.commit()
+            return _json({"id": f.id, "parents": f.parents or []})
+        new_facet = str(body.get("facet") or "").strip() or f.facet
+        if new_facet != f.facet and (f.facet not in editable() or new_facet not in editable()):
+            return _json({"error": "the aspect (functional, technical) is fixed; a value moves between "
+                                   + ", ".join(editable())}, 400)
+        name = " ".join(str(body.get("value") or "").split())[:128] or f.value
+        if new_facet != f.facet or name.lower() != f.value.lower():
+            there = (db.session.query(Facet).filter(Facet.facet == new_facet, Facet.value.ilike(name),
+                                                    Facet.id != f.id).first())
+            if there is not None:                    # that value exists there already: one value, its items together
+                if there.status == "rejected":
+                    there.status = f.status
+                merge_value(f, there)
+                if str(body.get("description") or "").strip() and not there.description:
+                    there.description = str(body["description"]).strip()
+                syn = body.get("synonyms")
+                more = [x.strip() for x in (syn if isinstance(syn, list) else str(syn or "").split(",")) if x.strip()]
+                if more:
+                    there.synonyms = sorted(set(there.synonyms or []) | {x for x in more if x.lower() != there.value.lower()})
+                there.reviewed_by, there.reviewed_at = g.user.username, dt.datetime.utcnow()
+                db.session.commit()
+                touch()
+                db.session.commit()
+                return _json({"merged_into": there.id, "facet": there.facet, "value": there.value})
+        f.facet = new_facet
         if body.get("status") in ("approved", "proposed", "rejected"):
+            from supagent.knowledge.facets import review_all
+
             f.status = body["status"]
-            if f.status == "approved":        # its confident tags are used at once
+            if f.status == "approved" and not review_all():        # its confident tags are used at once
                 for t in db.session.query(Tag).filter(Tag.facet_id == f.id, Tag.status == "proposed"):
                     if (t.confidence or 0) >= CONFIDENT:
                         t.status = "approved"
         if str(body.get("value") or "").strip():
-            f.value = str(body["value"]).strip()[:128]
+            f.value = name
         if "description" in body:
             f.description = str(body.get("description") or "").strip() or None
         if "synonyms" in body:
             syn = body.get("synonyms")
             f.synonyms = [x.strip() for x in (syn if isinstance(syn, list) else str(syn or "").split(",")) if x.strip()]
+        if "parents" in body:                          # the values it is part of (a component of two applications)
+            from supagent.knowledge.facets import clean_parents
+
+            f.parents = clean_parents(f.id, body.get("parents")) or None
         f.reviewed_by, f.reviewed_at = g.user.username, dt.datetime.utcnow()
         db.session.commit()
         touch()
         db.session.commit()
-        return _json({"id": f.id, "status": f.status, "value": f.value})
+        return _json({"id": f.id, "status": f.status, "value": f.value, "facet": f.facet, "parents": f.parents or []})
 
     @expose("/api/tags/<int:tid>", methods=("POST",))
     @has_access_api
@@ -1645,6 +2011,26 @@ class AdminView(BaseView):
         t = db.session.get(Tag, tid)
         if t is None:
             abort(404)
+        if str(_body().get("facet_id") or "").isdigit():  # changed: another value (approved with it)
+            from supagent.models import Facet
+
+            to = db.session.get(Facet, int(_body()["facet_id"]))
+            if to is None or to.status == "rejected":
+                return _json({"error": "choose a value that is in use"}, 400)
+            other = db.session.query(Tag).filter(Tag.ref == t.ref, Tag.facet_id == to.id, Tag.id != t.id).first()
+            if other is not None:                      # the item has that one already: this one goes
+                other.status, other.reviewed_by = "approved", g.user.username
+                db.session.delete(t)
+                db.session.commit()
+                touch()
+                db.session.commit()
+                return _json({"id": other.id, "status": other.status, "facet_id": to.id})
+            t.facet_id, t.source = to.id, "admin"
+            t.status, t.reviewed_by = "approved", g.user.username
+            db.session.commit()
+            touch()
+            db.session.commit()
+            return _json({"id": t.id, "status": t.status, "facet_id": to.id})
         if _body().get("status") in ("approved", "rejected"):
             t.status, t.reviewed_by = _body()["status"], g.user.username
             db.session.commit()

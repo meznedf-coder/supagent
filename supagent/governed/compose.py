@@ -123,8 +123,9 @@ def sheet(plan: Plan, results: dict[str, str], pack: Pack) -> str:
             out.append("  | " + " | ".join(fmt_number(r.get(c)) for c in cols) + " |")
         if len(rows) > SHEET_ROWS:
             out.append(f"  ... {len(rows) - SHEET_ROWS} more rows (shown to the user under the answer)")
-        cut = res.get("truncated") or (step.limit is None and res.get("row_count")
-                                       and int(res.get("row_count")) >= 1000)
+        top = bool(step.limit) and len(rows) <= int(step.limit)  # the top N asked: all of it, not a cut
+        cut = not top and (res.get("truncated") or (step.limit is None and res.get("row_count")
+                                                    and int(res.get("row_count")) >= 1000))
         counts = [m.label for m in step.measures if m.fn in ("count", "count_distinct", "sum", "increase")]
         if len(rows) > 1 and counts and not cut:          # a total of cut rows is not the total
             totals = {c: sum(r.get(c) or 0 for r in rows if isinstance(r.get(c), (int, float))) for c in counts

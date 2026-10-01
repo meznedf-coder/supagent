@@ -72,6 +72,14 @@ def _tables(text: str) -> set[str]:
 EXCLUDING = re.compile(r"\b(exclude|excluding|without|never|remove|ignore|skip|do not|don'?t|not|exclure|exclu\w*|"
                        r"sans|sauf|jamais|ne pas|hors)\b", re.I)
 PAIR = re.compile(r"(?<![\w.])[\"`]?([A-Za-z_][A-Za-z0-9_]*)[\"`]?\s*(?:=|==|IN\s*\(?)\s*'([^'\n]{1,60})'", re.I)
+CONDITION = re.compile(r"(?<![\w.])[\"`]?([A-Za-z_][A-Za-z0-9_]*)[\"`]?\s*(<>|!=|==|=|\bNOT\s+IN\b\s*\(?|\bIN\b\s*\(?)"
+                       r"\s*'([^'\n]{1,60})'", re.I)
+SENTENCE_END = re.compile(r"[.;!?](?:\s|$)")
+LEFT_OUT_AFTER = re.compile(                     # after the value, about it: "(F = 'V') are never counted"
+    r"\b(?:are|is|be|must|should|do|does|will)\s+(?:never|not)\s+(?:be\s+)?(?:count|includ|use|add|sum|a\s+sale|"
+    r"sales|part)\w*|\bnever\s+(?:count|includ|use|add|sum)\w*|\b(?:are|is|be)\s+(?:excluded|removed|ignored|left\s+out)\b"
+    r"|\b(?:exclude|remove|ignore|skip)\s+(?:them|it|those|these)\b|\bne\s+(?:sont|doivent|est|doit)\s+(?:jamais|pas)\b"
+    r"|\bjamais\s+compt\w*|\bexclu(?:e|es|s)?\b", re.I)
 
 
 def _queries(trace: list[dict]) -> list[str]:
@@ -128,11 +136,18 @@ def _words(text: str) -> set[str]:
     return {w for w in re.split(r"[^a-z0-9]+", (text or "").lower()) if len(w) >= 3}
 
 
+def _stem(word: str) -> str:
+    """trades and trade, orders and order: one word."""
+    return word[:-1] if len(word) > 4 and word.endswith("s") and not word.endswith("ss") else word
+
+
 def concerns(rule: dict[str, Any], names: set[str]) -> set[str] | None:
-    """The tables a rule is about, among those that have its field: the ones whose data carries the rule's
-    distinguishing subject (a word of the rule naming a field, a value or the table itself in some of them and
-    not in the others: "The VaR of a desk is its record with BOOK = 'ALL'" is about the index whose values say
-    VaR, not every index with a BOOK). None: no distinguishing word, every table with the field."""
+    """The tables a rule is about, among those that have its field. The ones it names first: a word of the rule
+    in some of their names and not in the others ("Exclude cancelled trades (STATUS = 'CANCELLED')" is about the
+    trades, not the shop's orders, whose STATUS has CANCELLED too). Else the ones whose data carries the rule's
+    distinguishing subject (a word of the rule naming a field or a value in some of them and not in the others:
+    "The VaR of a desk is its record with BOOK = 'ALL'" is about the index whose values say VaR, not every index
+    with a BOOK). None: no distinguishing word, every table with the field."""
     import time
 
     from supagent.knowledge.describe import STOP
@@ -152,8 +167,12 @@ def concerns(rule: dict[str, Any], names: set[str]) -> set[str] | None:
         for v in ((o.stats or {}).get("values") or [])[:300]:
             ws |= _words(str(v))
     said = {w for w in _words(rule["text"]) if w not in STOP and w not in RULE_WORDS}
-    distinct = {w for w in said if 0 < sum(w in ws for ws in data.values()) < len(data)}
-    about = {t for t, ws in data.items() if ws & distinct} if distinct else set()
+    titled = {t: {_stem(w) for w in _words(t)} for t in tables}
+    naming = {w for w in {_stem(x) for x in said} if 0 < sum(w in ws for ws in titled.values()) < len(titled)}
+    about = {t for t, ws in titled.items() if ws & naming}
+    if not about:
+        distinct = {w for w in said if 0 < sum(w in ws for ws in data.values()) < len(data)}
+        about = {t for t, ws in data.items() if ws & distinct} if distinct else set()
     _CONCERNS[key] = (time.time(), about)
     return about or None
 
@@ -212,17 +231,42 @@ def details(question: str, queries: list[str]) -> list[dict[str, Any]]:
 KEEPING = re.compile(r"\b(only|uniquement|seulement|keep|garder|include|inclure)\b", re.I)
 
 
+def rule_conditions(text: str) -> list[tuple[str, str, bool]]:
+    """The conditions a rule writes: [(field, value, exclude)], once per field and value, in order. The operator
+    decides when it leaves the value out (CHANNEL <> 'TEST', NOT IN); else the words of its sentence: before the
+    field ("Exclude ... (F = 'V')" leaves it out, "Only ..." keeps it), then after the value, about it ("(F = 'V')
+    are never counted", "never count them"). A value the rule both describes (F = 'V') and leaves out (F <> 'V')
+    is left out: "Orders of the channel TEST (CHANNEL = 'TEST') ... never count them (CHANNEL <> 'TEST')"."""
+    text = text or ""
+    out: dict[tuple[str, str], bool] = {}
+    for m in CONDITION.finditer(text):
+        fld, op, value = m.group(1), " ".join(m.group(2).upper().replace("(", " ").split()), m.group(3)
+        if op in ("<>", "!=", "NOT IN"):
+            exclude = True
+        else:
+            start = max([0, *(e.end() for e in SENTENCE_END.finditer(text, 0, m.start()))])
+            before = text[max(start, m.start() - 80):m.start()]
+            end = SENTENCE_END.search(text, m.end())
+            after = text[m.end():end.start() if end else len(text)]
+            if KEEPING.search(before):
+                exclude = False
+            elif EXCLUDING.search(before):
+                exclude = True
+            else:
+                exclude = bool(LEFT_OUT_AFTER.search(after)) and not KEEPING.search(after)
+        out[(fld, value)] = out.get((fld, value), False) or exclude
+    return [(f, v, x) for (f, v), x in out.items()]
+
+
 def _detail(rule: dict[str, Any], has: set[str], values: list[str], tables: set[str]) -> dict[str, Any]:
-    """The field of the rule this table has, its value, and whether the rule leaves that value out (the
-    words before the field: "Exclude ... (ENVIRONMENT_TYPE = 'UAT')") or keeps only it ("Only ...")."""
+    """The field of the rule this table has, its value, and whether the rule leaves that value out ("Exclude ...
+    (ENVIRONMENT_TYPE = 'UAT')") or keeps only it ("Only ..."): rule_conditions."""
     text = rule["text"]
     fld = sorted(has)[0]
     value, exclude = (values[0] if values else None), bool(EXCLUDING.search(text)) and not KEEPING.search(text)
-    for m in PAIR.finditer(text):
-        if m.group(1) == fld:
-            before = text[max(0, m.start() - 80):m.start()]
-            value = m.group(2)
-            exclude = bool(EXCLUDING.search(before)) and not KEEPING.search(before)
+    for f, v, x in rule_conditions(text):
+        if f == fld:
+            value, exclude = v, x
             break
     return {"rule": text, "table": sorted(tables)[0], "field": fld, "value": value, "exclude": exclude}
 

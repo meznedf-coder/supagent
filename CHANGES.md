@@ -1,5 +1,114 @@
 # Changes
 
+## 0.7.0 — 1 Oct 2026
+
+* **Notes**: any user writes one in seconds (what a meeting decided), for the team or for themselves: the chat's
+  Notes button (search, pages, edit), `/note ...` or `/mynote ...` in the question box (saved without the LLM),
+  Data dictionary → Knowledge → Notes. The agent finds them (the knowledge search; `search_notes` with words and
+  days), always with their author and day, as not verified: never a team rule, never the source of a query's
+  condition. An admin pins a team note or makes a catalog entry of it. Table supagent_note.
+* **The agent as a notes assistant**: asked in the chat, it reads (`read_note`), writes (`add_note`: the team's,
+  or personal when the user says so), adds to or changes (`change_note`, `undo` back to the version before) and
+  deletes (`delete_note`, only in its answer to the user's yes: a call in the turn the deletion is asked is never
+  run) the notes the user may change, as that user. Each note keeps its earlier versions (`versions`, 20). A
+  request about notes gets the notes tools only; an answer that says a note was saved, changed or deleted with no
+  such call is sent back, then replaced by what is true (the lab's LLM wrote "has been deleted" without calling
+  anything). "Note for the team: ...", "Make a personal note for me: ...", "Add a note: ..." are saved at once,
+  without the LLM, like `/note`; the call in the answer to the user's yes is the confirmed deletion.
+* **The charts and dashboards looked at every night** (`charts.scan`, with the Context build): each chart's last
+  full day against the same weekday of the four weeks before, per series, through Superset's chart data API as
+  the learning user (high, low; data that stopped is said as such; a few events are not unusual; charts left out
+  say why); what each chart shows in words (LLM, cached); a Context page per dashboard. The agent's
+  `chart_anomalies` answers "anything unusual on the X dashboard?" for the charts the user may see (with
+  row-level security, a look now as them). Gentle on the databases: `charts.max_requests_per_minute`, a database
+  answering it is overloaded is left for the next night. `superset supagent charts`. Table supagent_chart_scan.
+* **Where the data of the questions was** (Data dictionary → Learned by the agent): one row per table, the words
+  that led there (one that also led to other tables and databases says so), the answers and the Helpful among
+  them; a search box, a database filter, pages; Wrong (admins) takes a word away from a table.
+* **Data dictionary → Search lists everything found**, not the 12 best: every piece the search finds (at most 500,
+  the first ones in the order the agent sees them), 20 per page, with the count. Each name is a link to where the
+  item is read or edited: a chart or a dashboard opens in Superset (new tab); an index, a metric, a catalog entry,
+  a note, a team memory, a document, a Context page or a learned answer opens in the dictionary's side panel, at
+  an address that can be copied or bookmarked (`#open/<item>`, opened only for a user who may search it).
+* **Categories by hand** (Data dictionary → Knowledge → Categories, admins): a value is added to a category
+  (subject, application, component) with its description and other names, used at once; one that exists is said
+  so, a retired one comes back. **Edit changes the category itself**, not only the value's text: a value moves
+  between subjects, applications and components with its items (where the other category has that value
+  already, the two become one, as a merge; a rename onto an existing value merges too, where it failed before).
+  The aspect (functional, technical) stays fixed.
+* **A value can be part of several others** (the user's example: a jvm of two applications and four components):
+  when it is added or with Edit → Part of (Ctrl or Cmd + click for several). The list says what each value is
+  part of; the items of a value count as about each value it is part of (a note on the jvm is found for both
+  applications); a merge keeps what each value is part of.
+* **The learning says it too**: a new value the LLM proposes (from the metrics, the data, the notes, the
+  catalog, the memories) comes with the known values it is part of, approved with it, and, when it names a
+  known value, a one-click "Merge into" that value; what the texts say about known values ("the posting engine
+  is part of LEDGER") waits in To review → Categories part of others (Approve, Reject).
+* **Categories of your own, read from the data** (Categories → Categories and where their values come from):
+  besides subject, application and component, an admin adds categories (server, environment, team...) and,
+  for any of them, the field names its values are read from (`categories.fields`, e.g. `server:
+  ^(host|node|server)$`). The learning makes their values approved values with where they come from ("field
+  NODE of jobs-*"); the LLM classifies into them too. Two such fields of one index show which values go
+  together (the profile's sample): proposed as "part of" (an application above its servers) in To review, never
+  applied without an admin (a rejected one is not proposed again). Settings `categories.custom`,
+  `categories.fields`, `categories.max_values`, `categories.relation_min_docs`.
+* **System map** (Categories → System map): the system as the categories describe it, each value under what it
+  is part of (a value of several under each), with the items about it that exist now by kind; a metric removed
+  or a note deleted is no longer counted, and a value whose items are all gone says so.
+* **To review**: a decided item leaves the list at once (it stayed, green, until the page was read again); a
+  value merged into an approved one counts its items at once (they waited as proposed). Besides Approve and
+  Reject, **Change…**: a "part of" suggestion approved with only the values chosen (or others; the rest is not
+  proposed again), an item's category moved to another value, a new value approved with what it is part of.
+* **Nothing the LLM finds is used before an admin approves it** (`categories.review_all`, on by default, a change
+  from 0.6): every category it gives an item and every relation it finds between items waits in To review, even
+  the ones it is sure of; until approved, the router and the search do not use them. Values and their "part of"
+  relations always wait. `categories.review_all=false` gives the 0.6 behaviour (what it is sure of, on approved
+  values, used at once).
+* Fields named `component` or `module` now feed the component category (`categories.fields`); before, a field
+  named `component` fed the application values.
+
+* **Reliability on a second subject.** A retail lab (orders and payments, deliveries, returns, customer care) and its
+  benchmark (25 cases, two wordings, split before any run). What its held-out half found, fixed:
+  * **The time the question names is the time of its period**: "parcels shipped on 17 and 18 September" counted on
+    the delivery time, "tickets opened" on the first response time. The classic check sends back a query whose
+    period is on another date field than the one the question names; the governed plan's period takes that field
+    (`Period.field`). Two named days ("17 and 18 September") are a span, not the second day.
+  * **An index's time field is its dataset's main time column** when the team chose one in Superset (the learner
+    took the first date field by name); indices learned before take it at the next learning run.
+  * **A rule's condition is read its way and on the data it names**: "Orders of the channel TEST (CHANNEL =
+    'TEST') ... never count them (CHANNEL <> 'TEST')" was applied as CHANNEL = 'TEST' (the governed pipeline counted
+    the test orders only); now the operator a rule writes decides, else the words of its sentence before or after
+    the value. "Exclude cancelled trades (STATUS = 'CANCELLED')" no longer goes to other tables with a CANCELLED
+    status. A condition code added from a rule never stands for one the question asks for ("failed at payment"
+    planned without the failed condition is sent back).
+  * **A follow-up keeps the previous question's conditions** (classic): "... show me only <app>" after an
+    answer counted with a business-date label added the application and dropped the label. The previous
+    answer's conditions on a table queried again, that this answer's queries lose and the message neither
+    changes nor removes, are sent back once, then said under the answer. "Make it in your memory", "when I say
+    X ... you should know" are learned like "remember".
+  * **A value the question names is in the query** (classic, as the governed plan already checked): "How many web
+    orders did we sell" counted every channel (no 'WEB' in its query): such an answer is sent back once, then
+    marked; a value said before the table's subject ("test orders") is named in both pipelines; "UAT included"
+    is not a filter.
+  * **Governed answers**: the top N asked is the whole answer (it said "the results only show the first rows"); a
+    count has no unit ("count of rows, in seconds"), nor a sum one the dictionary does not give ("in percent").
+  * **A day said as `DATE '2026-09-22'`** (or a midnight `TIMESTAMP`) on a date field stored with a time finds
+    nothing: sent back as `= '2026-09-22'` already was ("LYON orders of 22 September": 0 instead of 136).
+  * **No figure for the future**: "Forecast tomorrow's orders" got "~411 orders" (the mean of four Fridays); the
+    data tell what happened: past figures as past figures.
+  * **Status questions read the nightly look first** (`chart_anomalies`, then the live checks).
+  * **Investigations, generic**: the question's own data first, then what people said about that time (the
+    team's notes, the documents), the systems' health only for systems' data (the instructions named the jobs
+    index and the servers: "why were deliveries late" went there); two calls before the end, the agent answers.
+* **A second, independent computation** (test, off: `agent.cross_check`): when the classic agent answers with
+  figures from its own queries, the governed pipeline computes the same question its own way (its plan, queries
+  built by code); when its figures differ from the answer's headline figures, the answer says so with the other
+  figures. Costs the second computation's time (`agent.cross_check_seconds`, 180 at most). Measured on the lab's
+  112 labelled answers: it caught 4 of 21 wrong answers and questioned 12 of 91 right ones; it stays off.
+
+Upgrade: `superset supagent init` (schema 13: supagent_note, supagent_chart_scan; columns supagent_facet.parents,
+supagent_facet.suggested, supagent_facet.origins).
+
 ## 0.6.0 (2026-10-01)
 
 The release of the 0.6.0 test versions: the code of 0.6.0b7 with one fix, found by rehearsing the upgrade from

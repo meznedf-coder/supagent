@@ -326,9 +326,34 @@ details.sql summary { cursor: pointer; color: var(--ink-2); }
 .mem-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
 .mem-list li { border-left: 3px solid var(--accent); background: var(--line-2); padding: 6px 10px; border-radius: 0 6px 6px 0; }
 .page-chat .drawer-panel { width: min(560px, 100%); }
+.convs #open-notes { margin-top: 4px; }
+.note-fields input[type=text] { flex: 1 1 160px; min-width: 0; }
+.note-list li { display: grid; gap: 3px; }
+.note-list li.pinned { border-left-color: var(--warn, #c98a12); }
+.note-list li.catalog { border-left-color: var(--ok); }
+.note-title { font-weight: 600; overflow-wrap: anywhere; }
+.note-meta { color: var(--muted); font-size: 12px; }
+.note-body { color: var(--ink-2); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.note-body.folded { max-height: 6.2em; overflow: hidden; }
+.note-acts { display: flex; flex-wrap: wrap; gap: 10px; }
+.note-list textarea { width: 100%; }
+.msg.notice .bubble { background: var(--line-2); color: var(--ink-2); font-size: 13px; }
+.where-words { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.where-word { display: inline-flex; align-items: baseline; gap: 4px; border: 1px solid var(--line); border-radius: 10px;
+  padding: 0 7px; font-size: 12px; line-height: 20px; background: var(--panel); }
+.where-word.own { border-color: var(--accent); }
+.where-word.shared { color: var(--muted); }
+.where-uses { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.where-x { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 0 0 2px; font-size: 13px; line-height: 1; }
+.where-x:hover, .where-x:focus { color: var(--bad); }
 .k-results { display: grid; gap: 8px; }
 .k-hit { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 12px; }
 .k-text { color: var(--ink-2); font-size: 13px; white-space: pre-wrap; margin-top: 4px; }
+.k-count { margin: 4px 0 8px; }
+.k-name { font-weight: 600; }
+.k-via { font-size: 12px; }
+.facet-add { margin-top: 8px; }
+.facet-add input[type="text"] { min-width: 0; flex: 1 1 160px; }
 
 /* the chat in the panel docked on Superset's pages (?embed=1): one column, the conversations
    behind a button, no top bar */
@@ -427,6 +452,8 @@ td.row-actions { white-space: nowrap; }
 td.row-actions select { font-size: 12px; padding: 2px 4px; }
 .facet-value { font-weight: 600; }
 .facet-edit { display: grid; gap: 6px; }
+.facet-parents-select { min-width: 0; width: 100%; }
+.facet-parents { font-size: 12.5px; }
 .facet-chip { display: inline-block; padding: 0 8px; border-radius: 10px; font-size: 12px; background: var(--accent-soft);
   color: var(--accent); white-space: nowrap; }
 .link-kind { display: inline-block; padding: 0 7px; border-radius: 10px; font-size: 11.5px; background: var(--line-2);
@@ -454,6 +481,8 @@ td.row-actions select { font-size: 12px; padding: 2px 4px; }
 .rcard .ractions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; flex: 0 1 auto; }
 .rcard .ractions select { padding: 3px 6px; font-size: 12.5px; }
 .rcard.done { opacity: .6; background: var(--line-2); }
+.rcard.leaving { opacity: 0; transform: translateX(12px); transition: opacity .4s ease, transform .4s ease; }
+@media (prefers-reduced-motion: reduce) { .rcard.leaving { transition: none; } }
 .rcard .rdone { color: var(--ok); font-size: 12.5px; font-weight: 600; }
 .rcard .rdone::before { content: "\2713  "; }
 @media (max-width: 640px) { .maintabs button[data-tab] { padding: 8px 9px; font-size: 13.5px; }
@@ -480,3 +509,19 @@ td.row-actions .muted { font-size: 12px; }
 .use-why.good { color: var(--ok); }
 .use-why.bad { color: var(--bad); }
 tr.demoted > td:first-child > div:first-child { text-decoration: line-through; color: var(--muted); }
+
+/* categories: the view switch and the system map */
+.viewswitch { display: flex; gap: 6px; margin: 10px 0; }
+.viewswitch .btn.on { background: var(--accent); color: var(--accent-ink, #fff); border-color: var(--accent); }
+.fac-map .tree { list-style: none; margin: 0; padding-left: 18px; border-left: 1px solid var(--line); }
+.fac-map .tree-root { padding-left: 0; border-left: 0; }
+.fac-map li { margin: 4px 0; }
+.fac-map summary { cursor: pointer; }
+.fac-map .tnode { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: baseline; }
+.fac-map .tcount { font-size: 12.5px; }
+.fac-map .tcount.tgone { color: var(--warn, #b26b00); }
+.rcard .rsame { margin-top: 4px; }
+.cat-own { margin: 10px 0; }
+.cat-own summary { cursor: pointer; font-weight: 600; }
+.cat-own-list { margin: 6px 0; padding-left: 18px; }
+.facet-origins { font-size: 12px; }

@@ -64,7 +64,11 @@ Rules:
    failures on the same step, answer with what you have and say what did not work.
 5. Say exactly what the tools did, never claim what a tool result does not show. If the data ends before
    "now", say so and use its last days. Timestamps are local time (never call them UTC); now is given
-   with the question.
+   with the question. The data tell what happened, not what will: to a question about the future (a
+   forecast, tomorrow, next month), say first that the data cannot tell it, then give the past figures
+   that help (the same weekday of the last weeks) as past figures, never one figure as what will happen.
+   Groups that add up to more than the total hold rows counted in several groups (a field with several
+   values in a row); less than the total, rows without a value: say which only when a query shows it.
 6. Know what the question means before you query: the team's words, the memory, the learned answers and
    the chat decide first. If a word can still mean two things in the data that give different numbers
    (two fields or metrics that fit, a term nobody defined, a period that is not said and has no usual
@@ -149,11 +153,13 @@ with what it shows and its period ("<what it shows> - <its period>"), never twic
 
 What is happening now ("in production", "with <an application>", "on <a metric, a chart or a dashboard>", "is
 everything normal"): 1) find the dashboards and charts about the subject (the knowledge found names them, with
-their ids; else list_dashboards / list_charts), 2) read their latest data (get_chart_data), the team's checks
-with their limits (check_health) and the alerts firing (list_alerts), 3) compare with the usual (compare_to_usual:
-the same window of the previous weeks), 4) answer subject by subject: normal or not, with the value, the usual,
-the limit and since when, and a screenshot of a chart that shows a problem (chart_image) when one is found. Say
-what could not be checked; "nothing unusual" only when it was checked.""",
+their ids; else list_dashboards / list_charts), 2) chart_anomalies on that dashboard or chart: what the nightly
+look found on each chart (its last full day against the same weekday of the 4 weeks before; data that stopped);
+look_now=true to look again now, 3) read their latest data (get_chart_data), the team's checks with their limits
+(check_health) and the alerts firing (list_alerts), and compare with the usual (compare_to_usual: the same window
+of the previous weeks), 4) answer subject by subject: normal or not, with the value, the usual, the limit and
+since when, and a screenshot of a chart that shows a problem (chart_image) when one is found. Say what could not
+be checked and the day the look compared; "nothing unusual" only when it was checked.""",
     "sqllab": """
 
 SQL Lab and Explore (asked here): save_sql_query saves a query in SQL Lab's Saved Queries (database_id, sql, a
@@ -164,16 +170,29 @@ queries of the chat's earlier answers are listed with the question), and give th
 name.""",
     "investigation": """
 
-Investigations ("why did the jobs fail", "was a server saturated"): 1) find where and when on the jobs index
-(failed jobs by "NODE" or "APPLICATION" and hour), 2) call check_health for that time window with
-entities = the servers / applications found (CPU, memory, disk, OOM kills, outages, queues, HTTP errors,
-latency, licences with from-to and worst value), 3) answer with the problems that match the failures and
-say what was not found. list_alerts shows the alerts firing now; compare_to_usual says whether a metric
-was unusual for that time (the same window on earlier weeks).""",
+Investigations ("why did ... fail", "what happened on ...", "was a server saturated"): 1) find where and when
+in the data the question is about (its own table: counts by its fields and by hour or day, against the days
+before); 2) read what people said about that time: the team's notes (search_notes with those days) and the
+documents (search_knowledge); 3) when that data is about systems (jobs, servers, applications), call
+check_health for that window with entities = the servers / applications found (CPU, memory, disk, OOM kills,
+outages, queues, HTTP errors, latency, licences with from-to and worst value); list_alerts shows the alerts
+firing now; compare_to_usual says whether a metric was unusual for that time (the same window on earlier
+weeks); 4) answer with what matches, where each finding comes from, and what was not found. Stay on the
+question's data: other subjects' tables only when the question or what you found points to them.""",
     "usual": """
 
 Unusual or not (asked here): compare_to_usual(promql, start, end) compares the window with the same window
 of the previous weeks and gives a verdict per series; use it rather than judging a number alone.""",
+    "notes": """
+
+Notes (asked here): the users' notes (what a meeting decided, a fact to keep). search_notes finds them (words,
+days; mine=true: the user's own), read_note gives one in full. A note is its author's, not verified: say whose
+and of which day; never a team rule, never a query's condition. Write or change one only when the user asks:
+add_note (for the team, unless they say it is for them: "my note", "for me", "personal", "private"; its day when
+they say it; their words, nothing added), change_note (add_text adds to it, text replaces it, undo=true puts back
+the version before the last change; the user's own notes, an admin's for the team's ones). Say what was saved or
+changed: its title and for whom. To delete one: find it, show it (title, author, day), ask whether to delete it
+and stop; call delete_note with confirmed=true only in the answer to their yes.""",
     "files": """
 
 Files, e-mails and reports (asked here): a file or Excel extract -> export_excel (every matching row: no
@@ -220,6 +239,9 @@ INTENTS = {
                           r"answers?))\b|\b(la derni[èe]re fois|comme (avant|la derni[èe]re fois)|d[ée]j[àa] demand[ée]|"
                           r"tu m'as (dit|donn[ée]|montr[ée]|envoy[ée])|(anciennes?|pr[ée]c[ée]dentes?) "
                           r"(conversations?|questions?|r[ée]ponses?))\b", re.I),
+    "notes": re.compile(r"\b(notes?|meetings?|minutes of|stand-?ups?|decided|decisions?|agreed|we (said|noted)|"
+                       r"(write|jot|put) (it |this |that )?down|r[ée]unions?|compte[- ]rendu|d[ée]cid[ée]e?s?|"
+                       r"on a (dit|not[ée])|not(er|ez)|prends? note)\b", re.I),
     "sqllab": re.compile(r"\bsql ?lab\b|\bsaved? (it|this|that|the|my|as)?\s*(sql|query|queries|requ[êe]te)\b|"
                          r"\bexplore\b|\bexplorer\b|\b(link|lien|url)\b|\bopen (it|this|that|the (query|sql))\b|"
                          r"\bouvr\w+ (la|cette) requ[êe]te\b", re.I),
@@ -230,14 +252,15 @@ TOOLS_OF = {
                "get_dashboard_info", "fix_chart_time_range", "chart_image", "create_virtual_dataset", "get_chart_data"},
     "files": {"export_excel", "send_email", "create_report", "list_reports"},
     "images": {"chart_from_sql", "chart_image"},
-    "usual": {"compare_to_usual"},
+    "usual": {"compare_to_usual", "chart_anomalies"},
     "sqllab": {"save_sql_query", "open_sql_lab_with_context", "generate_explore_link"},
     "read_charts": {"get_chart_data", "get_chart_info", "list_charts", "list_dashboards", "get_dashboard_info",
-                    "chart_image"},
+                    "chart_image", "chart_anomalies"},
     "status": {"get_chart_data", "get_chart_info", "list_charts", "list_dashboards", "get_dashboard_info",
-               "chart_image", "compare_to_usual"},
-    "investigation": {"compare_to_usual"},
+               "chart_image", "compare_to_usual", "chart_anomalies"},
+    "investigation": {"compare_to_usual", "chart_anomalies", "search_notes"},
     "history": {"search_my_chats"},
+    "notes": {"search_notes", "read_note", "add_note", "change_note", "delete_note"},
 }
 INTENT_TOOLS = set().union(*TOOLS_OF.values())
 
@@ -797,8 +820,86 @@ def saved_dashboard(trace: list[dict]) -> bool:
     return any((t.get("called") or t["tool"]) in DASHBOARD_TOOLS and t.get("status") == "done" for t in trace)
 
 
+# a request about the notes themselves (not a question that notes may answer): only the notes tools are offered
+NOTES_ASK = re.compile(
+    r"^\W*(?:please\s+|can you\s+|could you\s+)?(?:"
+    r"(?:make|write|take|add|create|save|put|jot|keep)\b[^.?!\n]{0,30}\bnotes?\b"
+    r"|notes?\s+(?:for|to)\s+(?:the\s+team|me|myself|us|everyone)\b|notes?\s*:"
+    r"|(?:add|append)\s+(?:this\s+|it\s+|that\s+)?to\s+(?:my|the|that|this|our|your)\s+(?:personal\s+|team\s+)?notes?\b"
+    r"|(?:change|edit|update|modify|correct|fix|rename|retitle)\s+(?:my|the|that|this|our)\s+(?:personal\s+|team\s+)?notes?\b"
+    r"|(?:undo|revert|restore)\b[^.?!\n]{0,40}\bnotes?\b"
+    r"|(?:delete|remove|erase)\s+(?:my|the|that|this|our|a)\s+(?:personal\s+|team\s+)?notes?\b"
+    r"|(?:show|list|find|read|open)\s+(?:me\s+)?(?:my|the|our|all)\s+(?:personal\s+|team\s+)?notes?\b"
+    r"|(?:ajoute|[ée]cris|prends|cr[ée]e|enregistre)\b[^.?!\n]{0,30}\bnotes?\b"
+    r"|(?:modifie|change|supprime|efface|annule)\b[^.?!\n]{0,20}\b(?:ma|la|cette|notre)\s+note\b)", re.I)
+NOTE_DONE = re.compile(          # an answer saying a note was saved, changed or deleted in this turn
+    r"\bnotes?\b[^.\n]{0,160}?\b(?:has been|have been|is now)\s+(created|saved|added|written|recorded|updated|"
+    r"changed|appended|edited|modified|undone|restored|reverted|deleted|removed)\b(?!\s+by\b)"
+    r"|\bI(?:'ve| have)?\s+(created|saved|added|wrote|recorded|updated|changed|appended|edited|modified|undid|"
+    r"restored|reverted|deleted|removed)\b[^.\n]{0,60}\bnotes?\b"
+    r"|\bnotes?\b[^.\n]{0,160}?\ba [ée]t[ée]\s+(cr[ée]{2}e?|enregistr[ée]e?|ajout[ée]e?|modifi[ée]e?|supprim[ée]e?|"
+    r"annul[ée]e?|restaur[ée]e?)", re.I)
+NOTE_ACTIONS = (               # what an answer says was done, the calls that do it (with their result's key)
+    (re.compile(r"^(delet|remov|supprim)", re.I), (("delete_note", "deleted"),)),
+    (re.compile(r"^(updat|chang|append|edit|modif|undo|undid|restor|revert|annul)", re.I), (("change_note", "after"),)),
+    (re.compile(r"^(creat|cr[ée]|sav|add|ajout|writ|wrote|record|enregistr)", re.I),      # "added to the note": a
+     (("add_note", "saved"), ("change_note", "after"))))                                   # change saves it too
+CARRY_NUDGE = ("(Check before answering: this message goes on from the previous question, whose answer counted "
+               "with {conds}; the queries of this answer drop {them}. Keep the previous question's conditions unless "
+               "the user removes them: run the queries again with them. If the user asks a new question, answer it "
+               "and say in one line that {them} no longer {apply}. Write the whole answer for the user as if for the "
+               "first time: they see neither the one above nor this check.)")
+CARRY_NOTE = "\n\n(Check: the previous question counted with {conds}; this answer does not.)"
+NAMED_NUDGE = ("(Check before answering: the question names {value} ({field} of {table}), and no query of this "
+               "answer has a condition with it nor is per {field}: the figures above count every {field}. Run the "
+               "query again with {field} = '{value}', or, if the question means something else, say so in one line. "
+               "Write the whole answer for the user as if for the first time: they see neither the one above nor "
+               "this check.)")
+NAMED_NOTE = "\n\n(Check: the question names {value} ({field}); no query of this answer filters on it.)"
+NOTE_CLAIM_NUDGE = ("(Check before answering: your answer says a note was {what}, and no {tool} call did it in this "
+                    "answer. Call {tool} now ({how}), or tell the user it was not done. Write the whole answer for "
+                    "the user as if for the first time: they see neither the one above nor this check.)")
+NOTE_HOW = {"delete_note": "with the note's note_id from search_notes: it shows the note, then ask the user to confirm",
+            "change_note": "with the note's note_id from search_notes", "add_note": "with the user's text"}
+NOTE_NOT_DONE = {
+    "delete_note": "I have not deleted any note: the deletion did not run. Ask again (\"delete my note about ...\"): I "
+                   "will show you the note and ask you to confirm.",
+    "change_note": "The note was not changed: the change did not run. Ask again with what to change in which note.",
+    "add_note": "No note was saved: the save did not run. Ask again with the note's text, or use the Notes button."}
+
+
+def notes_request(text: str) -> bool:
+    return bool(NOTES_ASK.search(text or ""))
+
+
+def _note_done(trace: list[dict], tool: str, key: str) -> bool:
+    for t in trace:
+        if (t.get("called") or t["tool"]) == tool and t.get("status") == "done":
+            try:
+                if key in json.loads(t.get("result") or "{}"):
+                    return True
+            except (ValueError, TypeError):
+                pass
+    return False
+
+
+def note_claim(answer: str, trace: list[dict]) -> tuple[str, str] | None:
+    """(what the answer says was done to a note, the tool that does it) when no such call succeeded here."""
+    for m in NOTE_DONE.finditer(answer or ""):
+        word = next(g for g in m.groups() if g)
+        for rx, calls in NOTE_ACTIONS:
+            if rx.match(word):
+                if not any(_note_done(trace, tool, key) for tool, key in calls):
+                    return word.lower(), calls[0][0]
+                break
+    return None
+
+
 def claims_check(answer: str, trace: list[dict]) -> str:
     notes = []
+    claimed = note_claim(answer, trace)
+    if claimed:
+        notes.append(f"no note was {claimed[0]} in this answer ({claimed[1]} did not run): the notes are as they were")
     sent = []
     for t in trace:
         if t.get("called", t["tool"]) != "send_email":
@@ -848,6 +949,9 @@ BAD_TOOL_CALL = re.compile(r"parse tool call|tool call arguments|invalid tool ca
 UNREADABLE_CALL = ("(Your last reply could not be read: the arguments of its tool call were not valid JSON (too long, "
                    "or cut). Call the tool again with short arguments: a chart config names columns and aggregates, "
                    "never the data rows. Or write the answer with what you have.)")
+LAST_CALLS = ("(Two tool calls are left for this answer: write the answer for the user now from the results above "
+              "(what they show, what is known and what is not); call a tool only if the answer cannot be written "
+              "without it.)")
 OUT_OF_STEPS = ("(No tool call is left for this answer. Write the answer for the user now, from the results "
                 "above: what was done (the charts, datasets and dashboards saved, with their links), what the "
                 "results show, and what remains to do. Do not claim anything the tools did not do.)")
@@ -1231,6 +1335,8 @@ class Agent:
         wanted = set().union(*(TOOLS_OF.get(k, set()) for k in asked)) if asked else set()
         if self.wants_saved_chart:
             wanted |= TOOLS_OF["charts"]
+        if notes_request(question):                     # "add to my note ...": the notes tools only
+            return [s for s in self.specs if s["function"]["name"] in TOOLS_OF["notes"]]
         return [s for s in self.specs if s["function"]["name"] not in INTENT_TOOLS or s["function"]["name"] in wanted]
 
     def route(self, question: str, previous: str = "") -> Any:
@@ -1451,6 +1557,12 @@ class Agent:
         # "what charts are in it?": the tools, instructions and checks of the question it refers to, too
         self.intent_text = f"{before}\n{question}" if follow else question
         self.question = self.intent_text                  # the checks of periods and rules read it
+        self.raw_question, self.chat_history = question, list(history or [])     # a yes, as the user wrote it
+        last = next((h for h in reversed(history or []) if h.get("role") == "assistant"), None)
+        self.prev_queries = [str(q.get("query") or "") for q in (last or {}).get("queries") or [] if q.get("query")]
+        from supagent.knowledge.carry import continues
+
+        self.goes_on = bool(before) and continues(question, follow)
         self.moa = self.route(question, before if follow else "")
         try:
             from supagent.knowledge.scope import scope_for
@@ -1509,7 +1621,31 @@ class Agent:
         self.open_question = bool(intents(self.intent_text) & {"status", "investigation", "usual"})
         return messages
 
+    def _quick_note(self, question: str) -> tuple[str, list[dict]] | None:
+        """"Note for the team: ...", "Make a personal note for me: ...": saved at once, as "/note" is, without the
+        LLM (which took such a message for a question in the lab); the answer names the note for what follows."""
+        from supagent.knowledge.notes import asked_to_write
+
+        asked = asked_to_write(question)
+        if asked is None or not asked["text"]:
+            return None
+        from supagent.tools import add_note
+
+        personal = asked["scope"] == "user"
+        out = add_note(asked["text"], personal=personal)
+        step = {"tool": "add_note", "called": "add_note", "status": "error" if "error" in out else "done",
+                "args": {"text": asked["text"], "personal": personal}, "seconds": 0,
+                "result": json.dumps(out, default=str)[:4000]}
+        if "error" in out:
+            return f"The note was not saved: {out['error']}", [step]
+        saved = out["saved"]
+        return (f"Saved {'for you' if personal else 'for the team'}: \u201c{saved['title']}\u201d (note {saved['id']}; "
+                f"Notes, on the left). To add to it or change it, say so here."), [step]
+
     def ask(self, question: str, history: list[dict] | None = None) -> tuple[str, list[dict]]:
+        quick = self._quick_note(question)
+        if quick is not None:
+            return quick
         self.guard.saved = {}
         self.redirected_chart = False
         self.refused: set[str] = set()                 # calls sent back before running: they run if sent again
@@ -1519,7 +1655,9 @@ class Agent:
         messages = self.prompt(question, history)
         asked_at = self._asked_at = len(messages)      # what the LLM was given, before its own words
         trace: list[dict] = []
-        nudged = announced = numbers_asked = rules_asked = count_asked = looped = limit_asked = False
+        nudged = announced = numbers_asked = rules_asked = count_asked = looped = limit_asked = notes_asked = False
+        named_asked = carry_asked = False
+        about_notes = notes_request(getattr(self, "intent_text", None) or question)
         done: set[str] = set()                         # identical successful calls: not run twice
         saved_calls: set[str] = set()                   # identical saving calls: not run again either
         self.usage = {}
@@ -1531,8 +1669,10 @@ class Agent:
         if not building and len(re.findall(r",|;|\band\b|\bet\b", question or "")) >= MANY_PARTS:
             steps = int(steps * 1.5)                   # a report of many figures: more calls
         unreadable = 0
-        for _ in range(steps):
+        for i in range(steps):
             self._check_stop()
+            if i == steps - 2 and steps >= 4 and trace:   # the answer before the calls run out, not after
+                messages.append({"role": "user", "content": LAST_CALLS})
             try:
                 msg = self.llm.chat(messages, tools=specs, max_tokens=self._answer_tokens())
             except EmptyAnswer:
@@ -1565,7 +1705,18 @@ class Agent:
                     continue
                 if cut is not None:                    # again: cut there, and said
                     answer = answer[:cut].rstrip()
-                nudge = None if nudged else unsupported_answer(answer, trace)
+                claimed = None if notes_asked else note_claim(answer, trace)
+                if claimed:                            # once: "the note has been deleted" with no such call
+                    notes_asked = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (a note %s without %s)", *claimed)
+                    messages.append({"role": "user", "content": NOTE_CLAIM_NUDGE.format(
+                        what=claimed[0], tool=claimed[1], how=NOTE_HOW[claimed[1]])})
+                    continue
+                if notes_asked and claimed is None and (again := note_claim(answer, trace)):
+                    log.info("supagent: a note %s without %s again: the answer says it was not done", *again)
+                    return NOTE_NOT_DONE[again[1]], trace     # said twice, not done: not shown as done
+                nudge = None if nudged or about_notes else unsupported_answer(answer, trace)
                 if nudge and self.follow_up and settings.get("agent.check_numbers") and \
                         not self._ungrounded(answer, messages[:asked_at]):
                     nudge = None                       # a follow-up restating the chat's results: all in them
@@ -1589,6 +1740,24 @@ class Agent:
                     log.info("supagent: answer sent back (rule not applied): %r", missed[0][:200])
                     messages.append({"role": "user", "content": RULES_NUDGE.format(rule=missed[0][:300])})
                     continue
+                lost = None if carry_asked else self._dropped(question, trace)
+                if lost:                               # once: a follow-up lost the previous conditions
+                    carry_asked = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    said = ", ".join(c.said() for c in lost[:4])
+                    log.info("supagent: answer sent back (previous conditions dropped: %s)", said)
+                    messages.append({"role": "user", "content": CARRY_NUDGE.format(
+                        conds=said, them="them" if len(lost) > 1 else "it",
+                        apply="apply" if len(lost) > 1 else "applies")})
+                    continue
+                gap = None if named_asked else self._unnamed(question, trace)
+                if gap:                                # once: "web orders" counted over every channel
+                    named_asked = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (a named value not in the queries: %s)", gap)
+                    messages.append({"role": "user", "content": NAMED_NUDGE.format(value=gap[0], field=gap[1],
+                                                                                   table=gap[2])})
+                    continue
                 unknown = self._ungrounded(answer, messages[:asked_at] + [
                     m if m["role"] == "tool" else {"role": "assistant", "tool_calls": m["tool_calls"]}
                     for m in messages[asked_at:-1] if m["role"] == "tool" or m.get("tool_calls")])
@@ -1611,7 +1780,8 @@ class Agent:
                     log.info("supagent: answer sent back (no count for how many)")
                     messages.append({"role": "user", "content": COUNT_NUDGE})
                     continue
-                if nudged or announced or numbers_asked or rules_asked or count_asked or looped or limit_asked:
+                if nudged or announced or numbers_asked or rules_asked or count_asked or looped or limit_asked or \
+                        notes_asked or named_asked or carry_asked:
                     answer = without_apology(answer)   # written again after a check the user never saw
                 answer = without_preamble(answer)
                 missing = [c for c in charts if c.splitlines()[-1].strip() not in answer]
@@ -1636,6 +1806,12 @@ class Agent:
                     note += RULES_NOTE.format(rule=missed[0][:300])
                 if read_as_count:                      # still there after asking: marked
                     note += LIMIT_NOTE.format(n=read_as_count)
+                kept = self._dropped(question, trace) if carry_asked else None
+                if kept:                               # still dropped after asking: said
+                    note += CARRY_NOTE.format(conds=", ".join(c.said() for c in kept[:4]))
+                still = self._unnamed(question, trace) if named_asked else None
+                if still:                              # still not in the queries after asking: marked
+                    note += NAMED_NOTE.format(value=still[0], field=still[1])
                 note += self._marks(answer, trace, conditions_only=True)
                 if cut is not None:
                     note += LOOP_NOTE
@@ -1653,6 +1829,8 @@ class Agent:
                 props = (self.superset.schema(name) or {}).get("properties", {})
                 if list(props) == ["request"] and "request" not in args:
                     args = {"request": args}
+                if name == "delete_note":
+                    args = self._confirm_delete(args)
                 step = {"tool": name, "args": args, "status": "running", "started": time.time()}
                 trace.append(step)
                 self._report(trace)
@@ -1673,7 +1851,8 @@ class Agent:
                 else:
                     refused = self._refusal(name, args)
                     again = call_key in self.refused
-                    if refused and again and "(not run: another database)" not in refused:
+                    if refused and again and "(not run: another database)" not in refused \
+                            and "(not run: confirmation)" not in refused:
                         refused = None                 # sent again unchanged: the period, a rule, a count may be meant
                     if refused:                        # another database: never (the question did not name it)
                         if again:                      # a third time: "you already made this call and it failed"
@@ -1788,6 +1967,52 @@ class Agent:
             note += condition_note(getattr(self, "support", None), trace)
         return note
 
+    def _confirm_delete(self, args: dict) -> dict:
+        """delete_note in the answer to the user's yes (to the answer before, which asked to delete that note): the
+        deletion they confirmed, not shown to them once more (the lab: asked, "yes", then asked again)."""
+        if args.get("confirmed"):
+            return args
+        try:
+            from supagent.knowledge.notes import delete_refusal
+
+            if delete_refusal(getattr(self, "raw_question", ""), getattr(self, "chat_history", []),
+                              {**args, "confirmed": True}) is None:
+                return {**args, "confirmed": True}
+        except Exception:  # pylint: disable=broad-except
+            log.warning("supagent: the confirmation of a deletion was not read", exc_info=True)
+        return args
+
+    def _dropped(self, question: str, trace: list[dict]) -> list:
+        """The previous answer's conditions this follow-up's queries lost (knowledge.carry)."""
+        if not getattr(self, "goes_on", False) or not getattr(self, "prev_queries", None):
+            return []
+        try:
+            from supagent.knowledge.carry import dropped
+            from supagent.knowledge.rulecheck import _queries
+
+            return dropped(question, self.prev_queries, _queries(trace))
+        except Exception:  # pylint: disable=broad-except   (never an answer lost for a check)
+            from superset.extensions import db
+
+            db.session.rollback()
+            log.warning("supagent: the check of a follow-up's conditions failed", exc_info=True)
+            return []
+
+    def _unnamed(self, question: str, trace: list[dict]) -> tuple[str, str, str] | None:
+        """The first value the question names that this answer's queries never use (knowledge.named)."""
+        try:
+            from supagent.knowledge.named import unused
+            from supagent.knowledge.rulecheck import _queries
+
+            found = unused(question, _queries(trace))
+            return found[0] if found else None
+        except Exception:  # pylint: disable=broad-except   (never an answer lost for a check)
+            from superset.extensions import db
+
+            db.session.rollback()
+            log.warning("supagent: the check of named values failed", exc_info=True)
+            return None
+
     def _refusal(self, name: str, args: dict) -> str | None:
         """Why this call is sent back before it runs (once), every reason at once: it reads a table in
         another database than the one the question or its charts name, it misses the question's period,
@@ -1800,6 +2025,10 @@ class Agent:
             from supagent.knowledge.conditions import refusal as condition_refusal
 
             question = getattr(self, "intent_text", None) or getattr(self, "question", "")
+            if name == "delete_note":                  # the user's yes first, in their own message
+                from supagent.knowledge.notes import delete_refusal
+
+                return delete_refusal(getattr(self, "raw_question", ""), getattr(self, "chat_history", []), args)
             reasons = [refusal(self.scope, name, args) if self.scope is not None else None,
                        period_refusal(question, name, args), self._counted_samples(name, args),
                        None if getattr(self, "open_question", False) else

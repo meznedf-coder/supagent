@@ -6,6 +6,7 @@
     <button id="toggle-convs" class="btn wide" type="button" aria-expanded="false">Conversations</button>
     <button id="new-chat" class="btn primary wide" type="button">New conversation</button>
     <button id="open-memory" class="btn wide" type="button" title="What the agent remembers for you and the team">Memory</button>
+    <button id="open-notes" class="btn wide" type="button" title="Write down what was said in a meeting, read the team's notes (or type /note ... in the question box)">Notes</button>
     <input id="conv-search" class="conv-search" type="search" placeholder="Search your chats" aria-label="Search your chats"
            autocomplete="off">
     <ul id="conv-list" class="conv-list"></ul>
@@ -41,6 +42,38 @@
     <div class="section"><h3>For the team</h3><ul class="mem-list" id="memory-team"></ul></div>
     <div class="section" id="memory-proposed-box" hidden><h3>Waiting for an admin's approval</h3>
       <ul class="mem-list" id="memory-proposed"></ul></div>
+  </div>
+</div>
+<div id="notes-drawer" class="drawer" hidden>
+  <div class="drawer-panel notes-panel" role="dialog" aria-modal="true" aria-labelledby="notes-h">
+    <button type="button" class="close" id="notes-close" aria-label="Close">&times;</button>
+    <h2 id="notes-h">Notes</h2>
+    <p class="muted">What a meeting decided, a fact the team must not lose: write it in a few seconds. The agent finds
+      the notes when they matter, says whose note it is and of which day, and never takes one as a rule. In the question
+      box: <code>/note</code> &hellip; (for the team) or <code>/mynote</code> &hellip; (for you). Or ask the agent:
+      &ldquo;add to my note about &hellip;&rdquo;, &ldquo;undo the last change to that note&rdquo;, &ldquo;delete my note
+      about &hellip;&rdquo; (it asks first).</p>
+    <div class="edit">
+      <textarea id="note-text" rows="4" maxlength="50000" aria-label="The note"
+        placeholder="e.g. Pricing weekly, 1 Oct: the FX volatility surface is rebuilt at 07:00 from now on; Anna checks the HESTON timeouts."></textarea>
+      <div class="actions note-fields">
+        <input id="note-title" type="text" maxlength="300" placeholder="Title (optional)" aria-label="Title">
+        <input id="note-tags" type="text" maxlength="200" placeholder="Tags: pricing, meeting" aria-label="Tags">
+        <input id="note-day" type="date" aria-label="The day it is about (a meeting's)" title="The day it is about (a meeting's)">
+        <select id="note-scope" aria-label="For whom"><option value="team">For the team</option>
+          <option value="user">For me only</option></select>
+        <button type="button" class="btn primary" id="note-save">Save the note</button>
+        <span id="note-result" class="result"></span>
+      </div>
+    </div>
+    <div class="section">
+      <input id="notes-search" type="search" class="conv-search" placeholder="Search the notes" aria-label="Search the notes"
+             autocomplete="off">
+      <div id="notes-catalog-box" hidden><h3>In the catalog (verified)</h3><ul class="mem-list note-list" id="notes-catalog"></ul></div>
+      <h3 id="notes-count">Notes</h3>
+      <ul class="mem-list note-list" id="notes-list"></ul>
+      <button type="button" class="btn" id="notes-more" hidden>More</button>
+    </div>
   </div>
 </div>
 <template id="welcome">

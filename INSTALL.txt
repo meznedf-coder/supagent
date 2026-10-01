@@ -1,18 +1,19 @@
-supagent 0.6.0 - the AI agent inside Apache Superset
+supagent 0.7.0 - the AI agent inside Apache Superset
 ====================================================
 
 What is in this folder
-  supagent-0.6.0-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
+  supagent-0.7.0-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
 
-Upgrading from 0.5.4? Go to "Upgrade from 0.5.4 to 0.6.0" below. Steps 1-8 are for a new install.
+Upgrading? From 0.6.0: "Upgrade from 0.6.0 to 0.7.0" below; from 0.5.4: the steps of "Upgrade from 0.5.4
+to 0.6.0" with this wheel (init then goes from schema 7 to 13). Steps 1-8 are for a new install.
 
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.6.0-py3-none-any.whl
+   $PY -m pip install supagent-0.7.0-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
 
 2. Register it: one line in superset_config.py (no logic)
@@ -108,6 +109,41 @@ Upgrading from 0.5.4? Go to "Upgrade from 0.5.4 to 0.6.0" below. Steps 1-8 are f
    supagent_store). Then:
      superset supagent init          builds it (the first time it finds the extensions)
      superset supagent store status  extensions, versions, size, warnings
+
+Upgrade from 0.6.0 to 0.7.0
+===========================
+
+What changes (each one can be switched off):
+  - Notes: every user of the agent may write notes (the chat's Notes button, "/note ..." or "/mynote ..." in the
+    question box), for the team or for themselves; the agent finds them, says whose and of which day, never as a
+    rule. Data dictionary -> Knowledge -> Notes. Asked in the chat, the agent also writes, changes (earlier
+    versions kept) and deletes notes as the user (a deletion only after the user's yes).
+  - The charts and dashboards looked at every night, with the Context build: each chart's last full day against
+    the same weekday of the 4 weeks before; what each chart shows in words (LLM, charts.max_llm_calls a night);
+    the agent answers "anything unusual on the X dashboard?" (chart_anomalies). Off: charts.scan=false. Gentle on
+    the databases: charts.max_requests_per_minute (12 per database); one that answers it is overloaded is left for
+    the next night.
+  - Data dictionary -> Learned by the agent -> Where the data of the questions was: one row per table, pages.
+  - Reliability fixes (always on): a period the question puts on a named time ("parcels shipped on ...",
+    "tickets opened ...") is counted on that time field; an index's time field is its dataset's main time
+    column when the dataset in Superset has one (from the first learning run after the upgrade: the next night,
+    or superset supagent learn); a team rule's condition is applied the way the rule writes it ("... (F = 'V')
+    ... never count them (F <> 'V')" leaves V out) and only to the tables it names; a question about the future
+    gets past figures, never a forecast figure.
+  - Data dictionary: Search lists everything found (pages, each name a link); categories added by hand, moved
+    between categories, part of several others (a component of two applications), categories of your own read
+    from the data's fields (categories.fields), the relations the data shows proposed to an admin, a System map;
+    To review: Change... besides Approve and Reject.
+  - A change: nothing the LLM finds is used before an admin approves it (categories.review_all, on): its
+    categories and relations wait in To review (Approve all shown). categories.review_all=false: as in 0.6.
+  - Not on: agent.cross_check (a test: a second, independent computation of the classic agent's figures).
+  - Superset's database: 2 new tables (supagent_note, supagent_chart_scan) and one new column
+    (supagent_facet.parents, .suggested, .origins), schema 13; nothing else changes.
+
+Steps: as steps 3 to 9 of "Upgrade from 0.5.4 to 0.6.0" below (stop, back up, pip install this wheel on every
+host, superset supagent init once: "tables: schema version 9 -> 13", start), then, to see the charts now rather
+than the next night: superset supagent charts --scan (and --understand for what they show).
+Back to 0.6.0: pip install the 0.6.0 wheel, superset supagent init (the 2 tables and the 3 columns stay, unused).
 
 Upgrade from 0.5.4 to 0.6.0
 ===========================

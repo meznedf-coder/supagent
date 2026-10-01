@@ -64,6 +64,7 @@ class Period(BaseModel):
     start: str
     end: str
     source: str = ""
+    field: str | None = None          # a date field of the table other than its time field (the question names it)
 
 
 class Order(BaseModel):

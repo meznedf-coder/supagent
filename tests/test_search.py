@@ -292,3 +292,87 @@ def test_weak_neighbours_found_by_meaning_only_are_left_out(clean_knowledge, mon
         assert all(f["via"] in ("words", "meaning", "words and meaning") for f in found)
         monkeypatch.setattr(E, "nearest", lambda qv, allowed, k: [(i, 0.30) for i in [cpu] + others])
         assert all(f["via"] != "meaning" for f in S.search("processor load", k=8))     # nothing close enough
+
+
+def test_the_dictionary_search_lists_every_piece_with_its_link(app):
+    """The Data dictionary's search: every piece found (not the 12 best), page by page in the page, each name a
+    link to where it is read or edited; a piece is opened only by a user who may search it."""
+    from conftest import login
+    from superset.extensions import db
+
+    from supagent.knowledge.index import sync
+    from supagent.knowledge.search import link_of
+    from supagent.models import Memory
+
+    assert link_of("superset:chart:42") == {"href": "/explore/?slice_id=42", "where": "superset"}
+    assert link_of("superset:dashboard:7:3") == {"href": "/superset/dashboard/7/", "where": "superset"}
+    assert link_of("object:12") == {"href": "#open/object%3A12", "where": "dictionary"}
+    assert link_of("entry:5#settlement-date") == {"href": "#open/entry%3A5", "where": "dictionary"}
+    assert link_of("note:9#2")["href"] == "#open/note%3A9" and link_of("data:1:jobs") is None
+    with app.app_context():
+        mems = [Memory(scope="team", kind="rule", status="active", source="manual",
+                       text=f"Settlement batch rule number {i}: amounts in EUR (paging test)") for i in range(40)]
+        db.session.add_all(mems)
+        db.session.commit()
+        sync()
+        ids = [m.id for m in mems]
+    try:
+        with app.test_client() as c:
+            login(c, "alice")
+            d = c.get("/supagent/dictionary/api/search?all=1&q=settlement+batch+rule").get_json()
+            refs = [r["ref"] for r in d["results"]]
+            assert d["total"] == len(refs) and len(set(refs) & {f"memory:{i}" for i in ids}) == 40
+            hit = next(r for r in d["results"] if r["ref"] == f"memory:{ids[0]}")
+            assert hit["link"] == {"href": f"#open/memory%3A{ids[0]}", "where": "dictionary"}
+            assert len(c.get("/supagent/dictionary/api/search?q=settlement+batch+rule").get_json()["results"]) == 12
+            got = c.get(f"/supagent/dictionary/api/item?ref=memory:{ids[0]}").get_json()
+            assert "rule number 0" in got["text"] and got["kind"] == "memory"
+            assert c.get("/supagent/dictionary/api/item?ref=memory:999999").status_code == 404
+            assert c.get("/supagent/dictionary/api/item?ref=memory%25").status_code == 404
+    finally:
+        with app.app_context():
+            db.session.query(Memory).filter(Memory.text.like("%(paging test)%")).delete(synchronize_session=False)
+            db.session.commit()
+            sync()
+
+
+def test_a_private_note_or_memory_is_never_listed_nor_opened_for_another_user(app):
+    """The dictionary's search lists everything found and opens any item by its address: a user's personal note and
+    personal memory stay theirs (the search's own filter, before ranking and in api/item)."""
+    from conftest import login
+    from superset.extensions import db, security_manager
+
+    from supagent.knowledge.index import sync
+    from supagent.models import Memory, Note
+
+    with app.app_context():
+        alice = security_manager.find_user("alice").id
+        note = Note(scope="user", user_id=alice, title="Quokka meeting", text="Quokka budget is 42k (privacy test)")
+        mem = Memory(scope="user", user_id=alice, kind="preference", status="active", source="chat",
+                     text="Quokka figures in thousands (privacy test)")
+        team = Memory(scope="team", kind="rule", status="active", source="manual",
+                      text="Quokka reports go to the team (privacy test)")
+        db.session.add_all([note, mem, team])
+        db.session.commit()
+        sync()
+        refs = {"note": f"note:{note.id}", "memory": f"memory:{mem.id}", "team": f"memory:{team.id}"}
+    try:
+        for user, sees in (("alice", True), ("bob", False)):
+            with app.test_client() as c:
+                login(c, user)
+                found = {r["ref"].split("#")[0] for r in
+                         c.get("/supagent/dictionary/api/search?all=1&q=quokka").get_json()["results"]}
+                assert refs["team"] in found
+                for k in ("note", "memory"):
+                    assert (refs[k] in found) is sees, (user, k)
+                    r = c.get(f"/supagent/dictionary/api/item?ref={refs[k]}")
+                    assert r.status_code == (200 if sees else 404), (user, k)
+                    if sees:
+                        assert "Quokka" in r.get_json()["text"]
+                assert c.get(f"/supagent/dictionary/api/item?ref={refs['team']}").status_code == 200
+    finally:
+        with app.app_context():
+            db.session.query(Note).filter(Note.text.like("%(privacy test)%")).delete(synchronize_session=False)
+            db.session.query(Memory).filter(Memory.text.like("%(privacy test)%")).delete(synchronize_session=False)
+            db.session.commit()
+            sync()

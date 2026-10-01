@@ -177,9 +177,9 @@ def compile_step(step: Step, t: TableInfo, found: dict[str, list[Any]] | None = 
     where = [cond_sql(c, backend, found) for c in step.where]
     if step.period is not None:
         if t.kind == "index":
-            if not t.time_field:
+            if not (step.period.field or t.time_field):
                 raise CompileError(f"{t.name} has no time field for the period")
-            tf = ident(t.time_field, backend)
+            tf = ident(step.period.field or t.time_field, backend)
             where = [f"{tf} >= {literal(step.period.start)}", f"{tf} < {literal(step.period.end)}"] + where
         else:
             where = [f"ts >= TIMESTAMP {literal(step.period.start)}", f"ts < TIMESTAMP {literal(step.period.end)}"] + where
@@ -251,7 +251,7 @@ def query_object(step: Step, t: TableInfo, found: dict[str, list[Any]] | None = 
             f["val"] = value
         filters.append(f)
     if step.period is not None:
-        tf = t.time_field if t.kind == "index" else "ts"
+        tf = (step.period.field or t.time_field) if t.kind == "index" else "ts"
         start, end = step.period.start.replace(" ", "T") + ":00", step.period.end.replace(" ", "T") + ":00"
         filters.append({"col": tf, "op": "TEMPORAL_RANGE", "val": f"{start} : {end}"})
     by_label = {m["label"].lower(): m for m in metrics}
@@ -283,5 +283,5 @@ def run_on_dataset(step: Step, t: TableInfo, dataset: Any, found: dict[str, list
     rows = q.get("data") or []
     cols = q.get("colnames") or (list(rows[0]) if rows else [])
     return {"success": True, "database": t.database, "columns": [{"name": c} for c in cols], "rows": rows,
-            "row_count": len(rows), "truncated": len(rows) >= qo["row_limit"], "sql": q.get("query"),
+            "row_count": len(rows), "truncated": not step.limit and len(rows) >= qo["row_limit"], "sql": q.get("query"),
             "via": f"the dataset {dataset.table_name} (id {dataset.id}): its permissions and row-level security"}

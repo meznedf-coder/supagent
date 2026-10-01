@@ -205,6 +205,14 @@ def _superset_pieces() -> Iterator[dict[str, Any]]:
 
     tables = {t.id: t for t in db.session.query(SqlaTable)}
     db_names = {i: n for i, n in db.session.query(Database.id, Database.database_name)}
+    try:                                     # what the nightly look found and wrote (0.7): no figure here
+        from supagent.knowledge.charts import summary_line
+        from supagent.models import ChartScan
+
+        scans = {r.chart_id: r for r in db.session.query(ChartScan)}
+    except Exception:  # pylint: disable=broad-except   (the table comes with superset supagent init)
+        db.session.rollback()
+        scans, summary_line = {}, None
     boards: dict[int, list[Any]] = {}
     for d in db.session.query(Dashboard):
         for sl in d.slices or []:
@@ -230,6 +238,11 @@ def _superset_pieces() -> Iterator[dict[str, Any]]:
                  "on the dashboards: " + ", ".join(sorted({b.dashboard_title for b in boards.get(sl.id, [])}))
                  if boards.get(sl.id) else "",
                  f"chart id {sl.id}"]
+        scan = scans.get(sl.id)
+        if scan is not None and scan.understanding:
+            lines.append("what it shows (AI-written): " + " ".join(scan.understanding.split())[:600])
+        if scan is not None and summary_line is not None and summary_line(scan):
+            lines.append(summary_line(scan))
         yield {"ref": f"superset:chart:{sl.id}", "kind": "chart", "database_id": t.database_id,
                "title": f"chart {sl.slice_name}", "text": "\n".join(x for x in lines if x)}
         for b in boards.get(sl.id, []):
@@ -246,6 +259,13 @@ def _superset_pieces() -> Iterator[dict[str, Any]]:
                        f'"{db_names.get(database_id, "")}": ' + "; ".join(charts[:40])}
 
 
+def _note_pieces() -> Iterator[dict[str, Any]]:
+    """The notes users write (0.7): the team's for everyone, a personal one for its author only."""
+    from supagent.knowledge.notes import pieces as note_pieces
+
+    yield from note_pieces()
+
+
 def _mcp_pieces() -> Iterator[dict[str, Any]]:
     """The tools of the other MCP servers (mcp.servers): the decider routes questions to them."""
     try:
@@ -259,7 +279,7 @@ def _mcp_pieces() -> Iterator[dict[str, Any]]:
 
 KINDS = (("object:", _object_pieces), ("entry:", _entry_pieces), ("recipe:", _recipe_pieces),
          ("memory:", _memory_pieces), ("doc:", _doc_pieces), ("context:", _context_pieces),
-         ("superset:", _superset_pieces), ("mcp:", _mcp_pieces))
+         ("superset:", _superset_pieces), ("mcp:", _mcp_pieces), ("note:", _note_pieces))
 
 
 def pieces(prefixes: tuple[str, ...] | None = None) -> Iterator[dict[str, Any]]:

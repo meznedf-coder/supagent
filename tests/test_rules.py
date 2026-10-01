@@ -201,7 +201,8 @@ VAR_RULE = ("The VaR of a desk is its record with BOOK = 'ALL'. Never add up the
 
 @pytest.fixture()
 def desks(world):
-    """Three indices with a BOOK field (PnL, risk, trades); only the risk index's values say VaR."""
+    """Three indices with a BOOK field (PnL, risk, trades); only the risk index's values say VaR. And a shop's
+    orders, whose STATUS has CANCELLED like the trades'."""
     from superset.extensions import db
 
     from supagent.knowledge import rulecheck
@@ -215,7 +216,9 @@ def desks(world):
                           ("risk", {"BOOK": ["ALL", "EQ_VANILLA_EU"], "RISK_MEASURE": ["VAR_1D_99", "VEGA", "DELTA"]}),
                           ("trades", {"BOOK": ["EQ_VANILLA_EU"], "STATUS": ["NEW", "CANCELLED"]}),
                           ("pricing", {"BOOK": ["FX_SPOT_G10"], "STATUS": ["OK", "ERROR"],
-                                       "ERROR_CODE": ["INVALID_TRADE", "TIMEOUT"]})):
+                                       "ERROR_CODE": ["INVALID_TRADE", "TIMEOUT"]}),
+                          ("shop-orders", {"CHANNEL": ["WEB", "TEST"],
+                                           "STATUS": ["PAID", "CANCELLED", "PAYMENT_FAILED"]})):
         made.append(upsert(world["run"], world["s_jobs"], "index", "", index, {"stats": {"time_field": "COB_DATE"}}))
         for name, values in fields.items():
             made.append(upsert(world["run"], world["s_jobs"], "field", index, name,
@@ -285,3 +288,135 @@ def test_a_rule_whose_value_cannot_be_in_the_data_is_not_applied_there(desks):
     assert rulecheck.unapplied(q, [_step('SELECT COUNT(*) FROM "pricing" WHERE "STATUS" = \'ERROR\'')]) == []
     trades = rulecheck.unapplied("How many trades?", [_step('SELECT COUNT(*) FROM "trades"')])
     assert any("CANCELLED" in r for r in trades)
+
+
+TEST_RULE = ("Orders of the channel TEST (CHANNEL = 'TEST') are made by the QA team: never count them in sales, "
+             "revenue, order counts or rates (CHANNEL <> 'TEST'), unless the question asks for the test orders "
+             "themselves.")
+CANCELLED_RULE = ("Exclude cancelled trades (STATUS = 'CANCELLED') from trade counts and notionals unless the "
+                  "question asks about cancellations.")
+
+
+def test_the_way_a_rule_writes_its_condition():
+    """A rule that first says which values it is about, then leaves them out (the retail lab's: the governed
+    pipeline counted only the test orders, CHANNEL = 'TEST'), and the other ways rules write it."""
+    from supagent.knowledge.rulecheck import rule_conditions
+
+    assert rule_conditions(TEST_RULE) == [("CHANNEL", "TEST", True)]
+    assert rule_conditions(RULE) == [("ENVIRONMENT_TYPE", "UAT", True)]
+    assert rule_conditions("Exclude the UAT environment (ENVIRONMENT_TYPE = 'UAT', label env = 'UAT').") == [
+        ("ENVIRONMENT_TYPE", "UAT", True), ("env", "UAT", True)]
+    assert rule_conditions(VAR_RULE) == [("BOOK", "ALL", False)]
+    assert rule_conditions("Only count PROD jobs (ENVIRONMENT_TYPE = 'PROD'), never DEV.") == [
+        ("ENVIRONMENT_TYPE", "PROD", False)]
+    assert rule_conditions("Cancelled orders (STATUS = 'CANCELLED') are never counted as sales.") == [
+        ("STATUS", "CANCELLED", True)]
+    assert rule_conditions("The PnL of a COB is the official one (PNL_STATUS = 'OFFICIAL') unless the question "
+                           "asks for the flash PnL.") == [("PNL_STATUS", "OFFICIAL", False)]
+    assert rule_conditions("Never add up the books (VaR is not additive). The VaR of a desk is its record with "
+                           "BOOK = 'ALL'.") == [("BOOK", "ALL", False)]          # the sentence before is another
+    assert rule_conditions("Use BOOK = 'ALL' for the VaR of a desk, not the sum of the books.") == [
+        ("BOOK", "ALL", False)]
+    assert rule_conditions("Live trades have STATUS NOT IN ('CANCELLED', 'REJECTED').")[0] == (
+        "STATUS", "CANCELLED", True)
+
+
+def test_a_rule_that_names_its_data_is_about_that_data_only(desks):
+    """"Exclude cancelled trades (STATUS = 'CANCELLED')" is about the trades, not the shop's orders whose STATUS
+    has CANCELLED too (the retail lab's governed answers took the trades' rule to the orders); a rule that
+    leaves a value out is added that way, and not where the question says that field for what it counts."""
+    from supagent.governed.decider import Pack, TableInfo
+    from supagent.governed.plan import Cond, Measure, Step
+    from supagent.governed.validate import Checked, _apply_rules
+    from supagent.knowledge import rulecheck
+    from supagent.knowledge.catalog import save_entry
+
+    save_entry({"title": "Cancelled trades", "classification": "rule", "content": CANCELLED_RULE}, by="admin")
+    save_entry({"title": "Test orders", "classification": "rule", "content": TEST_RULE}, by="admin")
+    rulecheck._CONCERNS.clear()
+    assert rulecheck.concerns({"text": CANCELLED_RULE}, {"STATUS"}) == {"trades"}
+    orders = TableInfo(subject="data:1:shop-orders", ref="T1", kind="index", database_id=1, database="lab",
+                       backend="osagg", name="shop-orders",
+                       columns={"CHANNEL": {"values": ["WEB", "TEST"]},
+                                "STATUS": {"values": ["PAID", "CANCELLED", "PAYMENT_FAILED"]}})
+    pack = Pack(tables=[], knowledge=[], ambiguous=[], missing=[], kind="data", confidence="high")
+    step = Step(id="q1", table="T1")
+    out = Checked(plan=None)
+    _apply_rules(step, orders, "How many orders failed at payment on 23 September?", pack, out)
+    assert [(c.field, c.op, c.value) for c in step.where] == [("CHANNEL", "!=", "TEST")]
+    web = Step(id="q1", table="T1", measures=[Measure(label="web orders", fn="count", where=[
+        Cond(field="CHANNEL", op="=", value="WEB", source="question: web orders")])])
+    _apply_rules(web, orders, "How many web orders did we sell on 23 September?", pack, Checked(plan=None))
+    assert web.where == []
+
+
+def test_a_value_the_question_names_and_no_query_uses_is_sent_back(ruled, monkeypatch):
+    """"How many web orders did we sell on 23 September?" counted over every channel (the retail lab): a value the
+    question names in the data the queries read (as the data writes it, code-like, or before the table's subject)
+    that no query writes nor groups by is sent back once, then marked."""
+    from test_agent_loop import agent_with, call, say
+
+    from supagent.knowledge.named import unused
+
+    failed = 'SELECT COUNT(*) FROM "jobs" WHERE "STATUS" = \'FAILED\''
+    assert unused("How many billing jobs failed?", [failed]) == [("BILLING", "APPLICATION", "jobs")]
+    assert unused("How many PAYROLL jobs failed?", [failed]) == [("PAYROLL", "APPLICATION", "jobs")]
+    assert unused("How many billing jobs failed?", [failed + " AND \"APPLICATION\" = 'BILLING'"]) == []
+    assert unused("How many jobs failed per application?", [failed]) == []
+    assert unused("Failed jobs by application, billing first?", [failed + ' GROUP BY "APPLICATION"']) == []
+    assert unused("How many jobs failed on the billing side?", [failed]) == []          # an ordinary word
+    assert unused("Billing application: how many jobs failed?", [failed]) == [("BILLING", "APPLICATION", "jobs")]
+    assert unused("How many jobs failed, UAT included?", [failed]) == []                 # with the others
+    assert unused("How many jobs failed including UAT?", [failed]) == []
+    ruled_sql = failed + " AND \"ENVIRONMENT_TYPE\" <> 'UAT'"                       # the fixture's rule applied
+    plain = {"request": {"database_id": 1, "sql": ruled_sql}}
+    billing = {"request": {"database_id": 1, "sql": ruled_sql + " AND \"APPLICATION\" = 'BILLING'"}}
+    a, ran = agent_with(monkeypatch, [call("execute_sql", plain), say("12 jobs failed."),
+                                      call("execute_sql", billing), say("3 BILLING jobs failed.")], results=ROWS)
+    answer, _trace = a.ask("How many billing jobs failed?")
+    assert [r[1] for r in ran] == [plain, billing] and answer == "3 BILLING jobs failed."
+    b, ran = agent_with(monkeypatch, [call("execute_sql", plain), say("12 jobs failed."), say("12 jobs failed.")],
+                        results=ROWS)
+    answer, _trace = b.ask("How many billing jobs failed?")
+    assert answer.endswith("(Check: the question names BILLING (APPLICATION); no query of this answer filters on it.)")
+
+
+def test_a_follow_up_keeps_the_previous_questions_conditions(ruled, monkeypatch):
+    """"when I say billing you should know the filter is APPLICATION=BILLING ... show me now only billing", after
+    an answer counted with a label: the new queries added the application and dropped the label. The previous
+    answer's conditions on the same table are sent back once, then said under the answer."""
+    from test_agent_loop import agent_with, call, say
+
+    from supagent.knowledge.carry import dropped
+
+    base = 'SELECT COUNT(*) FROM "jobs" WHERE "STATUS" = \'FAILED\' AND "ENVIRONMENT_TYPE" <> \'UAT\''
+    prev = base + " AND \"LABEL\" = 'D'"
+    history = [{"role": "user", "content": "How many jobs failed, label D?"},
+               {"role": "assistant", "content": "12 jobs failed.", "queries": [{"query": prev}]}]
+    q = "when I say billing you should know the filter is APPLICATION=BILLING, show me only billing"
+    billing = base + " AND \"APPLICATION\" = 'BILLING'"
+    assert [c.said() for c in dropped(q, [prev], [billing])] == ["LABEL = 'D'"]
+    assert dropped(q, [prev], [billing + " AND \"LABEL\" = 'D'"]) == []
+    assert dropped("Now all labels, only billing", [prev], [billing]) == []           # removed on purpose
+    assert dropped("Only billing, label D-1 instead", [prev], [billing]) == []        # the message changes it
+    assert dropped(q, [prev], ['SELECT COUNT(*) FROM "other" WHERE "APPLICATION" = \'BILLING\'']) == []
+
+    plain = {"request": {"database_id": 1, "sql": billing}}
+    kept = {"request": {"database_id": 1, "sql": billing + " AND \"LABEL\" = 'D'"}}
+    a, ran = agent_with(monkeypatch, [call("execute_sql", plain), say("3 BILLING jobs failed."),
+                                      call("execute_sql", kept), say("2 BILLING jobs failed with label D.")],
+                        results=ROWS)
+    answer, _trace = a.ask(q, history)
+    assert [r[1] for r in ran] == [plain, kept] and answer == "2 BILLING jobs failed with label D."
+    b, ran = agent_with(monkeypatch, [call("execute_sql", plain), say("3 BILLING jobs failed."),
+                                      say("3 BILLING jobs failed.")], results=ROWS)
+    answer, _trace = b.ask(q, history)
+    assert answer.endswith("(Check: the previous question counted with LABEL = 'D'; this answer does not.)")
+
+
+def test_a_memory_said_in_other_words_is_learned():
+    from supagent.knowledge.memory import SIGNALS
+
+    for said in ("when I say BILLING you should know the filter is APPLICATION=BILLING, make it in your memory",
+                 "Keep this in your memory: PROD only", "Mémorise que PROD veut dire production"):
+        assert SIGNALS.search(said), said

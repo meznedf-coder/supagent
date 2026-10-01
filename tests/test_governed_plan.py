@@ -250,7 +250,13 @@ def test_no_total_of_cut_rows_and_explanations_say_the_knowledge(pack):
     whole = sheet(plan, {"q1": json.dumps({"columns": ["APPLICATION", "failed jobs"], "rows": rows[:3],
                                            "row_count": 3})}, pack)
     assert "totals of these rows: failed jobs 3" in whole
-    item = next(k for k in pack.knowledge if k.kind == "rule")
+    top = _plan([_jobs_step([{"field": "STATUS", "op": "=", "value": "FAILED", "source": "question: failed"}],
+                            by=["APPLICATION"], limit=1, limit_source="question: which application had the most",
+                            order=[{"by": "failed jobs", "desc": True}])])
+    first = sheet(top, {"q1": json.dumps({"columns": ["APPLICATION", "failed jobs"], "rows": rows[:1], "row_count": 1,
+                                          "truncated": True})}, pack)
+    assert "cut:" not in first                       # the top 1 asked is the whole answer (the retail lab: "the
+    item = next(k for k in pack.knowledge if k.kind == "rule")    # results only show the first rows")
     assert explained("[K2] rule", [item]).startswith(f"- **{item.title}**: {item.text}")
     good = f"The team counts without UAT: {item.text}"
     assert explained(good, [item]) == good
@@ -303,6 +309,25 @@ def test_a_unit_nobody_asked_for_is_not_said(pack):
     ok = check(plan, pack, q, today=TODAY)
     assert plan.steps[0].measures[0].unit is None
     assert any("unit 'seconds' of 'failed jobs' removed" in f for f in ok.fixed)
+    same = _plan([{"id": "q1", "table": "T1", "where": where, "period": DAY,     # the retail lab: "count of rows,
+                   "measures": [{"label": "failed jobs", "fn": "count", "unit": "seconds",   # in seconds"
+                                 "source_unit": "seconds"}]}])
+    check(same, pack, q, today=TODAY)
+    assert same.steps[0].measures[0].unit is None and same.steps[0].measures[0].source_unit is None
+    summed = _plan([{"id": "q1", "table": "T1", "where": where, "period": DAY,        # the domain lab's PnL summed
+                     "measures": [{"label": "time", "fn": "sum", "field": "DURATION_S", "unit": "percent",  # "in
+                                   "source_unit": "percent"}]}])                                     # percent"
+    check(summed, pack, q, today=TODAY)
+    assert summed.steps[0].measures[0].unit is None
+    seconds = _plan([{"id": "q1", "table": "T1", "where": where, "period": DAY,
+                      "measures": [{"label": "time", "fn": "sum", "field": "DURATION_S", "unit": "seconds",
+                                    "source_unit": "seconds"}]}])
+    pack.table("T1").columns["DURATION_S"]["unit"] = "seconds"           # the dictionary says it: kept
+    try:
+        check(seconds, pack, q, today=TODAY)
+        assert seconds.steps[0].measures[0].unit == "seconds"
+    finally:
+        pack.table("T1").columns["DURATION_S"].pop("unit", None)
 
 
 def test_a_day_said_as_an_equality_on_a_date_field_becomes_the_period(pack):
@@ -373,3 +398,105 @@ def test_a_count_the_question_qualifies_needs_that_condition(pack):
     assert not any("counts 'fail' ones" in e for e in good.errors)
     plain = check(_plan([_jobs_step(only_app)]), pack, "How many BILLING jobs ran on 23 September?", today=TODAY)
     assert not any("counts 'fail' ones" in e for e in plain.errors)
+
+
+def test_a_period_on_the_date_the_question_names(pack):
+    """"jobs finished on 23 September": the period on FINISHED_TIME, not on the table's time field; a period field
+    that is no date of the table is refused."""
+    from supagent.governed.compile import compile_step
+    from supagent.governed.validate import check
+
+    t = pack.table("T1")
+    t.columns["FINISHED_TIME"] = {"type": "date"}
+    try:
+        where = [{"field": "APPLICATION", "op": "=", "value": "BILLING", "source": "question: BILLING jobs"}]
+        q = "How many BILLING jobs finished on 23 September?"
+        out = check(_plan([_jobs_step(where)]), pack, q, today=TODAY)
+        assert out.ok, out.errors
+        assert out.plan.steps[0].period.field == "FINISHED_TIME" and any("the period on FINISHED_TIME" in f
+                                                                          for f in out.fixed)
+        sql = compile_step(out.plan.steps[0], t)
+        assert "\"FINISHED_TIME\" >= '2026-09-23 00:00' AND \"FINISHED_TIME\" < '2026-09-24 00:00'" in sql
+        plain = check(_plan([_jobs_step(where)]), pack, "How many BILLING jobs failed on 23 September?", today=TODAY)
+        assert plain.plan.steps[0].period.field is None                 # no date named: the time field
+        t.columns["QUEUED_TIME"] = {"type": "date"}                       # two named: the one next to the period's day
+        two = "How many BILLING jobs queued on 22 September finished on 23 September or later?"
+        later = where + [{"field": "FINISHED_TIME", "op": ">=", "value": "2026-09-23 00:00",
+                          "source": "question: finished on 23 September or later"}]
+        step = _jobs_step(later)
+        step["period"] = {"start": "2026-09-22 00:00", "end": "2026-09-23 00:00", "source": "question: on 22 September"}
+        out = check(_plan([step]), pack, two, today=TODAY)
+        assert out.plan.steps[0].period.field == "QUEUED_TIME", out.fixed
+        bad = _jobs_step(where)
+        bad["period"] = {**DAY, "field": "APPLICATION"}
+        out = check(_plan([bad]), pack, q, today=TODAY)
+        assert any("period field APPLICATION is not a date field" in e for e in out.errors)
+    finally:
+        t.columns.pop("FINISHED_TIME", None)
+        t.columns.pop("QUEUED_TIME", None)
+
+
+def test_a_rule_code_adds_is_its_way_round_and_never_the_questions_condition(pack, monkeypatch):
+    """The retail lab: "Orders of the channel TEST (CHANNEL = 'TEST') ... never count them (CHANNEL <> 'TEST')"
+    was added as CHANNEL = 'TEST' (the words before the field said nothing, the operator was not read), and a
+    rule's condition on STATUS hid that the plan had no condition saying the failed ones (36 failed payments
+    answered 2)."""
+    from supagent.governed.validate import check
+    from supagent.knowledge import rulecheck
+
+    rules = [{"title": "QA application", "text": "Jobs of the application ORDERS (APPLICATION = 'ORDERS') are the "
+                                                 "QA team's: never count them (APPLICATION <> 'ORDERS')."},
+             {"title": "Successes", "text": "Exclude the successful runs (STATUS = 'SUCCESS') from the reruns."}]
+    monkeypatch.setattr(rulecheck, "team_rules", lambda: rules)
+    rulecheck._CONCERNS.clear()
+    out = check(_plan([_jobs_step([])]), pack, "How many jobs failed on 23 September?", today=TODAY)
+    assert "q1: APPLICATION != 'ORDERS' (the team's rule \"QA application\")" in out.added
+    assert any("STATUS != 'SUCCESS'" in a for a in out.added)
+    assert any("counts 'fail' ones" in e and "FAILED" in e for e in out.errors)
+    rulecheck._CONCERNS.clear()
+    monkeypatch.undo()
+    rule = next(k for k in pack.knowledge if k.kind == "rule")              # the model's, from a rule: the same
+    taken = check(_plan([_jobs_step([{"field": "STATUS", "op": "=", "value": "SUCCESS", "source": rule.ref}])]), pack,
+                  "How many jobs failed on 23 September?", today=TODAY)
+    assert any("counts 'fail' ones" in e and "from a team rule does not say it" in e for e in taken.errors)
+
+
+def test_a_value_a_rule_leaves_out_is_never_the_one_kept(pack):
+    """The model's condition from a rule that leaves ENV = 'UAT' out, written ENV = 'UAT': turned round, unless
+    the question asks for UAT."""
+    from supagent.governed.validate import check
+
+    rule = next(k for k in pack.knowledge if k.kind == "rule")
+    failed = {"field": "STATUS", "op": "=", "value": "FAILED", "source": "question: failed"}
+    plan = _plan([_jobs_step([failed, {"field": "ENV", "op": "=", "value": "UAT", "source": rule.ref}])])
+    out = check(plan, pack, "How many jobs failed on 23 September?", today=TODAY)
+    assert [(c.op, c.value) for c in plan.steps[0].where if c.field == "ENV"] == [("!=", "UAT")]
+    assert any("written !=" in f for f in out.fixed)
+    asked = _plan([_jobs_step([failed, {"field": "ENV", "op": "=", "value": "UAT", "source": rule.ref}])])
+    check(asked, pack, "How many jobs failed in UAT on 23 September?", today=TODAY)
+    assert [(c.op, c.value) for c in asked.steps[0].where if c.field == "ENV"] == [("=", "UAT")]
+
+
+def test_a_value_said_before_the_tables_subject_is_named(pack):
+    """"How many test orders were placed in September?": the governed plan counted every order (10,579; the
+    retail lab's dev half): a value in any case just before the table's subject is named like "TEST" is; an
+    ordinary word elsewhere is not; a rule's condition with that value says it."""
+    from supagent.governed.validate import check
+
+    failed = {"field": "STATUS", "op": "=", "value": "FAILED", "source": "question: failed"}
+    out = check(_plan([_jobs_step([failed])]), pack, "How many billing jobs failed on 23 September?", today=TODAY)
+    assert any("names 'BILLING'" in e for e in out.errors), out.errors
+    billing = {"field": "APPLICATION", "op": "=", "value": "BILLING", "source": "question: billing jobs"}
+    out = check(_plan([_jobs_step([failed, billing])]), pack, "How many billing jobs failed on 23 September?",
+                today=TODAY)
+    assert not any("names 'BILLING'" in e for e in out.errors), out.errors
+    field = check(_plan([_jobs_step([failed])]), pack, "Billing application: jobs failed on 23 September?",
+                  today=TODAY)
+    assert any("names 'BILLING'" in e for e in field.errors)             # before its field's name: named too
+    side = check(_plan([_jobs_step([failed])]), pack, "How many jobs failed on the billing side on 23 September?",
+                 today=TODAY)
+    assert not any("names 'BILLING'" in e for e in side.errors)          # not before the subject: not named
+    rule = next(k for k in pack.knowledge if k.kind == "rule")
+    prod = {"field": "ENV", "op": "=", "value": "PROD", "source": rule.ref}
+    out = check(_plan([_jobs_step([failed, prod])]), pack, "How many prod jobs failed on 23 September?", today=TODAY)
+    assert not any("names 'PROD'" in e for e in out.errors), out.errors   # a rule's condition with it says it

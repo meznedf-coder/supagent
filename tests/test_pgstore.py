@@ -242,6 +242,33 @@ def test_confirmed_routes_vote_for_their_tables(store):
         assert g.tables[jobs].features.get("neighbors") == 1.0
 
 
+def test_notes_in_the_store_a_personal_one_found_by_its_author_only(store):
+    from superset.extensions import db, security_manager as sm
+
+    from supagent.knowledge import notes as N, pgstore
+    from supagent.knowledge.index import embed_pending, sync
+    from supagent.security import acting_as
+
+    alice = sm.find_user(username="alice").id
+    team = N.add(alice, "Night batch review: the BILLING reruns move to 03:00 from Monday", meeting_on="2026-09-30")
+    mine = N.add(alice, "My reminder: ask about the BILLING reruns budget", scope="user")
+    try:
+        sync(("note:",))
+        embed_pending()
+        pgstore.maintain()
+        with acting_as("bob"):
+            found = {f["ref"]: f for f in pgstore.search("BILLING reruns", 10)}
+            assert f"note:{team.id}#0" in found and f"note:{mine.id}#0" not in found
+            assert found[f"note:{team.id}#0"]["kind"] == "teamnote" and "not verified" in found[f"note:{team.id}#0"]["title"]
+        with acting_as("alice"):
+            refs = {f["ref"] for f in pgstore.search("BILLING reruns", 10)}
+            assert {f"note:{team.id}#0", f"note:{mine.id}#0"} <= refs
+    finally:
+        N.remove(db.session.get(type(team), team.id))
+        N.remove(db.session.get(type(mine), mine.id))
+        sync(("note:",))
+        pgstore.maintain()
+
 def test_kept_in_step_and_the_search_goes_through_it(store):
     from superset.extensions import db
 
@@ -310,3 +337,70 @@ def test_its_connections_never_stay_in_a_failed_transaction(store):
         assert con.execute(text("SELECT 1")).scalar() == 1
     with acting_as("admin"):
         assert pgstore.search("CPU seconds", 3)
+
+
+def test_the_dictionary_search_lists_every_piece_the_store_finds(store):
+    """The Data dictionary's search goes past the 60 pieces each way gives the agent: 90 team memories sharing
+    words are all listed (once each), best first, and the agent's search still gets its best few."""
+    from superset.extensions import db
+
+    from supagent.knowledge import pgstore
+    from supagent.knowledge.index import embed_pending, sync
+    from supagent.knowledge.search import search, search_all
+    from supagent.models import Memory
+    from supagent.security import acting_as
+
+    mems = [Memory(scope="team", kind="rule", status="active", source="manual",
+                   text=f"Reconciliation of the clearing ledger, step {i} of the nightly close (store paging)")
+            for i in range(90)]
+    db.session.add_all(mems)
+    db.session.commit()
+    try:
+        sync(("memory:",))
+        embed_pending()                               # the index's hook brings them into the store
+        pgstore.sync()
+        with acting_as("admin"):
+            every = search_all("clearing ledger reconciliation", cap=500)
+            refs = [r["ref"] for r in every]
+            assert len(refs) == len(set(refs))
+            assert {f"memory:{m.id}" for m in mems} <= set(refs)
+            assert len(pgstore.search("clearing ledger reconciliation", 500)) <= 2 * pgstore.CANDIDATES
+            assert len(search("clearing ledger reconciliation", k=12)) == 12
+    finally:
+        db.session.query(Memory).filter(Memory.text.like("%(store paging)%")).delete(synchronize_session=False)
+        db.session.commit()
+        sync(("memory:",))
+
+
+def test_the_store_lists_a_personal_memory_to_its_author_only(store):
+    """search_all through the store (the production path of the dictionary's search): a personal memory is listed
+    for its author, never for another user; a team one for both."""
+    from superset.extensions import db, security_manager
+
+    from supagent.knowledge import pgstore
+    from supagent.knowledge.index import embed_pending, sync
+    from supagent.knowledge.search import search_all
+    from supagent.models import Memory
+    from supagent.security import acting_as
+
+    alice = security_manager.find_user("alice").id
+    mine = Memory(scope="user", user_id=alice, kind="preference", status="active", source="chat",
+                  text="Wombat totals in thousands (store privacy)")
+    team = Memory(scope="team", kind="rule", status="active", source="manual",
+                  text="Wombat reports go to the team (store privacy)")
+    db.session.add_all([mine, team])
+    db.session.commit()
+    mine_ref, team_ref = f"memory:{mine.id}", f"memory:{team.id}"      # (acting_as has its own session)
+    try:
+        sync(("memory:",))
+        embed_pending()
+        pgstore.sync()
+        for user, sees in (("alice", True), ("bob", False)):
+            with acting_as(user):
+                refs = {r["ref"] for r in search_all("wombat totals reports", cap=500)}
+            assert team_ref in refs
+            assert (mine_ref in refs) is sees, user
+    finally:
+        db.session.query(Memory).filter(Memory.text.like("%(store privacy)%")).delete(synchronize_session=False)
+        db.session.commit()
+        sync(("memory:",))

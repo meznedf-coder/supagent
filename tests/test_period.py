@@ -246,6 +246,13 @@ def test_a_date_alone_on_a_field_with_times_is_sent_back(world):
         assert "e.g. 2026-09-25 02:00" in back
         inlist = refusal(q, "execute_sql", _sql('SELECT COUNT(*) FROM "jobs" WHERE RUN_DATE IN (\'2026-09-23\')'), TODAY)
         assert inlist and "not run: date" in inlist
+        for typed in ("DATE '2026-09-23'", "TIMESTAMP '2026-09-23 00:00:00'"):   # the retail lab: = DATE '...'
+            back = refusal(q, "execute_sql", _sql(f'SELECT COUNT(*) FROM "jobs" WHERE "RUN_DATE" = {typed}'), TODAY)
+            assert back and "not run: date" in back, typed
+        instant = refusal(q, "execute_sql", _sql("SELECT COUNT(*) FROM \"jobs\" WHERE \"RUN_DATE\" = TIMESTAMP "
+                                                 "'2026-09-23 02:00:00' AND \"ts\" >= '2026-09-23 00:00' AND \"ts\" < "
+                                                 "'2026-09-24 00:00'"), TODAY)
+        assert "not run: date" not in (instant or "")                      # an instant: meant
         ranged = refusal(q, "execute_sql", _sql(
             "SELECT COUNT(*) FROM \"jobs\" WHERE \"RUN_DATE\" >= '2026-09-23' AND \"RUN_DATE\" < '2026-09-24' "
             "AND \"ts\" >= '2026-09-23 00:00' AND \"ts\" < '2026-09-24 00:00'"), TODAY)
@@ -256,4 +263,113 @@ def test_a_date_alone_on_a_field_with_times_is_sent_back(world):
     finally:
         db.session.delete(timed)
         db.session.delete(plain)
+        db.session.commit()
+
+
+def _shipments(world):
+    """A shipments index with four dates; its learned time field is DELIVERED_TIME (the first in name order)."""
+    from superset.extensions import db
+    from superset.models.core import Database
+
+    from supagent.knowledge.store import source_for, upsert
+    from supagent.models import Run
+
+    run = Run(kind="learn", reason="test")
+    db.session.add(run)
+    db.session.commit()
+    jobs = db.session.query(Database).filter(Database.database_name == "jobs").one()
+    s = source_for(jobs)
+    upsert(run, s, "index", "", "shipments", {"stats": {"docs": 1000, "time_field": "DELIVERED_TIME"}})
+    for name in ("DELIVERED_TIME", "SHIPPED_TIME", "ORDER_DATE", "PROMISED_DATE"):
+        upsert(run, s, "field", "shipments", name, {"data_type": "date", "stats": {"filled_pct": 100.0}})
+    upsert(run, s, "field", "shipments", "CARRIER", {"data_type": "keyword", "stats": {"values": ["FASTPOST"]}})
+    db.session.commit()
+
+
+def test_the_time_the_question_names_is_the_time_of_its_period(world):
+    from supagent.knowledge.period import named_time_fields, ranges_named, refusal, whole_day
+
+    _shipments(world)
+    q = "Among the parcels shipped on 17 and 18 September, which carrier had the most late deliveries, and how many?"
+    assert whole_day(q, TODAY) is None                                  # two days, not the 18th
+    assert ranges_named(q, TODAY) == [(dt.datetime(2026, 9, 17), dt.datetime(2026, 9, 19))]
+    assert named_time_fields(q, {"shipments"}) == {"shipments": {"SHIPPED_TIME"}}
+    period = "'2026-09-17 00:00' AND \"{f}\" < '2026-09-19 00:00'"
+    by = 'SELECT "CARRIER", COUNT(*) FROM "shipments" WHERE "LATE" = true AND "{f}" >= ' + period + ' GROUP BY "CARRIER"'
+    wrong = refusal(q, "execute_sql", _sql(by.format(f="DELIVERED_TIME")), TODAY)
+    assert wrong.startswith("tool error (not run: period)") and '"SHIPPED_TIME" of shipments' in wrong
+    assert "puts the period on DELIVERED_TIME" in wrong
+    assert refusal(q, "execute_sql", _sql(by.format(f="SHIPPED_TIME")), TODAY) is None
+    both = ("How many of the LYON warehouse's orders of 22 September were shipped only on 24 September or later?")
+    assert named_time_fields(both, {"shipments"}) == {"shipments": {"ORDER_DATE", "SHIPPED_TIME"}}
+    assert refusal(both, "execute_sql", _sql("SELECT COUNT(*) FROM \"shipments\" WHERE \"ORDER_DATE\" >= '2026-09-22 "
+                                             "00:00' AND \"ORDER_DATE\" < '2026-09-23 00:00' AND \"SHIPPED_TIME\" >= "
+                                             "'2026-09-24 00:00'"), TODAY) is None
+    plain = "What is the average delivery time of FASTPOST parcels in September, in days?"
+    assert named_time_fields(plain, {"shipments"}) == {}                # "delivery time" names the measure here
+    assert refusal(plain, "execute_sql", _sql("SELECT AVG(\"DELIVERY_DAYS\") FROM \"shipments\" WHERE \"CARRIER\" = "
+                                              "'FASTPOST' AND \"DELIVERED_TIME\" >= '2026-09-01 00:00' AND "
+                                              "\"DELIVERED_TIME\" < '2026-10-01 00:00'"), TODAY) is None
+    assert named_time_fields("How many parcels were delivered on 23 September?", {"shipments"}) == \
+        {"shipments": {"DELIVERED_TIME"}}
+
+
+def test_each_day_the_question_names_has_its_field():
+    """The retail lab's D4: two dates, each with its event: the period of 22 September is the orders' day."""
+    import datetime as dt
+
+    from supagent.knowledge.period import named_days
+
+    fields = ["ORDER_DATE", "SHIPPED_TIME", "DELIVERED_TIME"]
+    q = "How many of the LYON warehouse's orders of 22 September were shipped only on 24 September or later?"
+    assert named_days(q, fields, TODAY) == {dt.date(2026, 9, 22): {"ORDER_DATE"}, dt.date(2026, 9, 24): {"SHIPPED_TIME"}}
+    assert named_days("Parcels shipped 17-18 September and delivered late?", fields, TODAY) == {
+        dt.date(2026, 9, 17): {"SHIPPED_TIME"}, dt.date(2026, 9, 18): {"SHIPPED_TIME"}}
+    assert named_days("How many parcels on 23 September?", fields, TODAY) == {}
+
+
+def test_an_index_takes_its_datasets_main_time_column(world):
+    from superset.connectors.sqla.models import SqlaTable
+    from superset.extensions import db
+    from superset.models.core import Database
+
+    from supagent.knowledge.learn_indices import prefer_dataset_time
+
+    jobs = db.session.query(Database).filter(Database.database_name == "jobs").one()
+    fstats = {"DELIVERED_TIME": {"type": "date", "min": "2026-08-28", "max": "2026-09-24"},
+              "SHIPPED_TIME": {"type": "date", "min": "2026-08-27", "max": "2026-09-25"}, "CARRIER": {"type": "keyword"}}
+    info = {"time_field": "DELIVERED_TIME", "time_range": ["2026-08-28", "2026-09-24"]}
+    prefer_dataset_time(info, fstats, jobs.id, ("shipments",))
+    assert info["time_field"] == "DELIVERED_TIME"                       # no dataset: the rule's choice
+    ds = SqlaTable(table_name="shipments", database_id=jobs.id, main_dttm_col="SHIPPED_TIME")
+    db.session.add(ds)
+    db.session.commit()
+    try:
+        prefer_dataset_time(info, fstats, jobs.id, ("shipments",))
+        assert info == {"time_field": "SHIPPED_TIME", "time_range": ["2026-08-27", "2026-09-25"],
+                        "time_field_from": "dataset"}
+        from supagent.knowledge.learn_indices import dataset_time_now   # learned before: at once, not at the
+        from supagent.knowledge.store import source_for, upsert            # next profile
+        from supagent.models import Run
+
+        src = source_for(jobs)
+        run = db.session.query(Run).first()
+        idx = upsert(run, src, "index", "", "shipments", {"stats": {"time_field": "DELIVERED_TIME",
+                                                                     "time_range": ["2026-08-28", "2026-09-24"]}})
+        made = [idx] + [upsert(run, src, "field", "shipments", n, {"data_type": st["type"], "stats": {
+            k: v for k, v in st.items() if k != "type"}}) for n, st in fstats.items()]
+        db.session.commit()
+        assert dataset_time_now(idx, src, jobs.id, ("shipments",))
+        assert (idx.stats["time_field"], idx.stats["time_range"]) == ("SHIPPED_TIME", ["2026-08-27", "2026-09-25"])
+        assert not dataset_time_now(idx, src, jobs.id, ("shipments",))
+        for o in made:
+            db.session.delete(o)
+        db.session.commit()
+        ds.main_dttm_col = "CARRIER"                                     # not a date of the index: not taken
+        db.session.commit()
+        other = {"time_field": "DELIVERED_TIME"}
+        prefer_dataset_time(other, fstats, jobs.id, ("shipments",))
+        assert other == {"time_field": "DELIVERED_TIME"}
+    finally:
+        db.session.delete(ds)
         db.session.commit()

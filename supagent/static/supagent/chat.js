@@ -453,6 +453,21 @@
     }
     var q = input.value.trim();
     if (!q) return;
+    var cmd = /^\s*\/(note|mynote)\b[ \t]*:?\s*/i.exec(q);     // "/note ..." (team), "/mynote ..." (me): saved, no LLM
+    if (cmd) {
+      var noteText = q.slice(cmd[0].length).trim(), scope = cmd[1].toLowerCase() === "mynote" ? "user" : "team";
+      if (!noteText) { openNotes(); return; }
+      send.disabled = true;
+      S.chat("POST", "notes", { text: noteText, scope: scope, source: "command" }).then(function (r) {
+        send.disabled = false;
+        var said = r.error ? r.error : (scope === "team" ? "Note saved for the team" : "Note saved for you") +
+          ": \u201c" + (r.note.title || "") + "\u201d (Notes, on the left)";
+        box.appendChild(el("div", { class: "msg assistant notice" + (r.error ? " error" : "") }, [el("div", { class: "bubble", text: said })]));
+        scrollDown();
+        if (!r.error) input.value = "";
+      });
+      return;
+    }
     send.disabled = true;
     S.chat("POST", "ask", { question: q, conversation_id: current }).then(function (r) {
       send.disabled = false;
@@ -515,7 +530,121 @@
       loadMemory();
     });
   });
-  document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") document.getElementById("memory-drawer").hidden = true; });
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape") { document.getElementById("memory-drawer").hidden = true; document.getElementById("notes-drawer").hidden = true; }
+  });
+
+  // ---------------------------------------------------------------- notes (0.7)
+  var notes = { q: "", offset: 0, seq: 0, timer: null };
+  function noteItem(n, admin) {
+    var body = el("div", { class: "note-body" + ((n.text || "").length > 280 ? " folded" : ""), text: n.text || "" });
+    body.addEventListener("click", function () { body.classList.remove("folded"); });
+    var meta = [n.author, n.day, n.scope === "user" ? "for you only" : "team"];
+    if ((n.tags || []).length) meta.push("#" + n.tags.join(" #"));
+    if (n.pinned) meta.push("pinned");
+    if (n.entry_id) meta.push("made a catalog entry");
+    var li = el("li", { class: n.pinned ? "pinned" : "" }, [el("div", { class: "note-title", text: n.title || "Note" }),
+      el("div", { class: "note-meta", text: meta.join(" \u00b7 ") }), body]);
+    var acts = el("div", { class: "note-acts" });
+    if (n.can_change) {
+      acts.appendChild(el("button", { type: "button", class: "linkish", text: "Edit", onclick: function () { editNote(li, n); } }));
+      acts.appendChild(el("button", { type: "button", class: "linkish", text: "Delete", onclick: function () {
+        if (!this.dataset.sure) {                            // a second click deletes (no browser dialog)
+          var b = this;
+          b.dataset.sure = "1"; b.textContent = "Delete: sure?";
+          setTimeout(function () { delete b.dataset.sure; b.textContent = "Delete"; }, 4000);
+          return;
+        }
+        S.chat("DELETE", "notes/" + n.id).then(function () { loadNotes(true); });
+      } }));
+    }
+    if (admin && n.scope === "team") {
+      acts.appendChild(el("button", { type: "button", class: "linkish", text: n.pinned ? "Unpin" : "Pin for everyone",
+        onclick: function () { S.chat("POST", "notes/" + n.id, { pinned: !n.pinned }).then(function () { loadNotes(true); }); } }));
+      if (!n.entry_id) acts.appendChild(el("button", { type: "button", class: "linkish", text: "Make a catalog entry",
+        onclick: function () {
+          S.chat("POST", "notes/" + n.id + "/promote", {}).then(function (r) {
+            if (r.error) { acts.appendChild(el("span", { class: "result bad", text: r.error })); return; }
+            loadNotes(true);
+          });
+        } }));
+    }
+    if (acts.childNodes.length) li.appendChild(acts);
+    return li;
+  }
+  function editNote(li, n) {
+    var title = el("input", { type: "text", maxlength: "300", "aria-label": "Title" });
+    var text = el("textarea", { rows: "6", maxlength: "50000", "aria-label": "The note" });
+    var tags = el("input", { type: "text", maxlength: "200", "aria-label": "Tags" });
+    title.value = n.title || ""; text.value = n.text || ""; tags.value = (n.tags || []).join(", ");
+    var res = el("span", { class: "result" });
+    li.innerHTML = "";
+    [title, text, tags].forEach(function (x) { li.appendChild(x); });
+    li.appendChild(el("div", { class: "note-acts" }, [
+      el("button", { type: "button", class: "btn primary", text: "Save", onclick: function () {
+        S.chat("POST", "notes/" + n.id, { title: title.value, text: text.value, tags: tags.value }).then(function (r) {
+          if (r.error) { res.textContent = r.error; res.className = "result bad"; return; }
+          loadNotes(true);
+        });
+      } }),
+      el("button", { type: "button", class: "btn", text: "Cancel", onclick: function () { loadNotes(true); } }), res]));
+    text.focus();
+  }
+  function loadNotes(reset) {
+    if (reset) notes.offset = 0;
+    var seq = ++notes.seq, ul = document.getElementById("notes-list");
+    var path = "notes?limit=20&offset=" + notes.offset + (notes.q ? "&q=" + encodeURIComponent(notes.q) : "");
+    return S.chat("GET", path).then(function (d) {
+      if (seq !== notes.seq) return;                       // an older search answering late
+      if (reset) ul.innerHTML = "";
+      (d.notes || []).forEach(function (n) { ul.appendChild(noteItem(n, d.is_admin)); });
+      if (!ul.childNodes.length) ul.appendChild(el("li", { class: "muted", text: notes.q ? "No note with these words." : "No note yet." }));
+      document.getElementById("notes-count").textContent = d.total ? "Notes (" + S.num(d.total) + ")" : "Notes";
+      notes.offset = (d.offset || 0) + (d.notes || []).length;
+      document.getElementById("notes-more").hidden = notes.offset >= (d.total || 0);
+      if (d.catalog) {
+        var cat = document.getElementById("notes-catalog");
+        cat.innerHTML = "";
+        d.catalog.forEach(function (e) {
+          var b = el("div", { class: "note-body folded", text: e.text || "" });
+          b.addEventListener("click", function () { b.classList.remove("folded"); });
+          cat.appendChild(el("li", { class: "catalog" }, [el("div", { class: "note-title", text: e.title }),
+            el("div", { class: "note-meta", text: (e.category || "catalog") + " \u00b7 " + S.when(e.updated_at) }), b]));
+        });
+        document.getElementById("notes-catalog-box").hidden = !d.catalog.length;
+      }
+    });
+  }
+  function openNotes() {
+    document.getElementById("notes-drawer").hidden = false;
+    loadNotes(true);
+    document.getElementById("note-text").focus();
+  }
+  function saveNote() {
+    var res = document.getElementById("note-result"), text = document.getElementById("note-text");
+    var fields = ["note-title", "note-tags", "note-day"].map(function (id) { return document.getElementById(id); });
+    S.chat("POST", "notes", { text: text.value, title: fields[0].value, tags: fields[1].value, meeting_on: fields[2].value || null,
+                              scope: document.getElementById("note-scope").value }).then(function (r) {
+      if (r.error) { res.textContent = r.error; res.className = "result bad"; return; }
+      res.textContent = r.note.scope === "team" ? "saved for the team" : "saved for you";
+      res.className = "result good";
+      text.value = "";
+      fields.forEach(function (f) { f.value = ""; });
+      loadNotes(true);
+    });
+  }
+  document.getElementById("open-notes").addEventListener("click", openNotes);
+  document.getElementById("notes-close").addEventListener("click", function () { document.getElementById("notes-drawer").hidden = true; });
+  document.getElementById("note-save").addEventListener("click", saveNote);
+  document.getElementById("note-text").addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); saveNote(); }   // Ctrl+Enter saves
+  });
+  document.getElementById("notes-more").addEventListener("click", function () { loadNotes(false); });
+  document.getElementById("notes-search").addEventListener("input", function () {
+    clearTimeout(notes.timer);
+    var v = this.value.trim();
+    notes.timer = setTimeout(function () { notes.q = v; loadNotes(true); }, 250);
+  });
 
   form.addEventListener("submit", function (ev) { ev.preventDefault(); submit(); });
   input.addEventListener("keydown", function (ev) {

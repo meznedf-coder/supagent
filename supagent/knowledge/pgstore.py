@@ -773,7 +773,7 @@ def _kinds_sql(kinds: tuple[str, ...] | None, skip: tuple[str, ...]) -> tuple[st
 
 
 def _by_words(con: Connection, v: int, st: dict[str, Any], query: str, where: str,
-              params: dict[str, Any], builtin: bool = False) -> list[tuple[int, float]]:
+              params: dict[str, Any], builtin: bool = False, n: int = CANDIDATES) -> list[tuple[int, float]]:
     """Pieces by their words, best first: BM25 over the whole store, then the user's filter (pg_textsearch 0.5 may
     fill a filtered scan short); when the filter leaves few of the BM25_POOL best, PostgreSQL's full-text search
     (filtered first) adds the others. `builtin`: that one only (the chats of one user)."""
@@ -788,9 +788,9 @@ def _by_words(con: Connection, v: int, st: dict[str, Any], query: str, where: st
             f"WITH top AS (SELECT id, terms <@> to_bm25query(:q, :idx) AS s FROM {doc} "
             f"ORDER BY terms <@> to_bm25query(:q, :idx) LIMIT :pool) "
             f"SELECT d.id, -top.s AS s FROM top JOIN {doc} d ON d.id = top.id WHERE {where} AND top.s < 0 "
-            f"ORDER BY top.s LIMIT :n"), {**params, "q": q, "idx": idx, "pool": BM25_POOL, "n": CANDIDATES}).all()
+            f"ORDER BY top.s LIMIT :n"), {**params, "q": q, "idx": idx, "pool": max(BM25_POOL, n), "n": n}).all()
         out = list(dict.fromkeys((r.id, float(r.s)) for r in rows))       # 0.5.x may give a row twice
-        if len(out) >= CANDIDATES // 2:
+        if len(out) >= n // 2:
             return out
     tsq = " | ".join(re.sub(r"[^a-z0-9]", "", w) for w in q.split() if re.sub(r"[^a-z0-9]", "", w))
     if not tsq:
@@ -798,13 +798,13 @@ def _by_words(con: Connection, v: int, st: dict[str, Any], query: str, where: st
     rows = con.execute(text(
         f"SELECT d.id, ts_rank_cd(to_tsvector('simple', d.terms), q, 1) AS s FROM {doc} d, "
         f"to_tsquery('simple', :tsq) q WHERE to_tsvector('simple', d.terms) @@ q AND {where} "
-        f"ORDER BY s DESC LIMIT :n"), {**params, "tsq": tsq, "n": CANDIDATES}).all()
+        f"ORDER BY s DESC LIMIT :n"), {**params, "tsq": tsq, "n": n}).all()
     seen = {i for i, _s in out}
-    return out + [(r.id, float(r.s)) for r in rows if r.id not in seen][:CANDIDATES - len(out)]
+    return out + [(r.id, float(r.s)) for r in rows if r.id not in seen][:n - len(out)]
 
 
 def _by_meaning(con: Connection, v: int, st: dict[str, Any], query: str, where: str,
-                params: dict[str, Any]) -> list[tuple[int, float]]:
+                params: dict[str, Any], n: int = CANDIDATES) -> list[tuple[int, float]]:
     from supagent.knowledge import embeddings as E
 
     if not st.get("dims") or not E.enabled():
@@ -816,7 +816,7 @@ def _by_meaning(con: Connection, v: int, st: dict[str, Any], query: str, where: 
     rows = con.execute(text(
         f"SELECT d.id, d.embedding <=> CAST(:qv AS halfvec({int(st['dims'])})) AS dist FROM {_q(f'doc_{v}')} d "
         f"WHERE d.embedding IS NOT NULL AND d.kind NOT IN ('chat', 'route') AND {where} "
-        f"ORDER BY dist LIMIT :n"), {**params, "qv": _vec_text(qv), "n": CANDIDATES}).all()
+        f"ORDER BY dist LIMIT :n"), {**params, "qv": _vec_text(qv), "n": n}).all()
     return sorted(((r.id, 1.0 - float(r.dist)) for r in rows), key=lambda x: -x[1])   # relaxed order: sorted here
 
 
@@ -874,9 +874,10 @@ def _by_spelling(con: Connection, v: int, query: str, params: dict[str, Any]) ->
 
 
 def search(query: str, k: int, kinds: tuple[str, ...] | None = None, lower: dict[str, int] | None = None,
-           skip: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+           skip: tuple[str, ...] = (), n: int | None = None) -> list[dict[str, Any]]:
     """As search.search: the pieces for a query, best first, each with how it was found ("via": words,
-    meaning, spelling) and its rank in each way ("ranks")."""
+    meaning, spelling) and its rank in each way ("ranks"). `n`: the pieces each way gives (CANDIDATES; more
+    to list every piece found, the Data dictionary's search)."""
     from supagent.knowledge.search import _superset_allowed
 
     st = state()
@@ -893,8 +894,9 @@ def search(query: str, k: int, kinds: tuple[str, ...] | None = None, lower: dict
     matched: dict[int, list[dict]] = {}
     info = st.get("info") if isinstance(st.get("info"), dict) else json.loads(st.get("info") or "{}")
     built = info.get("caps") or {}
-    ways = [("words", lambda: _by_words(con, v, st, query, where, params)),
-            ("meaning", lambda: _by_meaning(con, v, st, query, where, params))]
+    n = max(int(n or CANDIDATES), CANDIDATES)
+    ways = [("words", lambda: _by_words(con, v, st, query, where, params, n=n)),
+            ("meaning", lambda: _by_meaning(con, v, st, query, where, params, n=n))]
     if built.get("pg_trgm") or "caps" not in info:   # near spellings need pg_trgm (built without it: none)
         ways.append(("spelling", lambda: _by_spelling(con, v, query, params)))
     with e.connect() as con:

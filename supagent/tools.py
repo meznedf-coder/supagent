@@ -1099,16 +1099,293 @@ def describe_data(topic: str | None = None, index: str | None = None) -> str:
 @mcp.tool
 def search_knowledge(query: str, kind: str | None = None, limit: int = 8) -> dict:
     """Search what is known about the data and how the team works: metrics and indices (what
-    they mean, labels, fields), catalog notes, rules, glossary and formulas (calculated fields),
-    answers that worked before, team and personal preferences, documents and sites. `kind`:
-    metric, index, note, rule, glossary, formula, recipe, memory or doc (empty: all)."""
+    they mean, labels, fields), catalog notes and the users' notes (meetings, decisions), rules,
+    glossary and formulas (calculated fields), answers that worked before, team and personal
+    preferences, documents and sites. `kind`: metric, index, note (the catalog's notes and the
+    users' notes), rule, glossary, formula, recipe, memory or doc (empty: all)."""
     try:
         with _as_user():
+            from supagent.knowledge.notes import KIND as USERS_NOTES
             from supagent.knowledge.search import search
 
             kinds = (kind,) if kind else None
+            if kind in ("note", "notes", USERS_NOTES):      # "note": a meeting's note as well as the catalog's
+                kinds = ("note", USERS_NOTES)
             found = search(query, k=max(1, min(int(limit or 8), 20)), kinds=kinds)
             return {"query": query, "results": [{**f, "text": (f["text"] or "")[:1200]} for f in found]}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
+
+
+def _find_board(key: Any) -> Any:
+    """A dashboard by id or title (exact, else the only one whose title has it)."""
+    from superset.extensions import db as meta
+    from superset.models.dashboard import Dashboard
+
+    if isinstance(key, int) or str(key).strip().isdigit():
+        return meta.session.get(Dashboard, int(key))
+    title = str(key).strip().strip("'\"").lower()
+    rows = meta.session.query(Dashboard).all()
+    exact = [d for d in rows if (d.dashboard_title or "").lower() == title]
+    part = [d for d in rows if title and title in (d.dashboard_title or "").lower()]
+    return (exact or (part if len(part) == 1 else [None]))[0]
+
+
+def _find_chart(key: Any) -> Any:
+    from superset.extensions import db as meta
+    from superset.models.slice import Slice
+
+    if isinstance(key, int) or str(key).strip().isdigit():
+        return meta.session.get(Slice, int(key))
+    name = str(key).strip().strip("'\"").lower()
+    rows = meta.session.query(Slice).all()
+    exact = [c for c in rows if (c.slice_name or "").lower() == name]
+    part = [c for c in rows if name and name in (c.slice_name or "").lower()]
+    return (exact or (part if len(part) == 1 else [None]))[0]
+
+
+@mcp.tool
+def chart_anomalies(dashboard: str | int | None = None, chart: str | int | None = None, look_now: bool = False) -> dict:
+    """What the nightly look at the team's Superset charts found: for each chart (of a dashboard, one chart, or every
+    chart), its last full day against the same weekday of the 4 weeks before, per series (high, low; "stale": its
+    data stopped), and what the chart shows (AI-written). `dashboard` / `chart`: an id or a title. `look_now`: look
+    again now, as the user (10 charts at most). For "anything unusual on the X dashboard?", "any anomaly in the
+    charts?". Charts the user may not see are left out."""
+    try:
+        with _as_user():
+            from supagent import settings
+            from supagent.agent import now as agent_now
+            from supagent.knowledge import charts as K
+
+            where, slices = "every chart", None
+            if dashboard not in (None, ""):
+                d = _find_board(dashboard)
+                if d is None:
+                    return {"error": f"no dashboard {dashboard!r} (list_dashboards gives their titles and ids)"}
+                where, slices = f"dashboard {d.dashboard_title} (id {d.id})", list(d.slices or [])
+            if chart not in (None, ""):
+                c = _find_chart(chart)
+                if c is None:
+                    return {"error": f"no chart {chart!r} (list_charts gives their names and ids)"}
+                where, slices = f"chart {c.slice_name} (id {c.id})", [c]
+            if slices is None:
+                slices = K.charts_to_scan(int(settings.get("charts.max_charts") or 200))
+            scans = K.scans_of([s.id for s in slices])
+            out, hidden, looked, now = [], 0, 0, agent_now()
+            for s in slices:
+                ok, figures = K.may_see(s)
+                if not ok:
+                    hidden += 1
+                    continue
+                r = scans.get(s.id)
+                if look_now or not figures or r is None or r.scanned_at is None:
+                    if looked >= 10:
+                        out.append({"chart_id": s.id, "chart": s.slice_name, "status": "not looked at",
+                                    "note": "10 charts are looked at now at most: ask for one dashboard or chart"})
+                        continue
+                    res, when = K.look(s, now), "now, as you"
+                    looked += 1
+                else:
+                    res = {"status": r.status, "reason": r.reason, "findings": r.findings or [], "checked": r.checked,
+                           "day": r.day}
+                    when = f"the nightly look ({r.scanned_at:%Y-%m-%d %H:%M} UTC)"
+                out.append({"chart_id": s.id, "chart": s.slice_name, "status": res["status"],
+                            "day": str(res.get("day") or ""), "series_compared": res.get("checked"),
+                            "unusual": [K.describe_finding(f) for f in res.get("findings") or []][:6],
+                            "note": res.get("reason"), "looked": when,
+                            "what_it_shows": (r.understanding if r is not None and r.understanding else None)})
+            out.sort(key=lambda c: (-len(c.get("unusual") or []), c["status"] != "stale"))
+            return {"where": where, "compared": "each chart's last full day against the same weekday of the 4 weeks "
+                    "before (median and median absolute deviation, per series)",
+                    "with_anomalies": sum(1 for c in out if c.get("unusual")),
+                    "stale": sum(1 for c in out if c["status"] == "stale"), "charts": out[:60],
+                    "not_shown": hidden}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
+
+
+@mcp.tool
+def search_notes(words: str = "", since: str | None = None, until: str | None = None, mine: bool = False,
+                 limit: int = 8) -> dict:
+    """The notes people wrote down (what a meeting decided, a fact the team keeps): the team's and the user's own,
+    with every word of `words` (empty: any), of the days `since` to `until` (YYYY-MM-DD: the day a note is about,
+    else the day it was written), newest first; `mine`: the user's own only. A note is someone's, not verified:
+    say whose it is and of which day, never take it as a rule."""
+    try:
+        with _as_user():
+            from supagent.knowledge import notes as N
+
+            uid, _name, admin = _note_user()
+            rows, total = N.listing(uid, words or "", 0, max(1, min(int(limit or 8), 20)), mine=bool(mine),
+                                    since=since or None, until=until or None)
+            names = N.authors({n.user_id for n in rows if n.user_id})
+            return {"total": total, "about": "notes are not verified: give their author and day",
+                    "notes": [_note_view(n, uid, admin, names) for n in rows]}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
+
+
+def _note_user() -> tuple[int | None, str, bool]:
+    """(the user's id, their username, admin) inside _as_user()."""
+    from flask import g
+    from superset.extensions import security_manager
+
+    user = getattr(g, "user", None)
+    try:
+        from supagent.views import ADMIN_VIEW
+
+        admin = bool(security_manager.is_admin()) or bool(security_manager.can_access("can_write", ADMIN_VIEW))
+    except Exception:  # pylint: disable=broad-except
+        admin = False
+    return getattr(user, "id", None), str(getattr(user, "username", "") or ""), admin
+
+
+def _note_view(n: Any, me: int | None, admin: bool, names: dict[int, str], chars: int = 2000) -> dict:
+    from supagent.knowledge import notes as N
+
+    text = n.text or ""
+    return {"id": n.id, "title": n.title, "author": names.get(n.user_id, "?"), "day": N.day_of(n).isoformat(),
+            "for": "the team" if n.scope == "team" else "its author only", "tags": n.tags or [],
+            "can_change": N.can_change(n, me, admin), "earlier_versions": len(n.versions or []),
+            "text": text[:chars] + (" …" if len(text) > chars else "")}
+
+
+def _notes_changed() -> None:
+    """The notes' search pieces follow at once: the next search finds the change."""
+    from superset.extensions import db
+
+    try:
+        from supagent.knowledge.index import sync
+
+        sync(("note:",))
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+
+
+def _note_to_change(note_id: Any) -> tuple[Any, int | None, str, bool, dict[int, str], str | None]:
+    """(the note, the user's id, username, admin, its author's name, why it cannot be changed or None)."""
+    from superset.extensions import db
+
+    from supagent.knowledge import notes as N
+    from supagent.models import Note
+
+    me, name, admin = _note_user()
+    n = db.session.get(Note, int(note_id))
+    if n is None or not (n.scope == "team" or n.user_id == me):
+        return None, me, name, admin, {}, f"no note {note_id} this user may read (search_notes finds them)"
+    names = N.authors({n.user_id})
+    if not N.can_change(n, me, admin):
+        return n, me, name, admin, names, (f"note {note_id} is {names.get(n.user_id, '?')}'s: only its author, or an "
+                                           "admin for a team note, may change it")
+    return n, me, name, admin, names, None
+
+
+@mcp.tool
+def read_note(note_id: int) -> dict:
+    """One note in full (a team note, or the user's own): its text, author, day, tags, for whom, whether the
+    user may change it and how many earlier versions it has. A note is someone's, not verified."""
+    try:
+        with _as_user():
+            from supagent.knowledge import notes as N
+            from supagent.models import Note
+
+            me, _name, admin = _note_user()
+            n = N.visible(me).filter(Note.id == int(note_id)).first()
+            if n is None:
+                return {"error": f"no note {note_id} this user may read (search_notes finds them)"}
+            return {"note": _note_view(n, me, admin, N.authors({n.user_id}), chars=20000)}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
+
+
+@mcp.tool
+def add_note(text: str, title: str | None = None, personal: bool = False, tags: str | None = None,
+             day: str | None = None) -> dict:
+    """Write a note the user asks for (what a meeting decided, a fact to keep), in their words: for the team,
+    or for the user only (personal=true when they say "for me", "my note", "personal", "private"). day: the day
+    it is about (a meeting's, YYYY-MM-DD) when said; tags: a few words, comma-separated. Never add a fact the
+    user did not give. Returns the saved note: say its title and for whom."""
+    from supagent.knowledge import notes as N
+
+    try:
+        with _as_user():
+            me, name, admin = _note_user()
+            if me is None:
+                return {"error": "no user: a note is written by a user"}
+            n = N.add(me, text, title=title, scope="user" if personal else "team", tags=tags, meeting_on=day or None,
+                      source="agent", by=name)
+            _notes_changed()
+            return {"saved": _note_view(n, me, admin, N.authors({n.user_id}))}
+    except N.NoteError as ex:
+        return {"error": str(ex)}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
+
+
+@mcp.tool
+def change_note(note_id: int, text: str | None = None, add_text: str | None = None, title: str | None = None,
+                tags: str | None = None, day: str | None = None, personal: bool | None = None,
+                undo: bool = False) -> dict:
+    """Change a note the user asks to change: add_text adds a paragraph at its end (what is there stays); text
+    replaces its whole text; title, tags (comma-separated), day (YYYY-MM-DD; "" removes it), personal (true: its
+    author's only; false: the team's) change those; undo=true puts back the version before its last change. Only
+    the user's own notes, and a team note for an admin. Its earlier versions are kept. Returns the note before
+    and after: say what changed."""
+    from supagent.knowledge import notes as N
+
+    try:
+        with _as_user():
+            n, me, name, admin, names, why = _note_to_change(note_id)
+            if why:
+                return {"error": why}
+            before = _note_view(n, me, admin, names, chars=4000)
+            if undo:
+                N.undo(n, by=name)
+            else:
+                values: dict[str, Any] = {}
+                if text is not None and str(text).strip():
+                    values["text"] = str(text)
+                if add_text and str(add_text).strip():
+                    values["text"] = f"{str(values.get('text') or n.text or '').rstrip()}\n\n{str(add_text).strip()}"
+                if title is not None:
+                    values["title"] = title
+                if tags is not None:
+                    values["tags"] = tags
+                if day is not None:
+                    values["meeting_on"] = day or None
+                if personal is not None:
+                    if n.user_id != me:
+                        return {"error": "only its author makes a note personal or the team's"}
+                    values["scope"] = "user" if personal else "team"
+                if not values:
+                    return {"error": "nothing to change: give text, add_text, title, tags, day, personal or undo"}
+                N.update(n, values, by=name)
+            _notes_changed()
+            return {"before": before, "after": _note_view(n, me, admin, names, chars=4000)}
+    except N.NoteError as ex:
+        return {"error": str(ex)}
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
+
+
+@mcp.tool
+def delete_note(note_id: int, confirmed: bool = False) -> dict:
+    """Delete a note the user asks to delete. Without confirmed, nothing is deleted: the note is returned to
+    show the user (its title, author and day) with the question whether to delete it. Call with confirmed=true
+    only in the answer to their yes. Only the user's own notes, and a team note for an admin."""
+    from supagent.knowledge import notes as N
+
+    try:
+        with _as_user():
+            n, me, _name, admin, names, why = _note_to_change(note_id)
+            if why:
+                return {"error": why}
+            shown = _note_view(n, me, admin, names, chars=600)
+            if not confirmed:
+                return {"to_confirm": shown, "about": "not deleted: ask the user whether to delete this note"}
+            N.remove(n)
+            _notes_changed()
+            return {"deleted": {k: shown[k] for k in ("id", "title", "author", "day", "for")}}
     except Exception as ex:  # pylint: disable=broad-except
         return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
 

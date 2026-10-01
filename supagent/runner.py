@@ -5,6 +5,7 @@ and the files it made (kept in the database: a Celery worker may run on another 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import mimetypes
 import os
@@ -380,6 +381,20 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
                     answer, trace = agent.ask(question, history)
             finally:
                 agent.close()
+            if not hasattr(agent, "second_opinion"):     # the classic pipeline's figures: a second computation
+                try:                                     # (test); the governed one checked its plan already
+                    from supagent.crosscheck import check as cross_check
+
+                    with llm_task("answer", user_id=user_id, message_id=message_id):
+                        answer, found = cross_check(username, question, history, answer, trace, should_stop)
+                    if found is not None:
+                        trace.append({"tool": "cross_check", "called": "cross_check", "status": "done", "args": {},
+                                      "seconds": 0, "result": json.dumps(found, default=str)[:4000]})
+                except Cancelled:
+                    raise
+                except Exception:  # pylint: disable=broad-except   (the answer as it was)
+                    db.session.rollback()
+                    log.warning("supagent: the cross-check of answer %s failed", message_id, exc_info=True)
             try:
                 from supagent.tools_superset import drop_unused_datasets
 

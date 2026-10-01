@@ -96,7 +96,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.6.0-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.7.0-py3-none-any.whl          # Superset 6.1: nothing else to install
 ```
 
 One line in `superset_config.py` registers it. It holds no logic:
@@ -486,7 +486,9 @@ there, synonyms, relations marked Wrong: those objects stay, with their learned 
 `superset supagent learn --plan` tells what today's run would do, without reading any data:
 objects due, requests, minutes at the rate limit. **Learn now** on the settings page, or
 `superset supagent learn`, runs one at once. Limit what is learned with `learn.indices` /
-`learn.indices_exclude` and `learn.metrics` / `learn.metrics_exclude` (patterns with `*`).
+`learn.indices_exclude` and `learn.metrics` / `learn.metrics_exclude` (patterns with `*`). These say
+what the dictionary holds: an index or a metric learned before that a new pattern leaves out is
+marked gone at the next run (the agent no longer sees it), not only skipped.
 
 Lab measurement (Raspberry Pi 4, first 0.2 run): 6 indices and 95 fields, 28 metrics with 94
 labels, and a federated database of 4 tenants with 35 metrics. The lab's metrics stopped on 25
@@ -753,8 +755,9 @@ writes queries; each answer goes through:
 5. **the answer**: written from a figures sheet made by code, its numbers checked, with a line saying how it
    was counted (each condition with its source).
 
-Charts and dashboards to save, files, e-mails, screenshots, status and "is it normal" questions, questions for
-another MCP source, and a question no plan passed the checks for, go to the classic agent (its steps say so).
+Charts and dashboards to save, files, e-mails, screenshots, status and "is it normal" questions, notes,
+questions for another MCP source, and a question no plan passed the checks for, go to the classic agent (its
+steps say so).
 With `pip install "supagent[graph]"` the pipeline runs as a LangGraph graph and other MCP servers can be added
 (`mcp.servers`, see INSTALL.txt).
 
@@ -803,7 +806,74 @@ the LLM: functional or technical, its subjects, the applications and the compone
 relations to other items and tables (about, depends on, part of, explains, runs on). The values come first from
 what people wrote (the catalog's categories, the values of application-like fields); the LLM may propose new ones.
 Tags the LLM is fairly sure of, on approved values, are used at once; an admin reviews the new values, the unsure
-tags and the relations that say two items are the same. The router and the search read the approved ones.
+tags and the relations that say two items are the same. The router and the search read the approved ones. In
+*Data dictionary → Knowledge → Categories* an admin also adds a value by hand (used at once) and, with Edit,
+changes a value's category (subject, application, component) as well as its text, its description and its other
+names; a value moved or renamed onto one that exists is merged with it, items included. A value can be **part of
+several others** (a jvm of two applications and four components): its items count as about each of them, the
+LLM proposes these relations for new values and for known ones (To review), and **Categories → System map**
+draws the whole system from them, with the items about each value that exist now. Categories of your own
+(server, environment, team...) are added there too, each with the field names its values are read from in the
+data (`categories.fields`): their values are kept with where they come from, and two such fields of one index
+show which values go together, proposed as "part of" for an admin to approve. In To review every suggestion can
+be approved, rejected or changed first (Change…); `categories.review_all` (on by default) makes every category
+and relation the LLM finds wait for an admin, even the ones it is sure of; off, what it is sure of is used at
+once (the 0.6 behaviour).
+
+**Search** (*Data dictionary → Search*, 0.7): everything the search finds for the words, as the agent searches
+(at most 500, 20 per page). Each name opens the item: charts and dashboards in Superset, everything else in the
+dictionary's side panel, at an address (`…/supagent/dictionary/#open/<item>`) that can be shared with someone
+who may read it.
+
+## Notes (0.7)
+
+What a meeting decided, a fact the team must not lose: any user of the agent writes it down in a few seconds.
+
+* **Where**: the chat's **Notes** button (on every Superset page, in the panel too): write (Ctrl+Enter saves),
+  search, read the team's notes and the catalog's; or type `/note ...` in the question box (for the team) or
+  `/mynote ...` (for you): saved at once, the LLM is not asked. *Data dictionary → Knowledge → Notes* lists them
+  with pages.
+* **Who reads them**: a team note, every user of the agent; a personal one, its author only (an admin does not
+  see it). Its author changes or deletes it; an admin may change, pin (first for everyone) or delete a team note,
+  or make a **catalog entry** of it (classification note: verified from then on).
+* **The agent** finds the notes like the documents (the knowledge search, and `search_notes` with words and days
+  for "what did we decide on Monday"), and always says whose note it is and of which day: a note is **not
+  verified**. It is never a team rule, and never the source of a query's condition (the check of conditions
+  leaves note lines out). The daily classification includes team notes.
+* **The agent as a notes assistant**: ask it in the chat, in your words: "note that the ops meeting moved the
+  express orders to FASTPOST from 18 September 14:00", "add to my note about the carriers that QUICKSHIP is back
+  on the 21st", "show my notes of last week", "undo the last change to that note", "delete my note about the
+  carriers review". It acts as you, with the page's rights: it reads the team's notes and your own, writes a
+  team note (or a personal one when you say "for me", "my note", "personal"), changes your notes (an admin, the
+  team's too) and keeps each note's earlier versions (`undo` puts the last one back). It deletes a note only in
+  its answer to your **yes**: it shows the note first and asks. A request about notes is given the notes tools
+  only (no data queries), and an answer that says a note was saved, changed or deleted while no such tool call
+  did it is sent back once, then marked "no note was ... in this answer".
+
+## Charts and dashboards, looked at every night (0.7)
+
+With the nightly Context build (`charts.scan`), the agent looks at the team's Superset charts as the learning
+user, through Superset's own chart data API (the dataset's permissions and row-level security apply):
+
+* **what the data did**: each chart's metrics per day over the last five weeks, with the chart's own dimensions
+  and conditions, on the dataset's main time column; the last full day before "now" against the same weekday of
+  the four weeks before, per series (median and median absolute deviation, as `compare_to_usual`): **high**,
+  **low**, normal. A difference of a few events is not unusual; a series that is a count without a row on a day
+  the data has counts 0 (no breach is 0 breaches); data that **stopped** (the dataset's own last day is before)
+  is said as such, never as "low". A chart left out says why: raw records, no metric, no time column, a fixed
+  period that ended, its dataset gone.
+* **what it shows**, in words: written by the LLM from what the chart reads (its metrics and dimensions with the
+  dictionary's descriptions, its conditions, its dashboards), marked AI-written, written again only when that
+  changes; one Context facts page per dashboard (its charts, what each shows, the last check).
+* **the agent** answers "is there anything unusual on the X dashboard?" with `chart_anomalies` (a dashboard, a
+  chart, or every chart; `look_now` looks again as the user): only charts the user may see; on a dataset with
+  row-level security for that user, a look now as them (written nowhere). The charts' pieces in the knowledge
+  search and the dashboard pages say only whether something was unusual, never the figures.
+* **gentle**: `charts.max_charts` (200, the charts on dashboards first), `charts.minutes` (20),
+  `charts.max_requests_per_minute` (12 per database), one query per dataset for its first and last day; a
+  database that answers it is overloaded (a circuit breaker, 429...) `learn.stop_after_errors` times in a row is
+  left for the next night; Stop; the LLM after the people, `charts.max_llm_calls` (40) a night.
+  `superset supagent charts [--scan] [--understand] [--chart N]` runs it now and prints what was found.
 
 ## Learning from the chats
 
@@ -830,9 +900,17 @@ tags and the relations that say two items are the same. The router and the searc
   question and the metrics or indices its successful queries read; the next questions with those
   words find them first. *Not helpful* takes them back; one that sent the agent to data that was
   not there (an error, no rows, while the answer came from elsewhere) loses a use; one no answer
-  used for 60 days, or to a metric or index that is gone, is not used. They are not listed with
-  the learned answers; `learn.associations = false` switches this off. Learned answers and
-  memories that name a metric or index that no longer exists are not given to the agent.
+  used for 60 days, or to a metric or index that is gone, is not used. *Data dictionary → Learned
+  by the agent → Where the data of the questions was* (0.7) shows them one row per table: the
+  words that led there, a word that also led to other tables or databases said so (such a word
+  alone does not say where the data is), the answers and the Helpful among them, with a search, a
+  database filter and pages; an admin's *Wrong* takes a word away from a table.
+  `learn.associations = false` switches this off. Learned answers and memories that name a metric
+  or index that no longer exists are not given to the agent. Measured (0.7, the lab's two
+  benchmarks, the questions of one half never teaching): "Where the data is" finds the right table
+  first (MRR) 0.45-0.53 without what the answers taught, 0.82-0.88 with it; weighting the Helpful
+  answers more, a word's specificity, two-word phrases, a cap per table, or the tables of the most
+  similar earlier questions (meaning) did no better on both halves, so the learning stays as it is.
 * **What users state**: a message that tells something about the data ("KO means failed") is read
   for durable facts and rules like the explicit ones below (team ones wait for an admin). So is
   the answer to a question the agent asked back ("the killed jobs too": what the word meant), and
@@ -864,6 +942,16 @@ tags and the relations that say two items are the same. The router and the searc
   question gets at most `memory.prompt_chars` characters of them (rules, then preferences, then
   facts); the facts left out are still found by the knowledge search. Users see and delete
   theirs with the chat's *Memory* button; admins review the team's in *Data dictionary → To review*.
+
+### A second, independent computation (0.7, a test: off)
+
+`agent.cross_check` (off): when the classic agent answers with figures from its own queries, the governed
+pipeline computes the same question its own way, and the answer says so when its figures differ from the
+answer's headline figures. Measured on the lab's 112 labelled classic answers of the domain benchmark (56
+questions; 21 answers wrong): it decided 45% of them (the governed side gives the rest to the classic agent or
+asks back); it disagreed with 4 of the 21 wrong answers (19%) and with 12 of the 91 right ones (13%): a
+disagreement meant a wrong answer 1 time in 4, and an agreement a right one 85% of the time (81% without the
+check), for 24 s more per answer (median). Not worth it as it is: it stays off.
 
 ## Measuring it
 
@@ -1009,6 +1097,8 @@ columns of newer versions.
 | supagent_route | per answer: the tables shown, chosen and read, and the router's route (0.6) |
 | supagent_facet, supagent_tag, supagent_link, supagent_classified | the categories, the items' tags and relations, what was classified (0.6) |
 | supagent_item_use | which learned items each answer was given and used (their ranking, 0.6) |
+| supagent_note | the notes users write (team or personal, 0.7) |
+| supagent_chart_scan | per chart: the nightly look's findings and what it shows (0.7) |
 | supagent_meta | the schema version and the workers' heartbeats |
 | supagent_document | the 0.1 catalog, kept as a backup after the upgrade |
 
@@ -1041,6 +1131,7 @@ superset supagent knowledge [--changes DAYS]
 superset supagent describe "words" [--name INDEX_OR_METRIC] [--user U]   what the agent reads
 superset supagent ask "question" --user U [--pipeline classic|governed]  an answer in this process
 superset supagent classify [--minutes N] [--limit N]                      categories of the knowledge, now
+superset supagent charts [--scan] [--understand] [--chart N]              the nightly look at the charts, now (0.7)
 superset supagent store status | rebuild | sync | wipe [--yes] | search "words" [--user U] [--chats]
                                                                           the knowledge store (0.6)
 superset supagent grant USER...

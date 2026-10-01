@@ -63,6 +63,11 @@ SPECS: list[Spec] = [
          "charts, observability, infrastructure) by its meaning, the knowledge it touches and the routes people "
          "confirmed: the route chooses the knowledge given first, the tools and a short instruction; not sure: "
          "the normal way"),
+    Spec("agent.cross_check", False, "bool", "Test: an answer of the classic agent with figures is computed a second "
+         "time, independently (the governed pipeline's checked plan, its queries built by code); when the figures "
+         "differ, the answer says so with the other ones (the answer comes later: the time of a second computation)"),
+    Spec("agent.cross_check_seconds", 180, "int", "Seconds the second computation of agent.cross_check may take; later: "
+         "no second opinion"),
     Spec("router.min_confidence", "medium", "choice", "The router's confidence needed to use a route (below it: "
          "the normal way)", choices=("low", "medium", "high")),
     Spec("agent.pipeline", "classic", "choice", "How questions are answered: classic (the model writes the queries, "
@@ -92,9 +97,10 @@ SPECS: list[Spec] = [
     Spec("learn.user", "", "str", "Superset user the learner reads the data as (empty: the first Admin)"),
     Spec("learn.databases", [], "list", "Database names or ids to learn (empty: every osagg and promagg database)"),
     Spec("learn.indices", [], "list", "Only these indices (patterns with *, e.g. batch-jobs*); empty: every index "
-         "the OpenSearch database lists"),
+         "the OpenSearch database lists. An index learned before that the patterns leave out is marked gone"),
     Spec("learn.indices_exclude", [], "list", "Never these indices (patterns with *)"),
-    Spec("learn.metrics", [], "list", "Only these metrics (patterns with *, e.g. node_*, batch_*); empty: every metric"),
+    Spec("learn.metrics", [], "list", "Only these metrics (patterns with *, e.g. node_*, batch_*); empty: every "
+         "metric. A metric learned before that the patterns leave out is marked gone"),
     Spec("learn.metrics_exclude", [], "list", "Never these metrics (patterns with *, e.g. go_*)"),
     Spec("learn.max_minutes", 30, "int", "Stop a learning run after this many minutes (the next run continues)"),
     Spec("learn.max_objects", 20000, "int", "Metrics or indices listed per database at most"),
@@ -121,10 +127,37 @@ SPECS: list[Spec] = [
     Spec("context.enabled", True, "bool", "Build the Context every night: the system's functional and technical "
          "documentation, from the documents, the catalog, the team memory, the data dictionary and the Helpful answers"),
     Spec("context.hour", 4, "int", "Hour of the nightly Context build (after the day's learning run)"),
+    Spec("charts.scan", True, "bool", "With the nightly Context build: look at the team's Superset charts (their last "
+         "full day against the same weekday of the 4 weeks before, per series: high, low, data stopped) and write "
+         "what each shows; the agent answers \"anything unusual on the dashboard\" from it (chart_anomalies)"),
+    Spec("charts.max_charts", 200, "int", "Charts looked at per night at most (the ones on dashboards first)"),
+    Spec("charts.minutes", 20, "int", "Minutes the nightly look at the charts may take at most"),
+    Spec("charts.max_requests_per_minute", 12, "int", "Chart queries a minute at most per database during the nightly "
+         "look (a database that answers it is overloaded learn.stop_after_errors times in a row is left for the "
+         "next night)"),
+    Spec("charts.max_llm_calls", 40, "int", "LLM calls a night at most to write what the charts show (written again "
+         "only for a chart that changed)"),
     Spec("context.max_llm_calls", 12, "int", "LLM calls of a Context build at most (its summary pages: only the ones "
          "whose sources changed are written again; the facts pages need no LLM)"),
     Spec("knowledge.apply_background", True, "bool", "A save in the Data dictionary answers at once; the catalog "
          "applied to the dictionary, the searchable pieces and their vectors follow in the background (seconds)"),
+    Spec("categories.custom", [], "list", "Categories of your own besides subject, application and component (e.g. "
+         "server, environment, team): their values are added by hand, read from the data's fields "
+         "(categories.fields) and proposed by the LLM, like the others"),
+    Spec("categories.fields", {"application": r"^(application|app|app_name|service|service_name|system|platform)$",
+                               "component": r"^(component|components|module)$"}, "json",
+         "Where the values of a category are read in the data: category -> a regular expression of field (or "
+         "label) names, e.g. {\"server\": \"^(server|host|hostname|node)$\"}; the values become approved "
+         "values of that category (where they come from is kept), and two such fields of one index tell which "
+         "values go together (proposed as 'part of', to approve)"),
+    Spec("categories.review_all", True, "bool", "Every category the LLM gives an item and every relation it finds "
+         "between items waits for an admin (To review), even the ones it is sure of (the default since 0.7); off: "
+         "those it is sure of (medium, high) are used at once on approved values, as in 0.6. Values and their "
+         "'part of' relations always wait"),
+    Spec("categories.max_values", 1000, "int", "A field with more values than this is not read as a list of "
+         "category values (applications: 60 at most)"),
+    Spec("categories.relation_min_docs", 5, "int", "Documents two values must share in an index to be proposed "
+         "as one part of the other"),
     Spec("learn.classify_per_run", 400, "int", "Knowledge items the daily learning classifies at most (their "
          "categories: aspect, subjects, applications, components, and the relations their texts state); the next "
          "run continues"),

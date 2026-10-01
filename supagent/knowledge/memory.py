@@ -23,8 +23,9 @@ from supagent.models import Conversation, Memory, Message
 
 log = logging.getLogger(__name__)
 SIGNALS = re.compile(r"\b(always|never|from now on|remember|by default|in future|keep in mind|i prefer|we prefer|"
+                     r"memory|memori[sz]e|note (?:it|that)|when i say|you should know|"
                      r"toujours|jamais|d[ée]sormais|dor[ée]navant|retiens|souviens|par d[ée]faut|je pr[ée]f[èe]re|"
-                     r"nous pr[ée]f[ée]rons|à l'avenir)\b", re.I)
+                     r"nous pr[ée]f[ée]rons|à l'avenir|m[ée]moire|m[ée]moris\w*|quand je dis|tu dois savoir)\b", re.I)
 PROMPT = """You keep the memory of a data assistant used by a team. From the exchange below, list
 only DURABLE points worth remembering for later questions: how this user or the team wants
 answers (format, units, sorting, time zone, what 'yesterday' or 'today' means, environments to

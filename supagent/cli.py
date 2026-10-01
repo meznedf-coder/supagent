@@ -435,6 +435,39 @@ def classify(minutes: int, limit: int) -> None:
     click.echo(json.dumps(out, indent=2, default=str))
 
 
+@supagent.command(help="The team's Superset charts: look at their last full day against the 4 weeks before "
+                  "(--scan), write what they show (--understand, LLM), then print what was found")
+@click.option("--scan", "do_scan", is_flag=True, help="Look at the charts now (as the learning user)")
+@click.option("--understand", "do_understand", is_flag=True, help="Write what the charts show (LLM; only changed ones)")
+@click.option("--chart", "chart_ids", type=int, multiple=True, help="Only this chart (repeat)")
+@click.option("--minutes", type=int, default=None, help="At most (default charts.minutes)")
+@with_appcontext
+def charts(do_scan: bool, do_understand: bool, chart_ids: tuple[int, ...], minutes: int | None) -> None:
+    from superset.extensions import db
+
+    from supagent.knowledge import charts as K
+    from supagent.models import ChartScan
+
+    if do_scan:
+        click.echo(json.dumps(K.scan(seconds=minutes * 60 if minutes else None, chart_ids=list(chart_ids) or None),
+                              default=str))
+    if do_understand:
+        from supagent.llm import LLM, background, llm_task
+
+        with background(), llm_task("charts"):
+            click.echo(json.dumps(K.understand(LLM(), force=bool(chart_ids)), default=str))
+    q = db.session.query(ChartScan).order_by(ChartScan.chart_id)
+    if chart_ids:
+        q = q.filter(ChartScan.chart_id.in_(list(chart_ids)))
+    for r in q:
+        click.echo(f"chart {r.chart_id}: {r.status} {r.day or ''} {r.checked or 0} series"
+                   + (f" ({r.reason})" if r.reason else ""))
+        for f in r.findings or []:
+            click.echo(f"    {K.describe_finding(f)}")
+        if r.understanding:
+            click.echo(f"    shows: {' '.join(r.understanding.split())[:300]}")
+
+
 @supagent.group(help="The knowledge store in PostgreSQL (BM25, near spellings, vectors, chats)")
 def store() -> None:
     pass

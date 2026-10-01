@@ -94,6 +94,57 @@ def _lexical(q: Any, terms: list[str], limit: int = 50) -> list[int]:
     return [cid for _h, cid in sorted(scored, key=lambda x: -x[0])[:limit]]
 
 
+def search_all(query: str, kinds: tuple[str, ...] | None = None, cap: int = 500) -> list[dict[str, Any]]:
+    """Every piece the search finds for a query (at most `cap`), best first: the first ones as search() orders
+    them for the agent (reranked when a reranker is set), then the others as the ways of searching rank them.
+    For the Data dictionary's search, which lists them all, page by page."""
+    from supagent.knowledge import rerank as R
+
+    found = _search(query, cap, kinds, None, (), n=cap)
+    if not found or not R.enabled():
+        return found
+    return R.rerank(query, found)                 # the first rerank.depth reordered, the others after them
+
+
+ITEM_REF = re.compile(r"(object|entry|memory|doc|note|context|recipe):\d+")
+
+
+def link_of(ref: str) -> dict[str, str] | None:
+    """Where a piece is read or edited: a chart or a dashboard in Superset, else its place in the Data dictionary
+    (#open/<ref>, which the page opens: an index or a metric, a catalog entry, a note, a document...)."""
+    from urllib.parse import quote
+
+    kind, _, rest = (ref or "").partition(":")
+    if kind == "superset":
+        parts = rest.split(":")
+        if len(parts) >= 2 and parts[1].isdigit():
+            if parts[0] == "chart":
+                return {"href": f"/explore/?slice_id={parts[1]}", "where": "superset"}
+            if parts[0] == "dashboard":
+                return {"href": f"/superset/dashboard/{parts[1]}/", "where": "superset"}
+        return None
+    base = rest.split("#", 1)[0]
+    if kind in ("object", "entry", "memory", "doc", "note", "context", "recipe") and base.split(":")[0].isdigit():
+        return {"href": "#open/" + quote(f"{kind}:{base.split(':')[0]}", safe=""), "where": "dictionary"}
+    return None
+
+
+def item(ref: str) -> dict[str, Any] | None:
+    """One piece of the knowledge as the search sees it (its parts joined), for a user who may search it."""
+    ref = (ref or "").strip()
+    if not ITEM_REF.fullmatch(ref):
+        return None
+    q = _allowed_query().filter(or_(Chunk.ref == ref, Chunk.ref.like(f"{ref}#%")))
+    rows = sorted(q.limit(200).all(), key=lambda c: (len(c.ref), c.ref))
+    rows = [c for c in rows if _superset_allowed(c)]
+    if not rows:
+        return None
+    first = rows[0]
+    parts = sorted(rows, key=lambda c: int(c.ref.rsplit("#", 1)[1]) if c.ref.rsplit("#", 1)[-1].isdigit() else 0)
+    return {"ref": ref, "kind": first.kind, "title": first.title, "text": "\n\n".join(c.text or "" for c in parts),
+            "link": link_of(ref)}
+
+
 def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = None,
            lower: dict[str, int] | None = None, skip: tuple[str, ...] = (), rerank: bool = True) -> list[dict[str, Any]]:
     """The pieces for a query, best first. `lower`: kinds counted as found that many places lower
@@ -109,27 +160,27 @@ def search(query: str, k: int | None = None, kinds: tuple[str, ...] | None = Non
 
 
 def _search(query: str, k: int, kinds: tuple[str, ...] | None, lower: dict[str, int] | None,
-            skip: tuple[str, ...]) -> list[dict[str, Any]]:
+            skip: tuple[str, ...], n: int | None = None) -> list[dict[str, Any]]:
     from supagent.knowledge import embeddings as E, pgstore
 
     lower = {"context": CONTEXT_PLACES} if lower is None else lower
     if pgstore.active():                          # the knowledge store (0.6): BM25, near spellings, pgvector
         try:
-            return pgstore.search(query, k, kinds=kinds, lower=lower, skip=skip)
+            return pgstore.search(query, k, kinds=kinds, lower=lower, skip=skip, n=n)
         except Exception as ex:  # pylint: disable=broad-except   (the search of 0.5 answers)
             log.warning("supagent search: the store failed, searched without it: %s", str(ex)[:300])
     q = _allowed_query(kinds)
     if skip:
         q = q.filter(Chunk.kind.notin_(list(skip)))
     found: list[tuple[int, int, str]] = []                # (chunk, rank, list)
-    by_words = _lexical(q, _terms(query))
+    by_words = _lexical(q, _terms(query), max(50, int(n or 50)))
     found += [(cid, rank, "words") for rank, cid in enumerate(by_words)]
     by_meaning: set[int] = set()
     if E.enabled():
         try:
             allowed = {cid for (cid,) in q.with_entities(Chunk.id)}
             qv = E.embed([query])[0]
-            hits = E.nearest(qv, allowed, 50)
+            hits = E.nearest(qv, allowed, max(50, int(n or 50)))
             floor = max(VECTOR_FLOOR, (hits[0][1] - VECTOR_MARGIN) if hits else 0.0)
             words = set(by_words)
             for rank, (cid, score) in enumerate(hits):

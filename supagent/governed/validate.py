@@ -70,6 +70,7 @@ class Checked:
     warnings: list[str] = field(default_factory=list)
     unknown_values: list[tuple[str, str, Any]] = field(default_factory=list)   # (step, field, value)
     source_of: dict[str, str] = field(default_factory=dict)  # "<step>|<field>|<op>|<value>" -> how it is said
+    by_rule: set[str] = field(default_factory=set)           # the keys of the conditions code added (rules)
 
     @property
     def ok(self) -> bool:
@@ -124,7 +125,8 @@ def check(plan: Plan, pack: Pack, question: str, chat: str = "", today: dt.date 
         _check_step(step, seen, pack, question, chat, today, out)
         seen[step.id] = step
     _check_date_conditions(plan, pack, out)
-    _check_rule_conditions(plan, pack, out)
+    _check_rule_conditions(plan, pack, out, question)
+    _check_period_field(plan, question, pack, out, today)
     _check_periods(plan, question, today, out)
     _check_bucket_asked(plan, question, out)
     _check_period_given(plan, question, today, out)
@@ -132,21 +134,32 @@ def check(plan: Plan, pack: Pack, question: str, chat: str = "", today: dt.date 
     _check_named_values(plan, pack, question, out)
     _check_glossary(plan, pack, question, out)
     _check_qualified_counts(plan, pack, question, out)
-    _check_units_asked(plan, question, out)
+    _check_units_asked(plan, question, out, pack)
     _check_ranked(plan, out)
     _check_share_asked(plan, question, out)
     return out
 
 
-def _fields_used(plan: Plan, pack: Pack) -> dict[str, set[str]]:
-    """{table ref: the fields its steps filter on or group by}."""
+def _fields_used(plan: Plan, pack: Pack, out: Checked | None = None) -> dict[str, set[str]]:
+    """{table ref: the fields its steps filter on or group by}; with `out`, not the conditions of a team rule, added
+    by code or written by the model (STATUS != 'CANCELLED', STATUS IN ('PAID', 'DELIVERED') say nothing of the
+    failed orders a question asks for)."""
     used: dict[str, set[str]] = {}
+    added = out.by_rule if out is not None else set()
+
+    def own(step: Step, c: Cond) -> bool:
+        if out is None:
+            return True
+        kind, ref = source_of(c.source)
+        item = pack.item(ref) if kind == "knowledge" else None
+        return cond_key(step.id, c) not in added and not (item is not None and item.kind == "rule")
     for s in plan.steps:
         t = pack.table(s.table)
         if t is None:
             continue
         u = used.setdefault(t.ref, set())
-        u |= {c.field for c in s.where} | {c.field for m in s.measures for c in m.where} | set(s.by)
+        u |= {c.field for c in s.where if own(s, c)}
+        u |= {c.field for m in s.measures for c in m.where if own(s, c)} | set(s.by)
     return used
 
 
@@ -165,7 +178,7 @@ def _check_qualified_counts(plan: Plan, pack: Pack, question: str, out: Checked)
     families = [f for f in QUALIFIERS if said & (VALUE_WORDS[f] | {f})]
     if not families:
         return
-    for ref, fields in _fields_used(plan, pack).items():
+    for ref, fields in _fields_used(plan, pack, out).items():
         t = pack.table(ref)
         if t is None:
             continue
@@ -180,17 +193,25 @@ def _check_qualified_counts(plan: Plan, pack: Pack, question: str, out: Checked)
                     holders.append((name, hits))
             if holders and not ({n for n, _h in holders} & fields):
                 name, hits = holders[0]
+                ruled = any(c.field == name for st in plan.steps if st.table == ref
+                            for c in [*st.where, *(x for m in st.measures for x in m.where)])
                 out.errors.append(f"the question counts {fam!r} ones: {t.name} says it in {name} ({', '.join(hits[:4])}): "
                                   f"add that condition (source: the question's words), or the count takes every "
-                                  f"{name}")
+                                  f"{name}" + (f" (the condition on {name} from a team rule does not say it: a rule "
+                                               "about other ones does not apply)" if ruled else ""))
 
 
 def _check_named_values(plan: Plan, pack: Pack, question: str, out: Checked) -> None:
     """A value of the data the question names (BILLING, UAT, srv-a-01) is a condition or a group of the plan on
     its field: else the answer counts every value (the BILLING jobs in UAT counted as all jobs). Named = written
-    as the data writes it, or a code-like value (digits, _ or -) in any case; an ordinary word ("the critical
-    applications", when CRITICAL is a value) is not, nor a word the knowledge the plan uses explains."""
-    used = _fields_used(plan, pack)
+    as the data writes it, a code-like value (digits, _ or -) in any case, or a value in any case just before the
+    table's subject ("test orders" in an orders index: the retail lab counted every order); an ordinary word
+    elsewhere ("the critical applications", when CRITICAL is a value) is not, nor a word the knowledge the plan
+    uses explains. A rule's condition with that value says it too (PNL_STATUS = 'OFFICIAL' for "official PnL")."""
+    from supagent.knowledge.named import before_noun, nouns_of
+    from supagent.knowledge.rulecheck import _stem
+
+    used = _fields_used(plan, pack, out)
     per = [m.span() for m in PER.finditer(question or "")]
     explained = " ".join(f"{k.title} {k.text}" for k in pack.knowledge
                          if any(source_of(c.source) == ("knowledge", k.ref.upper()) for s in plan.steps
@@ -198,6 +219,7 @@ def _check_named_values(plan: Plan, pack: Pack, question: str, out: Checked) -> 
     for ref, fields in used.items():
         t = pack.table(ref)
         names = {c.lower() for c in t.columns} | {w.lower() for w in re.split(r"[^A-Za-z0-9]+", t.name) if w}
+        subject = {_stem(w) for w in re.split(r"[^a-z0-9]+", t.name.lower()) if len(w) >= 3}
         missing: dict[str, list[str]] = {}
         for fld, col in t.columns.items():
             if fld == t.time_field:
@@ -208,13 +230,22 @@ def _check_named_values(plan: Plan, pack: Pack, question: str, out: Checked) -> 
                     continue
                 code_like = bool(re.search(r"[\d_-]", v))
                 m = re.search(r"(?<![\w-])" + re.escape(v) + r"(?![\w-])", question or "", 0 if not code_like else re.I)
+                if m is None and not code_like:                # "test orders", "web channel": before the subject
+                    m = before_noun(question or "", v, subject | nouns_of("", fld))      # or its field's name
                 if m is None or any(a <= m.start() < b for a, b in per):    # "per node": a group, said so
+                    continue
+                from supagent.knowledge.named import included
+
+                if included(question or "", m):           # "UAT included": with the others, not alone
                     continue
                 if re.search(r"(?<![\w-])" + re.escape(v.lower()) + r"(?![\w-])", explained):
                     continue                                   # the knowledge the plan counts with says it
                 missing.setdefault(v, []).append(fld)
+        conds = [c for st in plan.steps if st.table == ref for c in [*st.where, *(x for m in st.measures for x in m.where)]]
         for v, flds in missing.items():
-            if not set(flds) & fields:
+            said = any(c.field in flds and c.op in ("=", "in") and v.lower() in
+                       {str(x).lower() for x in (c.value if isinstance(c.value, list) else [c.value])} for c in conds)
+            if not set(flds) & fields and not said:
                 out.errors.append(f"the question names {v!r}, a value of {' or '.join(flds)} in {t.name}: count with "
                                   f"a condition {flds[0]} = {v!r} (its source: the question's words) or group by "
                                   f"{flds[0]}; else the answer counts every {flds[0]}")
@@ -227,7 +258,7 @@ def _check_glossary(plan: Plan, pack: Pack, question: str, out: Checked) -> None
     from supagent.knowledge.rulecheck import PAIR
 
     asked = set(stems(question or ""))
-    used = _fields_used(plan, pack)
+    used = _fields_used(plan, pack, out)
     for k in pack.knowledge:
         if k.kind != "glossary":
             continue
@@ -245,15 +276,33 @@ def _check_glossary(plan: Plan, pack: Pack, question: str, out: Checked) -> None
                                   f"with that condition in {t.name} (source {k.ref})")
 
 
-def _check_units_asked(plan: Plan, question: str, out: Checked) -> None:
-    """A unit the question asks for (in GiB, in minutes) is on a measure: code converts, the model never does."""
+def _check_units_asked(plan: Plan, question: str, out: Checked, pack: Pack | None = None) -> None:
+    """A unit the question asks for (in GiB, in minutes) is on a measure: code converts, the model never does.
+    A unit nobody asked for is said only when the dictionary (or the field's name) gives it: the model's own
+    (a PnL summed "in percent", with "percent" as the field's unit too) is not."""
+    from supagent.governed.compile import unit_of
+    from supagent.governed.plan import Measure
+
     m = ASKED_UNIT.search(question or "")
     want = UNIT_WORDS.get(m.group(1).lower()) if m else None
     for s in plan.steps:                        # a unit nobody asked for, not the field's own: not said in the answer
+        t = pack.table(s.table) if pack is not None else None
         for x in s.measures:                    # (a PnL summed "in percent", a count "in seconds")
+            if x.fn in ("count", "count_distinct") and (x.unit or x.source_unit):
+                out.fixed.append(f"{s.id}: unit {x.unit or x.source_unit!r} of {x.label!r} removed (a count has none)")
+                x.unit = x.source_unit = None
+                continue
             if x.unit and x.unit != want and x.unit != (x.source_unit or ""):
                 out.fixed.append(f"{s.id}: unit {x.unit!r} of {x.label!r} removed (the question does not ask for it)")
                 x.unit = None
+            elif x.unit and not want and t is not None:
+                known = unit_of(t, x.field, Measure(label=x.label, fn=x.fn))
+                if (known or "").lower() != x.unit.lower():
+                    out.fixed.append(f"{s.id}: unit {x.unit!r} of {x.label!r} removed (neither asked nor the "
+                                     f"dictionary's{': ' + known if known else ''})")
+                    x.unit = None
+                    if x.source_unit and (known or "").lower() != x.source_unit.lower():
+                        x.source_unit = None
     if not want:
         return
     measures = [x for s in plan.steps for x in s.measures if x.fn not in ("count", "count_distinct", "share")]
@@ -275,6 +324,36 @@ def _check_bucket_asked(plan: Plan, question: str, out: Checked) -> None:
         out.fixed.append(f"{s.id}: bucket {s.bucket} removed (the question does not ask per {s.bucket}"
                          + (f"; it asks per {', '.join(sorted(grains))}" if grains else " or over time") + ")")
         s.bucket = None
+
+
+def _check_period_field(plan: Plan, question: str, pack: Pack, out: Checked, today: dt.date | None = None) -> None:
+    """The date field of a step's period: the table's time field, unless the question's words name another one
+    next to its date ("parcels shipped on 17 September": SHIPPED_TIME; with several named, the one next to the
+    period's own day: "orders of 22 September shipped on 24 September or later", ORDER_DATE for 22 September); a
+    field set by the plan must be a date field of the table."""
+    from supagent.knowledge.period import _now, named_among, named_days
+
+    for s in plan.steps:
+        t = pack.table(s.table)
+        if t is None or s.period is None or t.kind != "index":
+            continue
+        dates = {n for n, c in t.columns.items() if str(c.get("type") or "").lower().startswith("date")}
+        if s.period.field:
+            if s.period.field not in dates:
+                out.errors.append(f"{s.id}: period field {s.period.field} is not a date field of {t.name} "
+                                  f"({', '.join(sorted(dates)) or 'none'})")
+            continue
+        named = named_among(question, dates)
+        if len(named) == 1 and t.time_field not in named:
+            s.period.field = next(iter(named))
+            out.fixed.append(f"{s.id}: the period on {s.period.field} (the question names it), not {t.time_field}")
+        elif len(named) > 1:
+            start = parse_time(s.period.start)
+            here = named_days(question, dates, today or _now().date()).get(start.date()) if start else None
+            if here and len(here) == 1 and t.time_field not in here:
+                s.period.field = next(iter(here))
+                out.fixed.append(f"{s.id}: the period on {s.period.field} (the question names it next to "
+                                 f"{start:%d %B}), not {t.time_field}")
 
 
 def _check_period_given(plan: Plan, question: str, today: dt.date, out: Checked) -> None:
@@ -554,11 +633,15 @@ def _check_value(step: Step, c: Cond, t: TableInfo, out: Checked) -> None:
 
 
 def _apply_rules(step: Step, t: TableInfo, question: str, pack: Pack, out: Checked) -> None:
-    """The team's rules on a field of this table: added unless the question lifts them or says that field."""
-    from supagent.knowledge.rulecheck import EXCLUDING, KEEPING, PAIR, _checkable, concerns, possible_in, team_rules
+    """The team's rules on a field of this table: added unless the question lifts them or says that field (for
+    the step, or for each of its measures: "web orders" said on the measure)."""
+    from supagent.knowledge.rulecheck import _checkable, concerns, possible_in, rule_conditions, team_rules
 
     asked = (question or "").lower()
     said_fields = {c.field for c in step.where if source_of(c.source)[0] in ("question", "chat")}
+    if step.measures:
+        said_fields |= set.intersection(*({c.field for c in m.where if source_of(c.source)[0] in ("question", "chat")}
+                                          for m in step.measures))
     for rule in team_rules():
         found = _checkable(rule, asked)
         if found is None:
@@ -567,15 +650,12 @@ def _apply_rules(step: Step, t: TableInfo, question: str, pack: Pack, out: Check
         if about is not None and t.name not in about:
             continue                                  # a rule about another table's data (VaR, not trades)
         text = rule["text"]
-        for m in PAIR.finditer(text):
-            fld, value = m.group(1), m.group(2)
+        for fld, value, exclude in rule_conditions(text):
             real = next((c for c in t.columns if c == fld), None)
             if real is None or real in said_fields or real in (step.by or []):
                 continue                              # grouped per that field: every value, not the rule's
             if possible_in(t.columns.get(real) or {}, value) is False:
                 continue                              # its value is not in this data (no BOOK = 'ALL' in PnL)
-            before = text[max(0, m.start() - 80):m.start()]
-            exclude = bool(EXCLUDING.search(before)) and not KEEPING.search(before)
             if any(c.field == real for c in step.where):
                 continue
             item = next((k for k in pack.knowledge if k.kind == "rule" and k.text.strip() == text.strip()), None)
@@ -585,6 +665,7 @@ def _apply_rules(step: Step, t: TableInfo, question: str, pack: Pack, out: Check
             out.added.append(f"{step.id}: {real} {'!=' if exclude else '='} {value!r} (the team's rule "
                              f"\"{rule['title']}\")")
             out.source_of[cond_key(step.id, c)] = f'the team\'s rule "{rule["title"]}"'
+            out.by_rule.add(cond_key(step.id, c))
 
 
 DATE_VALUE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:[ T](\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?)?$")
@@ -631,11 +712,13 @@ def _check_date_conditions(plan: Plan, pack: Pack, out: Checked) -> None:
             holder.where = keep
 
 
-def _check_rule_conditions(plan: Plan, pack: Pack, out: Checked) -> None:
+def _check_rule_conditions(plan: Plan, pack: Pack, out: Checked, question: str = "") -> None:
     """A condition the model took from a team rule follows the rule's own limits, as the ones code adds: not on a
-    step grouped by its field (per BOOK: every book, not BOOK = 'ALL'), not where its value cannot be."""
-    from supagent.knowledge.rulecheck import possible_in
+    step grouped by its field (per BOOK: every book, not BOOK = 'ALL'), not where its value cannot be, and the
+    rule's way: a value the rule leaves out is never the one kept (CHANNEL = 'TEST' from "never count them")."""
+    from supagent.knowledge.rulecheck import possible_in, rule_conditions
 
+    asked = (question or "").lower()
     for s in plan.steps:
         t = pack.table(s.table)
         for holder in [s, *s.measures]:
@@ -656,6 +739,13 @@ def _check_rule_conditions(plan: Plan, pack: Pack, out: Checked) -> None:
                     out.fixed.append(f"{s.id}: {c.field} = {c.value} (from {item.title!r}) removed: {t.name} has no "
                                      "such value")
                     continue
+                way = {(f, str(v).lower()): x for f, v, x in rule_conditions(item.text)}
+                if (c.op in ("=", "in") and values and all(way.get((c.field, str(v).lower())) for v in values)
+                        and not any(re.search(rf"(?<![\w-]){re.escape(str(v).lower())}(?![\w-])", asked)
+                                    for v in values)):
+                    old_op, c.op = c.op, ("!=" if c.op == "=" else "not in")
+                    out.fixed.append(f"{s.id}: {c.field} {old_op} {c.value} (from {item.title!r}) written {c.op}: "
+                                     "the rule leaves that value out")
                 keep.append(c)
             holder.where = keep
 

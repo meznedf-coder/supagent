@@ -16,7 +16,7 @@ from superset.extensions import encrypted_field_factory
 
 from supagent.textsafe import SafeString, SafeText
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 13
 
 
 def _now() -> dt.datetime:
@@ -308,6 +308,52 @@ class Memory(db.Model):  # type: ignore[name-defined]
     approved_by = sa.Column(SafeString(255))
 
 
+class Note(db.Model):  # type: ignore[name-defined]
+    """A note any user writes in a few seconds (what was said in a meeting, a decision, a fact the team must
+    not lose): for the team (every user of the agent reads it) or for its author only. The agent finds it
+    like the documents, and says whose note it is and when: a note is not verified (never a team rule, never
+    a source of a query's condition); an admin may make a catalog entry of it."""
+
+    __tablename__ = "supagent_note"
+    id = sa.Column(sa.Integer, primary_key=True)
+    scope = sa.Column(SafeString(8), default="team", index=True)     # team | user
+    user_id = sa.Column(sa.Integer, index=True)                       # the author
+    title = sa.Column(SafeString(300))
+    text = sa.Column(SafeText, nullable=False)
+    tags = sa.Column(sa.JSON)                                         # ["pricing", "meeting"]
+    meeting_on = sa.Column(sa.Date)                                   # the day it is about (a meeting's), if said
+    pinned = sa.Column(sa.Boolean, default=False)
+    source = sa.Column(SafeString(16), default="page")                # page | command (/note) | dictionary | agent
+    entry_id = sa.Column(sa.Integer)                                  # the catalog entry an admin made of it
+    versions = sa.Column(sa.JSON)                                     # its states before the last changes (12)
+    created_at = sa.Column(sa.DateTime, default=_now, index=True)
+    updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
+    updated_by = sa.Column(SafeString(255))                           # who changed it last (its author, an admin)
+
+
+class ChartScan(db.Model):  # type: ignore[name-defined]
+    """What the nightly look at a Superset chart found (0.7): its last full day against the same weekday of the
+    weeks before, per series (high, low, data stopped), what it shows in words (the LLM's, cached on what it
+    reads), and why a chart was left out. Read by the agent (chart_anomalies) for the users who may see the
+    chart; one row per chart, replaced at each look."""
+
+    __tablename__ = "supagent_chart_scan"
+    id = sa.Column(sa.Integer, primary_key=True)
+    chart_id = sa.Column(sa.Integer, nullable=False, unique=True)
+    dashboard_ids = sa.Column(sa.JSON)                 # the dashboards it is on
+    datasource_id = sa.Column(sa.Integer, index=True)  # its dataset (the permission filter)
+    database_id = sa.Column(sa.Integer, index=True)
+    scanned_at = sa.Column(sa.DateTime)
+    day = sa.Column(sa.Date)                           # the day compared (the last full day before "now")
+    status = sa.Column(SafeString(16))                 # ok | stale | skipped | error
+    reason = sa.Column(SafeText)                       # why skipped, the error, or how it was read
+    findings = sa.Column(sa.JSON)                      # [{metric, series, now, median, change_pct, deviations, verdict}]
+    checked = sa.Column(sa.Integer)                    # series compared
+    understanding = sa.Column(SafeText)                # what it shows (AI-written)
+    understanding_hash = sa.Column(SafeString(64))     # of what the LLM read: written again when it changes
+    understood_at = sa.Column(sa.DateTime)
+
+
 class Doc(db.Model):  # type: ignore[name-defined]
     """A document or a site the agent may search: an uploaded text, Markdown or HTML file, or
     web pages fetched again every refresh_days days."""
@@ -469,6 +515,14 @@ class Facet(db.Model):  # type: ignore[name-defined]
     created_at = sa.Column(sa.DateTime, default=_now)
     reviewed_by = sa.Column(SafeString(255))
     reviewed_at = sa.Column(sa.DateTime)
+    # 13: the values this one is part of (ids), in other categories or its own: a component of two applications,
+    # an application of a subject. Its items count as about each of them too.
+    parents = sa.Column(sa.JSON)
+    # 13: what the LLM suggests about the value, waiting for an admin: {"parents": [ids it would be part of],
+    # "same_as": id of an existing value naming the same thing (a merge)}
+    suggested = sa.Column(sa.JSON)
+    # 13: where the value comes from ("field NODE of jobs-* (OpenSearch)", "catalog category", "added by admin"...)
+    origins = sa.Column(sa.JSON)
 
 
 class Tag(db.Model):  # type: ignore[name-defined]
@@ -528,7 +582,7 @@ class ItemUse(db.Model):  # type: ignore[name-defined]
 
 TABLES = [Meta, Setting, Source, KObject, Relation, Run, Change, Conversation, Message, File, Example, Document,
           Entry, EntryVersion, Recipe, QueryStat, Memory, Doc, Chunk, Association, Usage, ContextPage, LLMCall,
-          Route, Facet, Tag, Link, Classified, ItemUse]
+          Route, Facet, Tag, Link, Classified, ItemUse, Note, ChartScan]
 
 
 def _add_missing_columns(engine: sa.engine.Engine) -> list[str]:

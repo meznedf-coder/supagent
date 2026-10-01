@@ -9,6 +9,7 @@ import pytest
 from conftest import login
 
 ENDPOINTS = [("GET", "/supagent/admin/api/review"), ("GET", "/supagent/admin/api/facets"),
+             ("POST", "/supagent/admin/api/facets"),
              ("POST", "/supagent/admin/api/facets/1"), ("POST", "/supagent/admin/api/tags/1"),
              ("POST", "/supagent/admin/api/links/1"), ("POST", "/supagent/admin/api/routes/1"),
              ("GET", "/supagent/admin/api/apply")]
@@ -29,6 +30,16 @@ def test_only_admins_reach_the_review(app):
     for method, url in ENDPOINTS:
         r = c.open(url, method=method, json={} if method == "POST" else None)
         assert r.status_code in (200, 400, 404), (url, r.status_code)     # allowed (404: no such item)
+
+
+@pytest.fixture()
+def sure_used_at_once(monkeypatch):
+    """categories.review_all off (on by default since 0.7): what the LLM is sure of is used at once, as in 0.6."""
+    from supagent import settings
+
+    real = settings.get
+    monkeypatch.setattr(settings, "get", lambda key: False if key == "categories.review_all" else real(key))
+
 
 
 @pytest.fixture()
@@ -80,7 +91,7 @@ def test_the_review_lists_what_waits_with_real_counts_and_titles(app, queue):
         assert d["waiting"] == sum(d["counts"][k] for k in ("memory", "recipes", "values", "tags", "links"))
 
 
-def test_every_action_takes_an_item_out_of_the_review(app, queue):
+def test_every_action_takes_an_item_out_of_the_review(app, queue, sure_used_at_once):
     from superset.extensions import db
 
     from supagent.models import Facet, Link, Route, Tag
@@ -117,7 +128,7 @@ def test_every_action_takes_an_item_out_of_the_review(app, queue):
         assert db.session.get(Link, queue["link"]).status == "approved"
 
 
-def test_a_value_merged_into_another_moves_its_items(app, queue):
+def test_a_value_merged_into_another_moves_its_items(app, queue, sure_used_at_once):
     from superset.extensions import db
 
     from supagent.models import Facet, Tag
@@ -133,8 +144,77 @@ def test_a_value_merged_into_another_moves_its_items(app, queue):
         db.session.refresh(near)
         assert near.synonyms == ["Settlements"]
         assert db.session.query(Tag).filter(Tag.facet_id == queue["near"]).count() == 2
+        # into an approved value: the item the LLM was sure of (0.9) is used at once, so the value's count moves
+        # at once; the unsure one (0.6) waits in the review
+        statuses = sorted((t.confidence, t.status) for t in db.session.query(Tag).filter(Tag.facet_id == queue["near"]))
+        assert statuses == [(0.6, "proposed"), (0.9, "approved")]
         listed = c.get("/supagent/admin/api/facets?facet=subject").get_json()["facets"]
-        assert [(f["value"], f["status"]) for f in listed] == [("Settlement", "approved")]
+        assert [(f["value"], f["status"], f["items"]) for f in listed] == [("Settlement", "approved", 1)]
+        assert c.get("/supagent/admin/api/review").get_json()["counts"]["tags"] >= 1
+
+
+def test_an_admin_adds_a_value_by_hand(app, queue):
+    """A value added by hand is used at once; one that exists already in that category is said so, a retired
+    one is used again; the aspect (functional, technical) takes none."""
+    from superset.extensions import db
+
+    from supagent.models import Facet
+
+    with app.app_context():
+        c = _client(app, "admin")
+        r = c.post("/supagent/admin/api/facets", json={"facet": "application", "value": "  Risk   engine ",
+                                                        "description": "the pricing service", "synonyms": "RE, pricer"})
+        assert r.status_code == 200
+        f = db.session.get(Facet, r.get_json()["id"])
+        assert (f.facet, f.value, f.status, f.source, f.description, f.synonyms) == (
+            "application", "Risk engine", "approved", "admin", "the pricing service", ["RE", "pricer"])
+        dup = c.post("/supagent/admin/api/facets", json={"facet": "application", "value": "risk ENGINE"})
+        assert dup.status_code == 409 and dup.get_json()["id"] == f.id
+        assert c.post("/supagent/admin/api/facets", json={"facet": "aspect", "value": "legal"}).status_code == 400
+        assert c.post("/supagent/admin/api/facets", json={"facet": "subject", "value": " "}).status_code == 400
+        old = db.session.get(Facet, queue["new"])
+        old.status = "rejected"
+        db.session.commit()
+        again = c.post("/supagent/admin/api/facets", json={"facet": "subject", "value": "settlements"})
+        assert again.status_code == 200 and again.get_json()["id"] == queue["new"]
+        db.session.refresh(old)
+        assert (old.status, old.value) == ("approved", "settlements")
+
+
+def test_a_value_moves_to_another_category(app, queue):
+    """Editing a value changes its category too; where the other category has that value already, the two are
+    one (the items together); the aspect stays fixed."""
+    from superset.extensions import db
+
+    from supagent.models import Facet, Tag
+
+    with app.app_context():
+        c = _client(app, "admin")
+        r = c.post(f"/supagent/admin/api/facets/{queue['new']}", json={"facet": "component", "value": "Settlements",
+                                                                       "description": "the settlement batch"})
+        assert r.get_json()["facet"] == "component"
+        moved = db.session.get(Facet, queue["new"])
+        db.session.refresh(moved)
+        assert (moved.facet, moved.description) == ("component", "the settlement batch")
+        assert db.session.query(Tag).filter(Tag.facet_id == queue["new"]).count() == 2     # its items with it
+        # into a category that has the value already: merged there
+        r = c.post(f"/supagent/admin/api/facets/{queue['new']}", json={"facet": "application", "value": "ledger",
+                                                                       "synonyms": "GL"})
+        assert r.get_json()["merged_into"] == queue["app"]
+        assert db.session.get(Facet, queue["new"]) is None
+        ledger = db.session.get(Facet, queue["app"])
+        db.session.refresh(ledger)
+        assert set(ledger.synonyms) == {"GL", "Settlements"}
+        refs = [t.ref for t in db.session.query(Tag).filter(Tag.facet_id == queue["app"])]
+        assert sorted(refs) == sorted(set(refs)) and len(refs) == 2     # each item once (one had both values)
+        # renamed in its own category to a value that exists: merged too (it was a unique-key error)
+        r = c.post(f"/supagent/admin/api/facets/{queue['near']}", json={"value": "Settlement"})
+        assert r.status_code == 200 and r.get_json()["value"] == "Settlement"
+        aspect = Facet(facet="aspect", value="technical", status="approved", source="seed")
+        db.session.add(aspect)
+        db.session.commit()
+        assert c.post(f"/supagent/admin/api/facets/{aspect.id}", json={"facet": "subject"}).status_code == 400
+        assert c.post(f"/supagent/admin/api/facets/{queue['near']}", json={"facet": "aspect"}).status_code == 400
 
 
 def test_a_save_answers_at_once_and_the_search_follows_in_the_background(app, monkeypatch):
@@ -196,3 +276,144 @@ def test_a_pending_state_nobody_works_on_is_shown_stale(ctx):
     row.value = json.dumps({"pending": False, "done_at": old})
     db.session.commit()
     assert "stale" not in apply.status()
+
+
+def test_a_value_is_part_of_several_others(app, queue):
+    """A component of two applications (the user's example): its items count as about both; the list says what it
+    is part of; values that cannot be parents (itself, the aspect, a retired one) are left out; a merge keeps it."""
+    from superset.extensions import db
+
+    from supagent.knowledge import facets as F
+    from supagent.models import Facet, Tag
+
+    with app.app_context():
+        c = _client(app, "admin")
+        ids = {}
+        for facet, value in (("application", "LEDGER2"), ("application", "PAYMENTS2"), ("component", "posting engine")):
+            ids[value] = c.post("/supagent/admin/api/facets", json={"facet": facet, "value": value}).get_json()["id"]
+        aspect = Facet(facet="aspect", value="functional", status="approved", source="seed")
+        db.session.add(aspect)
+        db.session.commit()
+        comp = ids["posting engine"]
+        r = c.post(f"/supagent/admin/api/facets/{comp}",
+                   json={"parents": [ids["LEDGER2"], ids["PAYMENTS2"], comp, aspect.id, 999999]})
+        assert r.get_json()["parents"] == [ids["LEDGER2"], ids["PAYMENTS2"]]
+        listed = {f["value"]: f for f in c.get("/supagent/admin/api/facets?facet=component").get_json()["facets"]}
+        assert [p["value"] for p in listed["posting engine"]["parents"]] == ["LEDGER2", "PAYMENTS2"]
+        db.session.add(Tag(ref="memory:424242", facet_id=comp, confidence=0.9, source="admin", status="approved"))
+        db.session.commit()
+        F._CACHE["stamp"] = None
+        got = F.facets_of(["memory:424242"])["memory:424242"]
+        assert {"component: posting engine", "application: LEDGER2", "application: PAYMENTS2"} <= set(got)
+        # an application merged into another: what was part of it is part of the other
+        r = c.post(f"/supagent/admin/api/facets/{ids['PAYMENTS2']}", json={"merge_into": ids["LEDGER2"]})
+        assert r.status_code == 200
+        moved = db.session.get(Facet, comp)
+        db.session.refresh(moved)
+        assert moved.parents == [ids["LEDGER2"]]
+        db.session.query(Tag).filter(Tag.ref == "memory:424242").delete(synchronize_session=False)
+        db.session.commit()
+
+
+def test_the_review_shows_what_the_learning_says_values_are_part_of(app, queue):
+    from superset.extensions import db
+
+    from supagent.models import Facet
+
+    with app.app_context():
+        c = _client(app, "admin")
+        ids = {v: c.post("/supagent/admin/api/facets", json={"facet": f, "value": v}).get_json()["id"]
+               for f, v in (("application", "LEDGER3"), ("component", "engine3"))}
+        engine = db.session.get(Facet, ids["engine3"])
+        engine.suggested = {"parents": [ids["LEDGER3"]]}
+        new = db.session.get(Facet, queue["new"])                       # proposed "Settlements"
+        new.parents = [ids["LEDGER3"]]
+        new.suggested = {"same_as": queue["near"]}
+        db.session.commit()
+        d = c.get("/supagent/admin/api/review").get_json()
+        rel = next(x for x in d["relations"] if x["id"] == ids["engine3"])
+        assert [p["value"] for p in rel["suggested"]] == ["LEDGER3"] and d["counts"]["relations"] >= 1
+        val = next(x for x in d["values"] if x["id"] == queue["new"])
+        assert val["same_as"]["value"] == "Settlement" and [p["value"] for p in val["parents"]] == ["LEDGER3"]
+        assert c.post(f"/supagent/admin/api/facets/{ids['engine3']}", json={"accept_parents": True}).get_json()["parents"] \
+            == [ids["LEDGER3"]]
+        db.session.refresh(engine)
+        assert engine.parents == [ids["LEDGER3"]] and not engine.suggested
+        assert not [x for x in c.get("/supagent/admin/api/review").get_json()["relations"] if x["id"] == ids["engine3"]]
+        m = c.get("/supagent/admin/api/facets/map").get_json()["values"]
+        assert next(x for x in m if x["value"] == "engine3")["parents"] == [ids["LEDGER3"]]
+
+
+def test_an_admin_adds_a_category_of_their_own(app, queue):
+    from supagent import settings
+
+    with app.app_context():
+        c = _client(app, "admin")
+        try:
+            r = c.post("/supagent/admin/api/facets/categories", json={"name": "Server", "fields": "^(host|node)$"})
+            cats = {x["name"]: x for x in r.get_json()["categories"]}
+            assert cats["server"]["fields"] == "^(host|node)$" and not cats["server"]["builtin"]
+            assert c.post("/supagent/admin/api/facets", json={"facet": "server", "value": "srv-9"}).status_code == 200
+            assert c.post("/supagent/admin/api/facets/categories", json={"name": "x"}).status_code == 400
+            assert c.post("/supagent/admin/api/facets/categories", json={"name": "env", "fields": "(("}).status_code == 400
+        finally:
+            settings.set_value("categories.custom", None)
+            settings.set_value("categories.fields", None)
+    alice = _client(app, "alice")                       # (outside the app context: her own g)
+    assert alice.post("/supagent/admin/api/facets/categories", json={"name": "team"}).status_code in (401, 403)
+
+
+def test_a_suggestion_is_changed_before_it_is_approved(app, queue):
+    """The user: not only approve or reject: change. Part of only some of the values proposed (the others are not
+    proposed again), and an item's category moved to another value."""
+    from superset.extensions import db
+
+    from supagent.models import Facet, Tag
+
+    with app.app_context():
+        c = _client(app, "admin")
+        ids = {v: c.post("/supagent/admin/api/facets", json={"facet": f, "value": v}).get_json()["id"]
+               for f, v in (("application", "APP-A4"), ("application", "APP-B4"), ("component", "engine4"))}
+        engine = db.session.get(Facet, ids["engine4"])
+        engine.suggested = {"parents": [ids["APP-A4"], ids["APP-B4"]]}
+        db.session.commit()
+        r = c.post(f"/supagent/admin/api/facets/{ids['engine4']}", json={"accept_parents": [ids["APP-B4"]]})
+        assert r.get_json()["parents"] == [ids["APP-B4"]]
+        db.session.refresh(engine)
+        assert engine.suggested == {"declined": [ids["APP-A4"]]}
+        tag = db.session.query(Tag).filter(Tag.facet_id == queue["app"]).first()     # an item tagged LEDGER
+        r = c.post(f"/supagent/admin/api/tags/{tag.id}", json={"facet_id": ids["APP-B4"]})
+        assert r.get_json()["facet_id"] == ids["APP-B4"] and r.get_json()["status"] == "approved"
+        assert c.post(f"/supagent/admin/api/tags/{tag.id}", json={"facet_id": 987654}).status_code == 400
+
+
+def test_review_all_keeps_everything_the_llm_finds_waiting(app, queue, monkeypatch):
+    """categories.review_all: even the categories and links the LLM is sure of wait for an admin."""
+    from superset.extensions import db
+
+    from supagent import settings
+    from supagent.knowledge import facets as F
+    from supagent.models import Facet, Tag
+
+    real = settings.get
+    monkeypatch.setattr(settings, "get", lambda key: True if key == "categories.review_all" else real(key))
+    with app.app_context():
+        assert F.review_all()
+        sure = db.session.query(Tag).filter(Tag.confidence >= 0.9, Tag.status == "proposed").first()
+        F.settle()
+        db.session.refresh(sure)
+        assert sure.status == "proposed"                                   # settle() no longer approves it
+        c = _client(app, "admin")
+        c.post(f"/supagent/admin/api/facets/{queue['new']}", json={"status": "approved"})
+        assert db.session.get(Facet, queue["new"]).status == "approved"
+        db.session.refresh(sure)
+        assert sure.status == "proposed"                                   # nor the approval of its value
+
+
+def test_review_all_is_on_by_default(app):
+    """Since 0.7 nothing the LLM finds is used before an admin approves it, unless categories.review_all is off."""
+    from supagent import settings
+    from supagent.knowledge import facets as F
+
+    with app.app_context():
+        assert settings.BY_KEY["categories.review_all"].default is True and F.review_all()

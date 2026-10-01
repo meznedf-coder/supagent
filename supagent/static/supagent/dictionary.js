@@ -10,7 +10,7 @@
 
   // ------------------------------------------------------------------ tabs: one controller for the page
   var MAIN = ["review", "knowledge", "data", "learned", "search"];
-  var SUBS = { knowledge: ["catalog", "memory", "context", "docs", "categories"], data: ["browse", "relations", "changes"] };
+  var SUBS = { knowledge: ["catalog", "memory", "context", "docs", "notes", "categories"], data: ["browse", "relations", "changes"] };
   var ADMIN_ONLY = ["review", "categories"];
   var loaders = {}, current = {}, active = null;
 
@@ -364,16 +364,60 @@
             el("td", { class: "nm", text: e.origin || "" }), el("td", { text: S.when(e.updated_at) })]));
       });
       if (!(d.entries || []).length) te.appendChild(emptyRow(4, "No catalog entry written by the agent yet."));
-      var ta = $("associations").querySelector("tbody");
-      ta.innerHTML = "";
-      (d.associations || []).forEach(function (a) {
-        ta.appendChild(el("tr", {}, [el("td", { class: "nm", text: a.word }),
-          el("td", { class: "nm", text: (a.parent ? a.parent + " › " : "") + a.name + " (" + a.kind + ")" }),
-          el("td", { text: String(a.database) }), el("td", { class: "num", text: S.num(a.uses) })]));
-      });
-      if (!(d.associations || []).length) ta.appendChild(emptyRow(4, "Nothing yet: it comes from the answers of the chat."));
     });
   }
+
+  // where the data of the questions was: one row per table, the words that led there, paged
+  pages.where = { page: 0, size: 25, total: 0 };
+  var whereTimer = null, whereDbs = false;
+  function whereData() {
+    var st = pages.where, p = ["limit=" + st.size, "offset=" + st.page * st.size];
+    if ($("w-q").value.trim()) p.push("q=" + encodeURIComponent($("w-q").value.trim()));
+    if ($("w-db").value) p.push("database=" + encodeURIComponent($("w-db").value));
+    return S.dict("GET", "where_data?" + p.join("&")).then(function (d) {
+      var tb = $("associations").querySelector("tbody");
+      tb.innerHTML = "";
+      st.total = d.total || 0;
+      if (!whereDbs) {
+        whereDbs = true;
+        (d.databases || []).forEach(function (x) { $("w-db").appendChild(el("option", { value: x.id, text: x.name })); });
+      }
+      (d.tables || []).forEach(function (t) {
+        var words = el("td", { class: "where-words" });
+        var ordered = t.words.filter(function (w) { return !w.elsewhere; })      // the words that say this table
+          .concat(t.words.filter(function (w) { return w.elsewhere; }));          // first, the shared ones after
+        ordered.forEach(function (w) {
+          var tip = (w.elsewhere ? "Also led to " + w.elsewhere + " other table" + (w.elsewhere > 1 ? "s" : "") +
+            (w.other_databases.length ? " (other databases: " + w.other_databases.join(", ") + ")" : "") +
+            ": alone, it does not say where the data is." : "Led only here.") + " " + S.num(w.uses) + " answer use" +
+            (w.uses > 1 ? "s" : "") + ".";
+          var chip = el("span", { class: "where-word" + (w.elsewhere ? " shared" : " own"), title: tip }, [
+            el(w.elsewhere ? "span" : "strong", { class: "nm", text: w.word }),
+            el("span", { class: "where-uses", text: S.num(w.uses) })]);
+          if (d.is_admin) chip.appendChild(el("button", { type: "button", class: "where-x", text: "\u00d7",
+            title: "Wrong: \u201c" + w.word + "\u201d does not lead to " + t.name, "aria-label": "Wrong: " + w.word,
+            onclick: function () {
+              S.dict("POST", "where_data/forget", { word: w.word, database_id: t.database_id, kind: t.kind,
+                                                   parent: t.parent, name: t.name }).then(whereData);
+            } }));
+          words.appendChild(chip);
+        });
+        tb.appendChild(el("tr", {}, [
+          el("td", { class: "nm", text: (t.parent ? t.parent + " \u203a " : "") + t.name + " (" + t.kind + ")" }),
+          el("td", { text: t.database }), words,
+          el("td", { class: "num", text: S.num(t.answers) + (t.helpful ? " (" + S.num(t.helpful) + " Helpful)" : "") }),
+          el("td", { text: S.when(t.updated_at) })]));
+      });
+      if (!(d.tables || []).length) tb.appendChild(emptyRow(5, $("w-q").value.trim() || $("w-db").value ?
+        "Nothing for this search." : "Nothing yet: it comes from the answers of the chat."));
+      S.pager($("w-pager"), st, whereData);
+    });
+  }
+  $("w-q").addEventListener("input", function () {
+    clearTimeout(whereTimer);
+    whereTimer = setTimeout(function () { pages.where.page = 0; whereData(); }, 250);
+  });
+  $("w-db").addEventListener("change", function () { pages.where.page = 0; whereData(); });
 
   function recipes() {
     var st = $("r-status").value;
@@ -512,30 +556,79 @@
     });
   }
 
-  // ------------------------------------------------------------------ Search
+  // ------------------------------------------------------------------ Search: every piece found, page by page
+  var found = { rows: [], page: 0, size: 20, total: 0 };
+
+  /* a piece's name: a link to where it is read or edited (a chart or a dashboard in Superset, in a new tab; an
+     index, a metric, an entry, a note... here, opened in the side panel; the address can be copied or bookmarked) */
+  function refLink(r) {
+    var name = r.title || r.ref;
+    if (!r.link) return el("strong", { text: name });
+    if (r.link.where === "superset") {
+      return el("a", { href: r.link.href, target: "_blank", rel: "noopener", class: "k-name", text: name,
+                       title: "Open in Superset (new tab)" });
+    }
+    return el("a", { href: r.link.href, class: "k-name", text: name, title: "Open it", onclick: function (ev) {
+      if (ev.button || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;   // a new tab, as asked
+      ev.preventDefault();
+      try { history.replaceState(null, "", r.link.href); } catch (e) { /* no history API: the link still opens it */ }
+      openRef(decodeURIComponent(r.link.href.replace(/^#open\//, "")), true);   // the results stay behind it
+    } });
+  }
+
+  function foundPage() {
+    var box = $("k-results");
+    box.innerHTML = "";
+    found.rows.slice(found.page * found.size, (found.page + 1) * found.size).forEach(function (r) {
+      box.appendChild(el("div", { class: "k-hit" }, [
+        el("div", {}, [el("span", { class: "badge", text: r.kind }), document.createTextNode(" "), refLink(r),
+          r.via ? el("span", { class: "muted k-via", text: " · found by " + r.via }) : null]),
+        el("div", { class: "k-text", text: r.text || "" })]));
+    });
+    S.pager($("k-pager"), found, function () { foundPage(); $("k-count").scrollIntoView({ block: "nearest" }); });
+  }
+
   $("k-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
     var q = $("k-q").value.trim(), box = $("k-results");
     if (!q) return;
     box.innerHTML = "";
-    box.appendChild(el("div", { class: "muted", text: "Searching…" }));
-    S.dict("GET", "search?q=" + encodeURIComponent(q) + ($("k-kind").value ? "&kind=" + $("k-kind").value : "")).then(function (d) {
-      box.innerHTML = "";
-      (d.results || []).forEach(function (r) {
-        box.appendChild(el("div", { class: "k-hit" }, [
-          el("div", {}, [el("span", { class: "badge", text: r.kind }), document.createTextNode(" "), el("strong", { text: r.title })]),
-          el("div", { class: "k-text", text: (r.text || "").slice(0, 700) + ((r.text || "").length > 700 ? "…" : "") })]));
-      });
-      if (!(d.results || []).length) box.appendChild(el("div", { class: "muted", text: d.error || "Nothing found." }));
+    $("k-pager").hidden = true;
+    $("k-count").textContent = "Searching…";
+    S.dict("GET", "search?all=1&q=" + encodeURIComponent(q) + ($("k-kind").value ? "&kind=" + $("k-kind").value : "")).then(function (d) {
+      found.rows = d.results || [];
+      found.total = found.rows.length;
+      found.page = 0;
+      $("k-count").textContent = d.error ? d.error : !found.total ? "Nothing found." :
+        S.num(found.total) + (found.total === 1 ? " result" : " results") + (d.capped ? " (the " + S.num(found.total) + " best)" : "");
+      foundPage();
     });
   });
+
+  /* #open/<ref> (the search's links): the item in the side panel; an address opened as such shows the item's tab
+     behind it, a click in the search's results keeps them (stay) */
+  function openRef(ref, stay) {
+    var m = /^([a-z]+):(\d+)$/.exec(ref || "");
+    if (!m) return;
+    var kind = m[1], id = +m[2];
+    var tab = { object: "browse", context: "context", entry: "catalog", memory: "memory", doc: "docs", note: "notes",
+                recipe: "learned" }[kind];
+    if (!stay && tab) show(tab, true);
+    if (kind === "object") { detail(id); return; }
+    if (kind === "context") { contextPage(id); return; }
+    if (kind === "entry" && state.admin && D.openEntry) { D.openEntry(id); return; }
+    S.dict("GET", "item?ref=" + encodeURIComponent(ref)).then(function (x) {
+      if (x.error) { textDrawer("Not found", ref, x.error); return; }
+      textDrawer(x.title || ref, x.kind, x.text);
+    });
+  }
 
   // ------------------------------------------------------------------ wiring
   loaders.browse = function () { if (!browsed) { browsed = true; load(); } };
   loaders.relations = relations;
   loaders.changes = changes;
   loaders.context = contextTab;
-  loaders.learned = function () { agentKnowledge(); recipes(); timings(); };
+  loaders.learned = function () { agentKnowledge(); whereData(); recipes(); timings(); };
   loaders.search = function () { $("k-q").focus(); };
 
   $("r-status").addEventListener("change", recipes);
@@ -565,6 +658,7 @@
   function start() {
     summary();
     var h = (location.hash || "").replace(/^#/, "");
+    if (/^open\//.test(h)) { openRef(decodeURIComponent(h.slice(5))); return; }
     if (h && mainOf(h)) { show(h, true); return; }
     if (state.admin && D.reviewWaiting) {
       D.reviewWaiting().then(function (n) { show(n ? "review" : "catalog", true); }, function () { show("catalog", true); });
@@ -576,6 +670,7 @@
   else setTimeout(start, 0);                       // after knowledge.js registered its tabs
   window.addEventListener("hashchange", function () {
     var h = (location.hash || "").replace(/^#/, "");
+    if (/^open\//.test(h)) { openRef(decodeURIComponent(h.slice(5))); return; }
     if (h && h !== active && mainOf(h)) show(h, true);
   });
 })();

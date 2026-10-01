@@ -15,6 +15,16 @@ from test_decider import lab  # noqa: F401  (the fixture: jobs index with APPLIC
 
 
 @pytest.fixture()
+def sure_used_at_once(monkeypatch):
+    """categories.review_all off (on by default since 0.7): what the LLM is sure of is used at once, as in 0.6."""
+    from supagent import settings
+
+    real = settings.get
+    monkeypatch.setattr(settings, "get", lambda key: False if key == "categories.review_all" else real(key))
+
+
+
+@pytest.fixture()
 def world(lab):  # noqa: F811
     from superset.extensions import db
 
@@ -62,7 +72,7 @@ class Replies(ScriptedLLM):
         return classify_reply(messages)
 
 
-def test_seeded_classified_and_read(world):
+def test_seeded_classified_and_read(world, sure_used_at_once):
     from superset.extensions import db
 
     from supagent.knowledge import facets as F
@@ -123,7 +133,7 @@ def test_metrics_are_classified_by_family(world):
     assert "component: servers" in F.facets_of([f"object:{cpu.id}"])[f"object:{cpu.id}"]
 
 
-def test_only_what_needs_an_admin_waits(world):
+def test_only_what_needs_an_admin_waits(world, sure_used_at_once):
     """Medium or high tags of approved values are used at once; a "component" that names a table is a relation
     to it; the links saying two items are the same wait for an admin, and so do low ones; what an older rule left
     waiting is settled."""
@@ -192,3 +202,114 @@ def test_the_prompt_says_whose_each_piece_is(world):
         text = knowledge_block("How are payments settled by the batch?", set())
     line = next(ln for ln in text.splitlines() if "Payments note" in ln)
     assert "(BILLING" in line and "aspect" not in line
+
+
+def test_the_learning_says_what_new_and_known_values_are_part_of(world):
+    """The user: categories found while learning (from metrics, notes, the catalog, memories) can be part of one or
+    more known ones (a jvm of two applications and four components), or the same as a known one (a merge)."""
+    from superset.extensions import db
+
+    from supagent.knowledge import facets as F
+    from supagent.models import Facet
+
+    known = {}
+    for facet, value in (("application", "LEDGER"), ("application", "PAYMENTS"), ("component", "posting engine"),
+                         ("component", "risk grid"), ("subject", "Settlement")):
+        known[value] = F._ensure(facet, value, "approved", "admin")
+    db.session.commit()
+    batch = [{"ref": f"entry:{world['entry']}", "hash": "h"}]
+    args = {"items": [], "new_values": [
+        {"facet": "component", "value": "jvm", "description": "the Java virtual machines",
+         "part_of": ["LEDGER", "PAYMENTS", "posting engine", "Risk Grid", "nothing known"]},
+        {"facet": "subject", "value": "Settlements", "same_as": "Settlement"}],
+        "known_value_parents": [{"value": "posting engine", "part_of": ["LEDGER"]},
+                                {"value": "unknown thing", "part_of": ["LEDGER"]}]}
+    F.apply(args, batch, {})
+    jvm = db.session.query(Facet).filter(Facet.value == "jvm").one()
+    assert jvm.status == "proposed" and set(jvm.parents) == {known[v].id for v in
+                                                              ("LEDGER", "PAYMENTS", "posting engine", "risk grid")}
+    dup = db.session.query(Facet).filter(Facet.value == "Settlements").one()
+    assert dup.suggested == {"same_as": known["Settlement"].id}
+    engine = db.session.get(Facet, known["posting engine"].id)
+    assert engine.parents is None and engine.suggested == {"parents": [known["LEDGER"].id]}   # an admin decides
+
+
+def test_the_system_map_counts_the_items_that_exist_now(world):
+    from superset.extensions import db
+
+    from supagent.knowledge import facets as F
+    from supagent.knowledge.index import sync
+    from supagent.models import Facet, KObject, Tag
+
+    app_ = F._ensure("application", "LEDGER", "approved", "admin")
+    comp = F._ensure("component", "posting engine", "approved", "admin")
+    db.session.flush()
+    comp.parents = [app_.id]
+    metric = db.session.query(KObject).filter(KObject.kind == "metric").first()
+    db.session.add_all([Tag(ref=f"object:{metric.id}", facet_id=comp.id, confidence=0.9, source="admin", status="approved"),
+                        Tag(ref=f"entry:{world['entry']}", facet_id=comp.id, confidence=0.9, source="admin", status="approved")])
+    db.session.commit()
+    sync()
+    nodes = {n["value"]: n for n in F.system_map()}
+    assert nodes["posting engine"]["parents"] == [app_.id]
+    assert nodes["posting engine"]["kinds"] == {"metrics": 1, "catalog entries": 1}
+    metric.gone_at = __import__("datetime").datetime.utcnow()                  # the metric is removed from the source
+    db.session.commit()
+    nodes = {n["value"]: n for n in F.system_map()}
+    assert nodes["posting engine"]["kinds"] == {"catalog entries": 1} and nodes["posting engine"]["tagged"] == 2
+    metric.gone_at = None
+    db.session.commit()
+
+
+def test_own_categories_read_from_the_fields_and_related_by_the_data(world, monkeypatch):
+    """The user: categories come from the values in the indices too (applications, components, servers...), a
+    category list of one's own, where each value comes from, and the relations the data shows, to approve."""
+    from superset.extensions import db
+
+    from supagent import settings
+    from supagent.knowledge import facets as F
+    from supagent.knowledge.learn_indices import category_pairs
+    from supagent.models import Facet, KObject, Source
+
+    conf = {"categories.custom": ["server"], "categories.fields": {"application": r"^(application|app)$",
+                                                                    "server": r"^(node|host)$"},
+            "categories.relation_min_docs": 5}
+    real = settings.get
+    monkeypatch.setattr(settings, "get", lambda key: conf[key] if key in conf else real(key))
+    assert F.editable() == ("subject", "application", "component", "server")
+    src = db.session.query(Source).first()
+    idx = KObject(source_id=src.id, kind="index", name="ops-jobs", parent="")
+    fld_app = KObject(source_id=src.id, kind="field", name="APPLICATION", parent="ops-jobs",
+                      stats={"values": ["LEDGER", "PAYMENTS"]})
+    fld_node = KObject(source_id=src.id, kind="field", name="NODE", parent="ops-jobs",
+                       stats={"values": ["srv-01", "srv-02", "srv-03"]})
+    db.session.add_all([idx, fld_app, fld_node])
+    db.session.commit()
+
+    class Conn:
+        class transport:  # noqa: N801
+            @staticmethod
+            def search(index, body):
+                assert body["aggs"]["p"]["terms"]["field"] == "APPLICATION"      # the wider category first
+                return {"aggregations": {"p": {"buckets": [
+                    {"key": "LEDGER", "c": {"buckets": [{"key": "srv-01", "doc_count": 40}, {"key": "srv-02", "doc_count": 2}]}},
+                    {"key": "PAYMENTS", "c": {"buckets": [{"key": "srv-01", "doc_count": 9}, {"key": "srv-03", "doc_count": 30}]}}]}}}
+
+    class Fld:
+        def __init__(self, name):
+            self.name, self.agg_field, self.sql_type = name, name, "VARCHAR"
+
+    pairs = category_pairs(Conn(), "ops-jobs", [Fld("NODE"), Fld("APPLICATION"), Fld("STATUS")], 1000)
+    assert pairs[0]["parent"] == ["application", "APPLICATION"] and pairs[0]["child"] == ["server", "NODE"]
+    idx.stats = {"category_pairs": pairs}
+    db.session.commit()
+    n = F.seed()
+    assert n["server"] >= 3 and n["relations"] == 3                       # srv-02 with LEDGER: 2 documents, below 5
+    srv1 = db.session.query(Facet).filter(Facet.facet == "server", Facet.value == "srv-01").one()
+    assert srv1.status == "approved" and srv1.origins == [f"field NODE of ops-jobs ({src.database_name})"]
+    names = {db.session.get(Facet, i).value for i in srv1.suggested["parents"]}
+    assert names == {"LEDGER", "PAYMENTS"} and srv1.parents is None          # proposed, never applied alone
+    assert "LEDGER with NODE srv-01 in 40 documents" in " ".join(srv1.suggested["from"].values())
+    db.session.query(KObject).filter(KObject.parent == "ops-jobs").delete(synchronize_session=False)
+    db.session.delete(idx)
+    db.session.commit()

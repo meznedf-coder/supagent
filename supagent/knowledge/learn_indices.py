@@ -87,6 +87,93 @@ def computed_fields(conn: Any, index: str) -> dict[str, dict[str, Any]]:
             for f in (meta.fields.values() if meta is not None else []) if f.virtual}
 
 
+def dataset_time_field(database_id: int, names: tuple[str, ...]) -> str | None:
+    """The main time column the team chose for this index in Superset (a physical dataset of the same name), or
+    None: it says the time of the records better than any rule on the names of the date fields."""
+    from superset.connectors.sqla.models import SqlaTable
+
+    for t in db.session.query(SqlaTable).filter(SqlaTable.database_id == database_id,
+                                                SqlaTable.table_name.in_(list(names)), SqlaTable.sql.is_(None)):
+        if t.main_dttm_col:
+            return str(t.main_dttm_col)
+    return None
+
+
+def prefer_dataset_time(info: dict[str, Any], fstats: dict[str, dict[str, Any]], database_id: int,
+                        names: tuple[str, ...]) -> None:
+    """The index's time field: its dataset's main time column when there is one and it is a date field of the index
+    (the first date field in name order said only "a" date: DELIVERED_TIME for shipments, FIRST_RESPONSE_TIME
+    for tickets)."""
+    if not info.get("time_field"):
+        return
+    chosen = dataset_time_field(database_id, names)
+    if chosen and chosen != info["time_field"] and (fstats.get(chosen) or {}).get("type") in ("date", "date_nanos"):
+        info["time_field"] = chosen
+        info["time_range"] = [fstats[chosen].get("min"), fstats[chosen].get("max")]
+        info["time_field_from"] = "dataset"
+
+
+def dataset_time_now(obj: KObject, source: Source, database_id: int, names: tuple[str, ...]) -> bool:
+    """An index not due for its profile: its time field follows its dataset's main time column at once (chosen
+    since its profile, or learned before 0.7), from its fields as learned. True when it changed."""
+    stats = dict(obj.stats or {})
+    if not stats.get("time_field"):
+        return False
+    fstats = {f.name: {**(f.stats or {}), "type": f.data_type} for f in db.session.query(KObject).filter_by(
+        source_id=source.id, kind="field", parent=obj.name, gone_at=None)}
+    before = stats["time_field"]
+    prefer_dataset_time(stats, fstats, database_id, names)
+    if stats["time_field"] == before:
+        return False
+    obj.stats = stats
+    return True
+
+
+PAIR_FIELDS = 6          # pairs of category fields read per index
+PAIR_TERMS = 200         # values of each field in a pair
+
+
+def category_pairs(conn: Any, index: str, fields: list[Any], sample_docs: int) -> list[dict[str, Any]]:
+    """Two fields of one index that feed two categories (categories.fields: APPLICATION and NODE...): which values
+    go together in its documents (the profile's sample), the wider category's field first. The categories learn
+    from them what is part of what (proposed to an admin, never applied alone)."""
+    from supagent.knowledge.facets import field_rules, rank
+
+    rules = field_rules()
+    if not rules:
+        return []
+    cats = []
+    for f in fields:
+        if f.sql_type != "VARCHAR" or not f.agg_field:
+            continue
+        cat = next((c for c, rx in rules if rx.match(f.name)), None)
+        if cat is not None:
+            cats.append((cat, f))
+    out: list[dict[str, Any]] = []
+    for i, (pc, pf) in enumerate(cats):
+        for cc, cf in cats[i + 1:]:
+            if pc == cc or len(out) >= PAIR_FIELDS:
+                continue
+            if rank(cc) < rank(pc):
+                (pc, pf), (cc, cf) = (cc, cf), (pc, pf)
+            body = {"size": 0, "terminate_after": sample_docs, "aggs": {"p": {
+                "terms": {"field": pf.agg_field, "size": PAIR_TERMS},
+                "aggs": {"c": {"terms": {"field": cf.agg_field, "size": PAIR_TERMS}}}}}}
+            try:
+                res = conn.transport.search(index, body)
+            except SourceStopped:
+                raise
+            except Exception:  # pylint: disable=broad-except
+                continue
+            rows = []
+            for b in ((res.get("aggregations") or {}).get("p") or {}).get("buckets") or []:
+                for c in (b.get("c") or {}).get("buckets") or []:
+                    rows.append([str(b["key"]), str(c["key"]), int(c["doc_count"])])
+            if rows:
+                out.append({"parent": [pc, pf.name], "child": [cc, cf.name], "pairs": rows[:5000]})
+    return out
+
+
 def profile_index(conn: Any, index: str, meta: Any) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     sample_docs = int(settings.get("learn.sample_docs"))
     per_request = max(5, int(settings.get("learn.fields_per_request")))
@@ -137,6 +224,9 @@ def profile_index(conn: Any, index: str, meta: Any) -> tuple[dict[str, Any], dic
             fstats[f.name]["top"] = [[str(b["key"]), b["doc_count"]] for b in buckets[:12]]
     info: dict[str, Any] = {"sampled_docs": sampled, "profiled_on": dt.date.today().isoformat(),
                             "profiled_at": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}
+    pairs = category_pairs(conn, index, fields, sample_docs)
+    if pairs:
+        info["category_pairs"] = pairs
     try:
         full = conn.transport.search(index, {"size": 0, "track_total_hits": True})
         info["docs"] = full["hits"]["total"]["value"]
@@ -218,6 +308,7 @@ def learn_indices(run: Run, source: Source, database: Any, deadline: float, prog
                     upsert(run, source, "index", "", obj_name, {"stats": _family_info(obj_name, families, index)})
                 else:
                     old.last_seen, old.gone_at = dt.datetime.utcnow(), None
+                    dataset_time_now(old, source, database.id, (index, obj_name))
                     out["not_due"] += 1
                 db.session.commit()
                 continue
@@ -233,6 +324,7 @@ def learn_indices(run: Run, source: Source, database: Any, deadline: float, prog
             if info is None:
                 keep_fields(obj_name)
                 continue
+            prefer_dataset_time(info, fstats, database.id, (index, obj_name))
             info.update(_family_info(obj_name, families, index))
             upsert(run, source, "index", "", obj_name, {"stats": info})
             out["profiled"] += 1

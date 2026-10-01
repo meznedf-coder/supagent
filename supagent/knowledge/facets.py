@@ -33,6 +33,59 @@ from superset import db
 log = logging.getLogger(__name__)
 
 FACETS = ("aspect", "subject", "application", "component")
+BUILTIN = ("subject", "application", "component")
+NAME_OK = re.compile(r"^[a-z][a-z0-9_ ]{1,23}$")
+
+
+def editable() -> tuple[str, ...]:
+    """The categories an admin adds values to and moves values between: subject, application, component and the
+    deployment's own (categories.custom, and those categories.fields reads from the data)."""
+    from supagent import settings
+
+    extra: list[str] = []
+    try:
+        custom, fields = settings.get("categories.custom"), settings.get("categories.fields")
+        extra += [str(x).strip().lower() for x in (custom if isinstance(custom, (list, tuple)) else [])]
+        extra += [str(x).strip().lower() for x in (fields if isinstance(fields, dict) else {})]
+    except Exception:  # pylint: disable=broad-except   (no settings table yet)
+        pass
+    return BUILTIN + tuple(dict.fromkeys(x for x in extra if NAME_OK.match(x) and x not in BUILTIN + ("aspect",)))
+
+
+def field_rules() -> list[tuple[str, Any]]:
+    """(category, compiled regex of field names) from categories.fields (bad patterns left out)."""
+    from supagent import settings
+
+    out = []
+    fields = settings.get("categories.fields")
+    for cat, rx in (fields if isinstance(fields, dict) else {}).items():
+        cat = str(cat).strip().lower()
+        if cat not in editable():
+            continue
+        try:
+            out.append((cat, re.compile(str(rx), re.I)))
+        except re.error:
+            log.warning("supagent categories: bad field pattern for %s: %r", cat, rx)
+    return out
+
+
+def review_all() -> bool:
+    """categories.review_all: nothing the LLM finds is used before an admin approves it."""
+    from supagent import settings
+
+    try:
+        return bool(settings.get("categories.review_all"))
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
+def rank(category: str) -> int:
+    """Wider first: subject, application, component, then the deployment's own in their order."""
+    cats = list(editable())
+    return cats.index(category) if category in cats else len(cats)
+
+
+EDITABLE = BUILTIN       # the built-in ones; editable() adds the deployment's own
 ASPECTS = ("functional", "technical")
 LINK_KINDS = ("about", "depends_on", "part_of", "explains", "runs_on", "same_as")
 BATCH = 8                   # items per LLM call
@@ -55,7 +108,8 @@ def base_ref(ref: str) -> str:
 # --------------------------------------------------------------------------------------------- #
 # the vocabulary
 # --------------------------------------------------------------------------------------------- #
-def _ensure(facet: str, value: str, status: str, source: str, description: str | None = None) -> Any:
+def _ensure(facet: str, value: str, status: str, source: str, description: str | None = None,
+            origin: str | None = None) -> Any:
     from supagent.models import Facet
 
     value = " ".join(str(value or "").split())[:128]
@@ -68,7 +122,43 @@ def _ensure(facet: str, value: str, status: str, source: str, description: str |
         db.session.flush()
     elif f.status == "proposed" and status == "approved":
         f.status, f.source = "approved", source
+    if origin and origin not in (f.origins or []):
+        f.origins = ((f.origins or []) + [origin])[-10:]          # where it comes from, the latest ten
     return f
+
+
+def merge_value(f: Any, to: Any) -> None:
+    """Value f joins value `to` (of the same category or another): its items move there (once each), its name
+    becomes one of the other's names, f goes. Into an approved value, the items the LLM was sure of are used at
+    once, as when a value is approved (they were waiting for f's approval; the unsure ones stay to review): the
+    merged value's count follows at once."""
+    from supagent.models import Tag
+
+    for t in db.session.query(Tag).filter(Tag.facet_id == f.id):
+        if db.session.query(Tag).filter(Tag.ref == t.ref, Tag.facet_id == to.id).first() is None:
+            t.facet_id = to.id
+        else:
+            db.session.delete(t)
+    db.session.flush()
+    if to.status == "approved" and not review_all():
+        for t in db.session.query(Tag).filter(Tag.facet_id == to.id, Tag.status == "proposed"):
+            if (t.confidence or 0) >= CONFIDENT:
+                t.status = "approved"
+    names = set(to.synonyms or []) | set(f.synonyms or [])
+    if f.value.lower() != to.value.lower():
+        names.add(f.value)
+    to.synonyms = sorted(names)
+    if not to.description and f.description:
+        to.description = f.description
+    # what f was part of, `to` is now; what was part of f is part of `to`
+    to.parents = [p for p in dict.fromkeys(list(to.parents or []) + list(f.parents or [])) if p not in (f.id, to.id)] or None
+    from supagent.models import Facet
+
+    for other in db.session.query(Facet).filter(Facet.id.notin_([f.id, to.id])):
+        if other.parents and f.id in other.parents:
+            other.parents = [p for p in dict.fromkeys(to.id if p == f.id else p for p in other.parents)
+                             if p != other.id] or None
+    db.session.delete(f)
 
 
 def named(value: str) -> bool:
@@ -91,16 +181,58 @@ def seed() -> dict[str, int]:
     cats |= {c for (c,) in db.session.query(KObject.category).filter(KObject.category.isnot(None),
                                                                      KObject.gone_at.is_(None))}
     for c in sorted(x for x in cats if x and x.strip() and x.lower() not in ("context", "lab")):
-        n["subject"] += _ensure("subject", c, "approved", "seed") is not None
+        n["subject"] += _ensure("subject", c, "approved", "seed", origin="a category of the catalog") is not None
+    from supagent import settings
+    from supagent.models import Source
+
+    cap = int(settings.get("categories.max_values") or 1000)
+    names = {s.id: s.database_name for s in db.session.query(Source)} if db.session.query(Source).count() else {}
+    rules = field_rules()
     for o in db.session.query(KObject).filter(KObject.kind.in_(("field", "label")), KObject.gone_at.is_(None)):
-        if not APP_FIELDS.match(o.name or ""):
-            continue
-        values = (o.stats or {}).get("values") or []
-        if 0 < len(values) <= MAX_DATA_VALUES and not (o.stats or {}).get("partial"):
+        for cat, rx in rules:
+            if not rx.match(o.name or ""):
+                continue
+            values = (o.stats or {}).get("values") or []
+            most = MAX_DATA_VALUES if cat == "application" else cap
+            if not (0 < len(values) <= most) or (o.stats or {}).get("partial"):
+                continue
+            where = f"field {o.name} of {o.parent}" + (f" ({names[o.source_id]})" if o.source_id in names else "")
             for v in values:
                 if named(str(v)):
-                    n["application"] += _ensure("application", str(v), "approved", "data") is not None
+                    n[cat] = n.get(cat, 0) + (_ensure(cat, str(v), "approved", "data", origin=where) is not None)
+    n["relations"] = relations_from_data()
     db.session.commit()
+    return n
+
+
+def relations_from_data() -> int:
+    """Two category fields of one index (APPLICATION and NODE...): the values that go together in its documents
+    (the profile's sample) are proposed as one part of the other, the wider category above (an application above
+    its servers), to approve in To review; never applied without an admin."""
+    from supagent import settings
+    from supagent.models import Facet, KObject
+
+    least = int(settings.get("categories.relation_min_docs") or 5)
+    values: dict[tuple[str, str], Any] = {}
+    for f in db.session.query(Facet).filter(Facet.status != "rejected", Facet.facet.in_(list(editable()))):
+        values.setdefault((f.facet, f.value.lower()), f)
+    n = 0
+    for idx in db.session.query(KObject).filter(KObject.kind == "index", KObject.gone_at.is_(None)):
+        for grp in (idx.stats or {}).get("category_pairs") or []:
+            (pcat, pfield), (ccat, cfield) = grp.get("parent") or ("", ""), grp.get("child") or ("", "")
+            for pv, cv, docs in (grp.get("pairs") or [])[:5000]:
+                if docs < least:
+                    continue
+                parent, child = values.get((pcat, str(pv).lower())), values.get((ccat, str(cv).lower()))
+                if parent is None or child is None or parent.id == child.id or parent.id in (child.parents or []):
+                    continue
+                sug = dict(child.suggested or {})
+                if parent.id in (sug.get("parents") or []) or parent.id in (sug.get("declined") or []):
+                    continue
+                sug["parents"] = list(sug.get("parents") or []) + [parent.id]
+                sug.setdefault("from", {})[str(parent.id)] = f"{idx.name}: {pfield} {pv} with {cfield} {cv} in {docs} documents"
+                child.suggested = sug
+                n += 1
     return n
 
 
@@ -108,7 +240,7 @@ def vocabulary(with_proposed: bool = True) -> dict[str, list[dict[str, Any]]]:
     from supagent.models import Facet
 
     q = db.session.query(Facet).filter(Facet.status.in_(("approved", "proposed") if with_proposed else ("approved",)))
-    out: dict[str, list[dict[str, Any]]] = {f: [] for f in FACETS}
+    out: dict[str, list[dict[str, Any]]] = {f: [] for f in ("aspect",) + editable()}
     for f in q.order_by(Facet.facet, Facet.value):
         out.setdefault(f.facet, []).append({"id": f.id, "value": f.value, "status": f.status,
                                             "description": f.description or "", "source": f.source})
@@ -121,7 +253,7 @@ def vocabulary(with_proposed: bool = True) -> dict[str, list[dict[str, Any]]]:
 def items() -> Iterator[dict[str, Any]]:
     """Every item to classify: its ref, kind, title and text (what the LLM reads)."""
     from supagent.knowledge.experience import USED
-    from supagent.models import ContextPage, Doc, Entry, KObject, Memory, Recipe
+    from supagent.models import ContextPage, Doc, Entry, KObject, Memory, Note, Recipe
 
     for e in db.session.query(Entry).filter(Entry.deleted_at.is_(None), Entry.enabled.is_(True)):
         yield {"ref": f"entry:{e.id}", "kind": e.classification, "title": e.title, "text": e.content or ""}
@@ -129,6 +261,8 @@ def items() -> Iterator[dict[str, Any]]:
         yield {"ref": f"memory:{m.id}", "kind": "memory", "title": (m.text or "")[:80], "text": m.text or ""}
     for d in db.session.query(Doc).filter(Doc.enabled.is_(True), Doc.content.isnot(None)):
         yield {"ref": f"doc:{d.id}", "kind": "document", "title": d.title or d.url or "", "text": d.content or ""}
+    for n in db.session.query(Note).filter(Note.scope == "team"):          # a personal note stays its author's
+        yield {"ref": f"note:{n.id}", "kind": "team note", "title": n.title or "", "text": n.text or ""}
     for p in db.session.query(ContextPage):
         yield {"ref": f"context:{p.id}", "kind": f"context ({p.section})", "title": p.title, "text": p.content or ""}
     for r in db.session.query(Recipe).filter(Recipe.status.in_(USED)):
@@ -194,7 +328,16 @@ CLASSIFY_TOOL = {"type": "function", "function": {
             "required": ["ref", "aspect"]}},
         "new_values": {"type": "array", "items": {"type": "object", "properties": {
             "facet": {"type": "string", "enum": ["subject", "application", "component"]},
-            "value": {"type": "string"}, "description": {"type": "string"}}, "required": ["facet", "value"]}}},
+            "value": {"type": "string"}, "description": {"type": "string"},
+            "part_of": {"type": "array", "items": {"type": "string"},
+                        "description": "known values this new one is part of (the applications a component belongs to, "
+                                       "the subject of an application); several when it is shared"},
+            "same_as": {"type": "string", "description": "a known value naming the same thing, if any"}},
+            "required": ["facet", "value"]}},
+        "known_value_parents": {"type": "array", "description": "what the texts say about known values: one is part of "
+                                "others (a component of two applications)", "items": {"type": "object", "properties": {
+                                    "value": {"type": "string"}, "part_of": {"type": "array", "items": {"type": "string"}}},
+                                    "required": ["value", "part_of"]}}},
         "required": ["items"]}}}
 
 CLASSIFY_SYSTEM = ("You classify pieces of knowledge of a company's data platform (catalog entries, notes, documents, "
@@ -205,14 +348,34 @@ CLASSIFY_SYSTEM = ("You classify pieces of knowledge of a company's data platfor
                    "runs_on). A component is a part of the systems (a service, a job or batch, a report, a "
                    "pipeline, a group of servers), never the name of a table, index, metric or field: those are "
                    "relations (about). Use the known values below, written exactly; when none fits, add a new value "
-                   "in new_values with a short description (a general subject, never a single record). Only what "
-                   "the text says. Call classify_items once.")
+                   "in new_values with a short description (a general subject, never a single record), the known "
+                   "values it is part of (a component of one application or several, an application of a subject) "
+                   "and, when it names the same thing as a known value, that value (same_as). When a text says a "
+                   "known value is part of other known values, give it in known_value_parents. Only what the text "
+                   "says. Call classify_items once.")
+
+
+def classify_tool() -> dict[str, Any]:
+    """The tool with the deployment's own categories (categories.custom / categories.fields) as well."""
+    import copy
+
+    tool = copy.deepcopy(CLASSIFY_TOOL)
+    props = tool["function"]["parameters"]["properties"]
+    cats = list(editable())
+    props["new_values"]["items"]["properties"]["facet"]["enum"] = cats
+    own = [c for c in cats if c not in BUILTIN]
+    if own:
+        props["items"]["items"]["properties"]["others"] = {
+            "type": "array", "description": "values of the other categories: " + ", ".join(own),
+            "items": {"type": "object", "properties": {"category": {"type": "string", "enum": own},
+                                                       "value": {"type": "string"}}, "required": ["category", "value"]}}
+    return tool
 
 
 def classify_messages(batch: list[dict[str, Any]], vocab: dict[str, list[dict[str, Any]]],
                       tables: list[str]) -> list[dict[str, str]]:
     lines = ["Known values:"]
-    for facet in ("subject", "application", "component"):
+    for facet in editable():
         vals = [v["value"] for v in vocab.get(facet, [])][:120]
         lines.append(f"- {facet}: " + (", ".join(vals) if vals else "(none yet)"))
     if tables:
@@ -258,17 +421,53 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
     from supagent.models import Classified, Facet, Link, Tag
 
     n = {"tags": 0, "proposed": 0, "links": 0}
+    strict = review_all()
 
     def data_name(facet: str, value: str) -> str | None:     # a "component" that is a table's name: a link
         return table_refs.get(value.strip().lower()) if facet == "component" else None
 
+    def known(name: Any, not_id: int | None = None) -> Any:
+        """A known value (any editable category, not retired) by its name or one of its other names."""
+        name = " ".join(str(name or "").split())
+        if not name:
+            return None
+        rows = db.session.query(Facet).filter(Facet.facet.in_(list(editable())), Facet.status != "rejected")
+        hit = rows.filter(Facet.value.ilike(name)).order_by(Facet.status).first()
+        if hit is None:
+            low = name.lower()
+            hit = next((x for x in rows if any(str(s).lower() == low for s in (x.synonyms or []))), None)
+        return None if hit is None or hit.id == not_id else hit
+
     for nv in args.get("new_values") or []:
         if data_name(str(nv.get("facet") or ""), str(nv.get("value") or "")):
             continue
-        if nv.get("facet") in ("subject", "application", "component") and str(nv.get("value") or "").strip():
+        if nv.get("facet") in editable() and str(nv.get("value") or "").strip():
             f = _ensure(nv["facet"], nv["value"], "proposed", "llm", str(nv.get("description") or "")[:500] or None)
             if f is not None and f.status == "proposed":
                 n["proposed"] += 1
+                if not f.origins:
+                    f.origins = ["proposed by the LLM from the texts it read"]
+                parents = [p.id for p in (known(x, f.id) for x in (nv.get("part_of") or [])[:6]) if p is not None]
+                if parents:                           # shown with the value in the review, approved with it
+                    f.parents = list(dict.fromkeys(list(f.parents or []) + parents))
+                same = known(nv.get("same_as"), f.id) if nv.get("same_as") else None
+                if same is not None and same.facet == f.facet:
+                    f.suggested = {**(f.suggested or {}), "same_as": same.id}     # one click: merge
+    for kv in args.get("known_value_parents") or []:  # known values said part of others: an admin decides
+        f = known(kv.get("value"))
+        if f is None:
+            continue
+        have = set(f.parents or [])
+        new = [p.id for p in (known(x, f.id) for x in (kv.get("part_of") or [])[:6])
+               if p is not None and p.id not in have]
+        if not new:
+            continue
+        if f.status == "proposed":                    # waiting anyway: with the value
+            f.parents = list(dict.fromkeys(list(f.parents or []) + new))
+        else:
+            old = (f.suggested or {}).get("parents") or []
+            f.suggested = {**(f.suggested or {}), "parents": list(dict.fromkeys(list(old) + new))}
+            n["relations"] = n.get("relations", 0) + 1
     by_ref = {it["ref"]: it for it in batch}
     for row in args.get("items") or []:
         ref = str(row.get("ref") or "").strip("[] ")
@@ -289,6 +488,10 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
                     links.append({"to": str(v), "kind": "about"})
                 else:
                     wanted.append((facet, str(v)))
+        own = set(editable()) - set(BUILTIN)
+        for o in (row.get("others") or [])[:6]:            # the deployment's own categories (server, team...)
+            if isinstance(o, dict) and o.get("category") in own and str(o.get("value") or "").strip():
+                wanted.append((o["category"], str(o["value"])))
         for facet, value in wanted:
             f = (db.session.query(Facet).filter(Facet.facet == facet, Facet.value.ilike(value.strip())).first()
                  or _ensure(facet, value, "proposed", "llm"))
@@ -297,7 +500,8 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
             t = db.session.query(Tag).filter(Tag.ref == ref, Tag.facet_id == f.id).first()
             if t is None:
                 db.session.add(Tag(ref=ref, facet_id=f.id, confidence=conf, source="llm",
-                                   status="approved" if f.status == "approved" and conf >= CONFIDENT else "proposed"))
+                                   status="approved" if f.status == "approved" and conf >= CONFIDENT and not strict
+                                   else "proposed"))
                 n["tags"] += 1
             elif t.source == "llm" and t.status != "rejected":
                 t.confidence = conf
@@ -310,7 +514,7 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
                 continue
             if db.session.query(Link).filter(Link.a_ref == ref, Link.b_ref == b, Link.kind == kind).first() is None:
                 db.session.add(Link(a_ref=ref, b_ref=b, kind=kind, confidence=conf, source="llm",
-                                    status="approved" if conf >= CONFIDENT and kind not in REVIEWED_LINKS
+                                    status="approved" if conf >= CONFIDENT and kind not in REVIEWED_LINKS and not strict
                                     else "proposed"))
                 n["links"] += 1
     for it in batch:                              # classified: not again until its text changes
@@ -340,6 +544,9 @@ def settle() -> dict[str, int]:
             db.session.query(Tag).filter(Tag.facet_id == f.id).delete(synchronize_session=False)
             db.session.delete(f)
             out["values"] += 1
+    if review_all():                                  # nothing used before an admin approves it
+        db.session.commit()
+        return out
     approved = [f.id for f in db.session.query(Facet.id).filter(Facet.status == "approved")]
     out["tags"] = (db.session.query(Tag).filter(Tag.status == "proposed", Tag.source == "llm",
                                                Tag.confidence >= CONFIDENT, Tag.facet_id.in_(approved or [-1]))
@@ -372,7 +579,7 @@ def classify(llm: Any, seconds: float = 900.0, limit: int = 400) -> dict[str, An
         check()
         batch = todo[i:i + BATCH]
         try:
-            msg = llm.chat(classify_messages(batch, vocabulary(), tables), tools=[CLASSIFY_TOOL], max_tokens=2500)
+            msg = llm.chat(classify_messages(batch, vocabulary(), tables), tools=[classify_tool()], max_tokens=2500)
         except Exception as ex:  # pylint: disable=broad-except
             log.warning("supagent facets: classification failed: %s", str(ex)[:300])
             out["error"] = str(ex)[:300]
@@ -381,7 +588,7 @@ def classify(llm: Any, seconds: float = 900.0, limit: int = 400) -> dict[str, An
         n = apply(_args(msg), batch, table_refs)
         out["items"] += len(batch)
         for k, v in n.items():
-            out[k] += v
+            out[k] = out.get(k, 0) + v
     if out["tags"] or out["links"]:
         from supagent.knowledge.freshness import touch
 
@@ -396,8 +603,28 @@ def classify(llm: Any, seconds: float = 900.0, limit: int = 400) -> dict[str, An
 _CACHE: dict[str, Any] = {"at": 0.0, "stamp": None, "tags": {}}
 
 
+def lineage(fid: int, values: dict[int, Any], depth: int = 4) -> list[int]:
+    """The value and every approved value it is part of (its parents, theirs... `depth` levels up), each once,
+    cycles ignored."""
+    out: list[int] = []
+    level = [fid]
+    for _ in range(depth + 1):
+        nxt: list[int] = []
+        for i in level:
+            v = values.get(i)
+            if v is None or i in out:
+                continue
+            out.append(i)
+            nxt += [int(x) for x in (v.parents or []) if str(x).isdigit()]
+        if not nxt:
+            break
+        level = nxt
+    return out
+
+
 def _approved() -> dict[str, list[str]]:
-    """ref -> ["facet: value", ...] of the approved tags (cached, reloaded when the knowledge changes)."""
+    """ref -> ["facet: value", ...] of the approved tags (cached, reloaded when the knowledge changes); an item
+    tagged with a value is also about each value that one is part of (a component of two applications: both)."""
     from supagent.knowledge.freshness import stamp
     from supagent.models import Facet, Tag
 
@@ -406,14 +633,29 @@ def _approved() -> dict[str, list[str]]:
         return _CACHE["tags"]
     out: dict[str, list[str]] = {}
     try:
-        rows = (db.session.query(Tag.ref, Facet.facet, Facet.value).join(Facet, Facet.id == Tag.facet_id)
-                .filter(Tag.status == "approved", Facet.status == "approved"))
-        for ref, facet, value in rows:
-            out.setdefault(ref, []).append(f"{facet}: {value}")
+        values = {f.id: f for f in db.session.query(Facet).filter(Facet.status == "approved")}
+        rows = db.session.query(Tag.ref, Tag.facet_id).filter(Tag.status == "approved")
+        for ref, fid in rows:
+            for i in lineage(fid, values):
+                out.setdefault(ref, []).append(f"{values[i].facet}: {values[i].value}")
     except Exception:  # pylint: disable=broad-except   (tables not created yet)
         db.session.rollback()
     _CACHE.update(at=time.time(), stamp=s, tags=out)
     return out
+
+
+def clean_parents(fid: int | None, wanted: Any) -> list[int]:
+    """The parents asked for a value (ids or "1,2"), kept when they are other values of the editable categories
+    that are not retired; the order kept, each once."""
+    from supagent.models import Facet
+
+    raw = wanted if isinstance(wanted, list) else str(wanted or "").split(",")
+    ids = list(dict.fromkeys(int(x) for x in raw if str(x).strip().isdigit() and int(x) != fid))
+    if not ids:
+        return []
+    ok = {f.id for f in db.session.query(Facet).filter(Facet.id.in_(ids), Facet.facet.in_(list(editable())),
+                                                       Facet.status != "rejected")}
+    return [i for i in ids if i in ok]
 
 
 def facets_of(refs: list[str]) -> dict[str, list[str]]:
@@ -435,6 +677,56 @@ def facets_of(refs: list[str]) -> dict[str, list[str]]:
             got += tags.get(fam[int(m.group(1))], [])
         if got:
             out[r] = sorted(set(got))
+    return out
+
+
+REF_KINDS = {"entry": "catalog entries", "memory": "team memories", "doc": "documents", "note": "notes",
+             "context": "Context pages", "recipe": "learned answers", "family": "metric families"}
+
+
+def system_map() -> list[dict[str, Any]]:
+    """The system picture from the categories: every approved value, what it is part of (several: a jvm of two
+    applications and four components), and the items about it that exist now, by kind (a metric removed, a note
+    deleted: no longer counted; a value with none says so). The page draws it as a tree from the values that are
+    part of nothing."""
+    from supagent.models import Chunk, Facet, KObject, Tag
+
+    values = {f.id: f for f in db.session.query(Facet).filter(Facet.status == "approved", Facet.facet.in_(list(editable())))}
+    if not values:
+        return []
+    refs: dict[int, set[str]] = {}
+    for ref, fid in db.session.query(Tag.ref, Tag.facet_id).filter(Tag.status == "approved",
+                                                                   Tag.facet_id.in_(list(values))):
+        refs.setdefault(fid, set()).add(base_ref(ref))
+    every = {r for rs in refs.values() for r in rs}
+    obj_ids = [int(r.split(":")[1]) for r in every if re.match(r"^object:\d+$", r)]
+    objs = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(obj_ids or [-1]))}
+    live_families = set()
+    if any(r.startswith("family:") for r in every):
+        for o in db.session.query(KObject).filter(KObject.kind == "metric", KObject.gone_at.is_(None)):
+            live_families.add(family_of(o.source_id, o.name))
+    pieces = {r.split("#", 1)[0] for (r,) in db.session.query(Chunk.ref).filter(
+        Chunk.ref.notlike("object:%"), Chunk.ref.notlike("superset:%"))}
+
+    def kind_if_live(r: str) -> str | None:
+        k, _, rest = r.partition(":")
+        if k == "object":
+            o = objs.get(int(rest)) if rest.isdigit() else None
+            return None if o is None or o.gone_at is not None else {"metric": "metrics", "index": "indices"}.get(o.kind, o.kind + "s")
+        if k == "family":
+            return REF_KINDS[k] if r in live_families else None
+        return REF_KINDS.get(k) if r in pieces else None
+
+    out = []
+    for f in sorted(values.values(), key=lambda x: (FACETS.index(x.facet) if x.facet in FACETS else 9, x.value.lower())):
+        kinds: dict[str, int] = {}
+        for r in refs.get(f.id, ()):
+            k = kind_if_live(r)
+            if k:
+                kinds[k] = kinds.get(k, 0) + 1
+        out.append({"id": f.id, "facet": f.facet, "value": f.value, "description": f.description,
+                    "parents": [i for i in (f.parents or []) if i in values and i != f.id],
+                    "items": sum(kinds.values()), "kinds": kinds, "tagged": len(refs.get(f.id, ()))})
     return out
 
 

@@ -354,3 +354,15 @@ def test_a_call_written_as_text_after_the_last_call_is_not_the_answer(ctx, monke
     answer, _trace = a.ask("Which applications failed?")
     assert "<tool_call>" not in answer and "<function=" not in answer
     assert answer.endswith("(Stopped: the tool calls of one answer were used up; ask a narrower question.)")
+
+
+def test_two_calls_before_the_end_the_model_is_told_to_answer(ctx, monkeypatch):
+    """An investigation that used its calls up wrote nothing (the retail lab's X2): two calls before the end, the
+    model is told to answer from what it found."""
+    from supagent.agent import LAST_CALLS
+
+    sql = [{"request": {"database_id": 1, "sql": f"SELECT {i} AS n"}} for i in range(9)]
+    a, ran = agent_with(monkeypatch, [call("execute_sql", q) for q in sql] + [say("Found: 8 checks, nothing more.")])
+    answer, _trace = a.ask("Why did the jobs fail?")
+    told = [m for m in a.llm.seen[-1] if m["role"] == "user" and m["content"] == LAST_CALLS]
+    assert len(told) == 1 and len(ran) == 9

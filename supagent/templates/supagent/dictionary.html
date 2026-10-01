@@ -39,6 +39,7 @@
       <button type="button" data-sub="memory">Team memory</button>
       <button type="button" data-sub="context">Context</button>
       <button type="button" data-sub="docs">Documents and sites</button>
+      <button type="button" data-sub="notes">Notes</button>
       <button type="button" data-sub="categories" class="admin-only">Categories</button>
     </nav>
 
@@ -122,11 +123,28 @@
         <tbody></tbody></table></div>
     </div>
 
+    <div id="sub-notes" class="sub" hidden>
+      <p class="lead">What users write down in a few seconds (in the chat: Notes, or <code>/note</code> &hellip; in the
+        question box): what a meeting decided, a fact the team must not lose. The agent finds them, says whose note it
+        is and of which day, and never takes one as a rule. An admin may pin a note for everyone, or make a catalog
+        entry of it (then verified).</p>
+      <div class="filters">
+        <input id="note-q" type="search" placeholder="Search the notes" aria-label="Search the notes">
+        <select id="note-who" aria-label="Whose notes"><option value="">The team's and mine</option>
+          <option value="mine">Mine</option></select>
+      </div>
+      <div class="table-wrap"><table class="grid" id="notes">
+        <thead><tr><th>Note</th><th>By</th><th>Day</th><th>For</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+      <div class="pager" id="note-pager"></div>
+    </div>
+
     <div id="sub-categories" class="sub" hidden>
       <p class="lead">Every piece of knowledge is classified, in this platform's own words: functional or technical,
         its subjects, the applications and the components it is about. The LLM classifies what changes every day and
-        may propose new values; a new value is used once an admin approves it. The router and the search use them to
-        find the knowledge a question needs.</p>
+        may propose new values; a new value is used once an admin approves it. An admin also adds a value here (used
+        at once) and, with Edit, moves a value to another category. The router and the search use them to find the
+        knowledge a question needs.</p>
       <div class="filters">
         <select id="fac-facet" aria-label="Category"><option value="">All categories</option>
           <option value="subject">Subjects</option><option value="application">Applications</option>
@@ -135,9 +153,38 @@
           <option value="approved">Approved</option><option value="proposed">Proposed</option></select>
         <input id="fac-q" type="search" placeholder="Search the values" aria-label="Search the categories">
       </div>
-      <div class="table-wrap"><table class="grid" id="facets">
+      <div class="filters facet-add" role="group" aria-label="Add a value">
+        <select id="fac-new-facet" aria-label="Category of the new value"><option value="subject">Subject</option>
+          <option value="application">Application</option><option value="component">Component</option></select>
+        <input id="fac-new-value" type="text" maxlength="128" placeholder="New value, e.g. Pricing" aria-label="New value">
+        <input id="fac-new-desc" type="text" placeholder="What it covers (optional)" aria-label="What it covers">
+        <input id="fac-new-syn" type="text" placeholder="Also called (comma separated)" aria-label="Also called">
+        <select id="fac-new-parents" multiple size="3" class="facet-parents-select"
+          aria-label="Part of (Ctrl or Cmd + click for several)" title="Part of: Ctrl or Cmd + click for several"></select>
+        <button type="button" class="btn primary" id="fac-add">Add</button>
+        <span id="fac-result" class="result" role="status" aria-live="polite"></span>
+      </div>
+      <details class="cat-own" id="cat-own">
+        <summary>Categories and where their values come from</summary>
+        <p class="muted">Subject, application and component, and your own (server, environment, team…). A category
+          can read its values from the data: the fields whose names match its pattern (e.g. <code>^(host|node|server)$</code>);
+          two such fields of one index tell which values go together, proposed to you as "part of" in To review.</p>
+        <ul id="cat-own-list" class="cat-own-list"></ul>
+        <div class="filters" role="group" aria-label="Add a category">
+          <input id="cat-own-name" type="text" maxlength="24" placeholder="New category, e.g. server" aria-label="New category">
+          <input id="cat-own-fields" type="text" placeholder="Field names it reads, e.g. ^(host|node|server)$" aria-label="Field names pattern">
+          <button type="button" class="btn" id="cat-own-add">Add or change</button>
+          <span id="cat-own-result" class="result" role="status" aria-live="polite"></span>
+        </div>
+      </details>
+      <div class="viewswitch" role="group" aria-label="View">
+        <button type="button" class="btn small on" id="fac-view-list" aria-pressed="true">List</button>
+        <button type="button" class="btn small" id="fac-view-map" aria-pressed="false">System map</button>
+      </div>
+      <div class="table-wrap" id="fac-list"><table class="grid" id="facets">
         <thead><tr><th>Value</th><th>Category</th><th class="num">Items</th><th>For example</th><th>State</th><th></th></tr></thead>
         <tbody></tbody></table></div>
+      <div id="fac-map" class="fac-map" hidden></div>
     </div>
   </section>
 
@@ -210,9 +257,20 @@
       <thead><tr><th>Entry</th><th>Classification</th><th>From</th><th>Updated</th></tr></thead>
       <tbody></tbody></table></div>
     <h2 class="section-title">Where the data of the questions was</h2>
+    <p class="muted">The tables the answers read, with the words of the questions that led there (stems: "fail"
+      for failed, failure...) and how many answers used each. A word in <strong>bold</strong> led only there; the
+      grey ones also led to other tables (point at one: which, and in which databases): alone, such a word does not
+      say where the data is. Learned from the answers; an answer marked Not helpful takes back what it taught.
+      Admins: &times; removes a word from a table.</p>
+    <div class="filters">
+      <input id="w-q" type="search" placeholder="A word or a table" aria-label="Search the words and tables">
+      <select id="w-db" aria-label="Database"><option value="">Every database</option></select>
+    </div>
     <div class="table-wrap"><table class="grid" id="associations">
-      <thead><tr><th>Word of the questions</th><th>Where the data was</th><th>Database</th><th class="num">Uses</th></tr></thead>
+      <thead><tr><th>Where the data was</th><th>Database</th><th>Words of the questions that led there</th>
+        <th class="num">Answers</th><th>Last</th></tr></thead>
       <tbody></tbody></table></div>
+    <div class="pager" id="w-pager"></div>
     <h2 class="section-title">Query timings</h2>
     <p class="muted">How long each kind of query took (values replaced by ?), slowest first: the agent sees them next
       to the metric or index it is about to query.</p>
@@ -235,7 +293,9 @@
         <option value="context">Context</option></select>
       <button type="submit" class="btn primary">Search</button>
     </form>
+    <div id="k-count" class="muted k-count" role="status" aria-live="polite"></div>
     <div id="k-results" class="k-results"></div>
+    <div class="pager" id="k-pager" hidden></div>
   </section>
 </div>
 

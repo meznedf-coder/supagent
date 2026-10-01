@@ -97,11 +97,111 @@ def has_period(question: str, today: dt.date) -> bool:
 
 
 def whole_day(question: str, today: dt.date) -> dt.date | None:
-    """The one day the question is about, whole (no hours, no part of the day, no comparison)."""
+    """The one day the question is about, whole (no hours, no part of the day, no comparison; "on 17 and 18
+    September" is a span of two days, not the 18th)."""
     days = days_named(question, today)
-    if len(days) != 1 or PART_OF_DAY.search(question or "") or COMPARED.search(question or ""):
+    if len(days) != 1 or PART_OF_DAY.search(question or "") or COMPARED.search(question or "") \
+            or ranges_named(question, today):
         return None
     return days[0]
+
+
+# the time field the question's words name: "shipped on 17 September" is the period of SHIPPED_TIME, "orders of 22
+# September" of ORDER_DATE, whatever the index's main time field (the learner's) is
+EVENT_GENERIC = {"time", "date", "timestamp", "datetime", "at", "ts", "day", "dt", "utc", "on", "of", "local", "the"}
+DATE_PHRASES = (DAY_RANGE, DAY_MONTH, MONTH_DAY, ISO_DAY,
+                re.compile(rf"\b(?:in|during|for|of|since)\s+{MONTH}", re.I),
+                re.compile(r"\b(yesterday|today|hier|aujourd)", re.I))
+EVENT_WINDOW = 3                       # words before a date phrase that may name its event
+
+
+def _date_fields(tables: set[str]) -> dict[str, list[str]]:
+    """The date fields of each index (the dictionary's)."""
+    from supagent.models import KObject
+
+    out: dict[str, list[str]] = {}
+    for parent, name in db.session.query(KObject.parent, KObject.name).filter(
+            KObject.kind == "field", KObject.parent.in_(list(tables) or ["-"]), KObject.gone_at.is_(None),
+            KObject.data_type.in_(("date", "date_nanos", "timestamp", "datetime"))):
+        out.setdefault(parent, []).append(name)
+    return out
+
+
+def _alike(a: str, b: str) -> bool:
+    """The same word, or one with a common start of 5 letters at least (delivery, delivered)."""
+    if a == b:
+        return True
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= 5 and min(len(a), len(b)) >= 5
+
+
+def event_words(question: str) -> set[str]:
+    """The words just before each date phrase of the question ("parcels shipped on 17 September": parcels,
+    shipped, on)."""
+    text = question or ""
+    out: set[str] = set()
+    for rx in DATE_PHRASES:
+        for m in rx.finditer(text):
+            before = re.findall(r"[a-zà-ÿ]+", text[:m.start()].lower())
+            out |= set(before[-EVENT_WINDOW:])
+    return out - EVENT_GENERIC
+
+
+def _fields_said(words: set[str], fields: list[str] | set[str]) -> set[str]:
+    """The fields among these whose name one of these words says (shipped: SHIPPED_TIME)."""
+    out: set[str] = set()
+    for f in fields:
+        parts = [t for t in re.split(r"[^a-z0-9]+", f.lower()) if t and t not in EVENT_GENERIC]
+        if parts and any(_alike(p, w) for p in parts for w in words):
+            out.add(f)
+    return out
+
+
+def named_among(question: str, fields: list[str] | set[str]) -> set[str]:
+    """The date fields among these whose name the question says next to a date."""
+    said = event_words(question)
+    return _fields_said(said, fields) if said else set()
+
+
+def named_days(question: str, fields: list[str] | set[str], today: dt.date) -> dict[dt.date, set[str]]:
+    """{a day the question names: the date fields its words name just before it} ("orders of 22 September were
+    shipped on 24 September or later": 22 September, ORDER_DATE; 24 September, SHIPPED_TIME). A span: its first
+    day."""
+    text = question or ""
+    found: list[tuple[int, dt.date | None]] = []
+    found += [(m.start(), _day(int(m.group(1)), m.group(3), m.group(4), today)) for m in DAY_RANGE.finditer(text)]
+    found += [(m.start(), _day(int(m.group(1)), m.group(2), m.group(3), today)) for m in DAY_MONTH.finditer(text)]
+    found += [(m.start(), _day(int(m.group(2)), m.group(1), m.group(3), today)) for m in MONTH_DAY.finditer(text)]
+    for m in ISO_DAY.finditer(text):
+        try:
+            found.append((m.start(), dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))))
+        except ValueError:
+            pass
+    out: dict[dt.date, set[str]] = {}
+    for start, day in found:
+        if day is None:
+            continue
+        words = set(re.findall(r"[a-zà-ÿ]+", text[:start].lower())[-EVENT_WINDOW:]) - EVENT_GENERIC
+        hit = _fields_said(words, fields)
+        if hit:
+            out.setdefault(day, set()).update(hit)
+    return out
+
+
+def named_time_fields(question: str, tables: set[str]) -> dict[str, set[str]]:
+    """{index: its date fields whose name the question says next to a date}."""
+    if not event_words(question):
+        return {}
+    out: dict[str, set[str]] = {}
+    for table, fields in _date_fields(tables).items():
+        hit = named_among(question, fields)
+        if hit:
+            out[table] = hit
+    return out
 
 
 def _time_fields(tables: set[str]) -> dict[str, str]:
@@ -147,11 +247,12 @@ def _timed_date_fields(tables: set[str]) -> dict[str, str]:
 
 
 def day_equality(sql: str, tables: set[str]) -> str | None:
-    """A date field whose values carry a time, compared with a date alone ("TRADE_DATE" = '2026-09-23'): it
-    finds nothing. The day is a range."""
+    """A date field whose values carry a time, compared with a date alone ("TRADE_DATE" = '2026-09-23', = DATE
+    '2026-09-23', = TIMESTAMP '2026-09-23 00:00'): it finds nothing. The day is a range."""
     fields = _timed_date_fields(tables) if tables else {}
     for field, sample in sorted(fields.items()):
-        m = re.search(rf"(?<![\w@])\"?{re.escape(field)}\"?\s*(?:=|\bIN\s*\(\s*)\s*'(\d{{4}}-\d{{2}}-\d{{2}})'", sql, re.I)
+        m = re.search(rf"(?<![\w@])\"?{re.escape(field)}\"?\s*(?:=|\bIN\s*\(\s*)\s*(?:(?:DATE|TIMESTAMP)\s+)?"
+                      rf"'(\d{{4}}-\d{{2}}-\d{{2}})(?:[ T]00:00(?::00(?:\.0+)?)?)?'", sql, re.I)      # DATE '...' too
         if m is None:
             continue
         try:
@@ -193,7 +294,22 @@ def refusal(question: str, tool: str, args: dict, today: dt.date | None = None) 
     if not fields:
         return None
     asks_business = bool(BUSINESS.search(question))
+    named = named_time_fields(question, tables)
+    dates = _date_fields(set(named)) if named else {}
     for table, field in sorted(fields.items()):
+        names = named.get(table) or set()
+        if names:                                       # the question names the event of its period
+            used = {f for f in dates.get(table, []) if re.search(rf"(?<![\w@]){re.escape(f)}(?![\w])", sql)}
+            if used & names:
+                continue
+            want = " or ".join(f'"{f}"' for f in sorted(names))
+            if used:
+                return (f"tool error (not run: period): the question's words name the time of its period: {want} of "
+                        f"{table}, and this query puts the period on {', '.join(sorted(used))}. Put the question's "
+                        f"period on {want}. If {sorted(used)[0]} is meant, send this same call again unchanged.")
+            return (f"tool error (not run: period): the question is about a period and this query has no filter on "
+                    f"{want} of {table}, the time its words name: it would count every date. Add the question's "
+                    "period on it. If that is meant, send this same call again unchanged.")
         uses_time = re.search(rf"(?<![\w@]){re.escape(field)}(?![\w])", sql) is not None
         if re.search(r"\bPOSITION_(DATE|LABEL|TIME)\b", sql) and not asks_business:
             return (f"tool error (not run: period): the question gives a date, not a position (business) date, and "

@@ -396,10 +396,38 @@ def build_context(reason: str = "manual", llm: bool = True, force: bool = False)
             steps.end(databases=len(ev["databases"]), documents=len(ev["docs"]), catalog_entries=len(ev["entries"]),
                       team_memory=len(ev["memory"]), helpful_answers=len(ev["answers"]),
                       inventory=len(ev["inventory"]), relations=len(ev["relations"]))
+            boards: list[dict[str, Any]] = []
+            if settings.get("charts.scan"):              # the team's charts (0.7): their data, what they show
+                from supagent.knowledge import charts as K
+
+                steps.begin("charts: their last day against the weeks before (no LLM)")
+                try:
+                    steps.end(**K.scan_isolated(run_id))
+                except LearningStopped:
+                    raise
+                except Exception as ex:  # pylint: disable=broad-except   (the rest of the build goes on)
+                    db.session.rollback()
+                    steps.end(error=f"{type(ex).__name__}: {str(ex)[:300]}")
+                if llm:
+                    steps.begin("charts: what they show (LLM)")
+                    try:
+                        from supagent.llm import LLM
+
+                        steps.end(**K.understand(LLM()))
+                    except LearningStopped:
+                        raise
+                    except Exception as ex:  # pylint: disable=broad-except
+                        db.session.rollback()
+                        steps.end(error=f"{type(ex).__name__}: {str(ex)[:300]}")
+                try:
+                    boards = K.dashboard_pages()
+                except Exception:  # pylint: disable=broad-except
+                    db.session.rollback()
+                    log.warning("supagent context: dashboard pages", exc_info=True)
             keep: set[tuple[str, str]] = set()
             steps.begin("facts pages (no LLM)")
             done: dict[str, int] = defaultdict(int)
-            for page in fact_pages(ev):
+            for page in fact_pages(ev) + boards:
                 check()
                 keep.add((page["section"], page["slug"]))
                 done[save_page(page, "facts", _hash([page["title"], page["content"], page["database_ids"]]))] += 1

@@ -15,6 +15,7 @@ MAX_ROWS = 500_000
 TASKS = {"answer": "Answers in the chat", "learn": "Daily learning (descriptions)", "context": "Context (nightly)",
          "memory": "Memory from the chats", "helpful": "Learned answers (Helpful)", "catalog": "Agent catalog",
          "tidy": "Tidying learned answers", "names": "Chat names", "test": "LLM tests",
+         "classify": "Categories of the knowledge", "charts": "What the charts show",
          "background": "Other background work",
          "other": "Other"}
 

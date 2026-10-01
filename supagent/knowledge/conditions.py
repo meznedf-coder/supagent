@@ -35,6 +35,7 @@ TIME_LIKE = re.compile(r"^\d{4}-\d{2}-\d{2}|^\d{8}$|^\d{1,2}:\d{2}")
 DB_VALUE_LISTS = (re.compile(r";\s*values:[^)\n]*"),                               # where_block field lines
                   re.compile(r"tenants \(__tenant_id__[^)]*\):[^;\n)]*"),          # where_block metric lines
                   re.compile(r"^- \[(?:metric|index)\] .*$", re.M))               # dictionary pieces found
+NOTE_LINES = re.compile(r"^- \[teamnote\] .*$", re.M)          # the users' notes found (knowledge_block lines)
 CHECK_TOOLS = ("execute_sql", "create_virtual_dataset", "export_excel", "chart_from_sql", "save_sql_query",
                "promql_query", "compare_to_usual", "send_email")
 FACTORS = (1.0, 60.0, 3600.0, 86400.0, 1000.0, 1024.0, 1024.0 ** 2, 1024.0 ** 3, 1e6, 1e9, 100.0, 0.01, 1 / 60)
@@ -118,6 +119,7 @@ def build(messages: list[dict], people: list[str]) -> Support:
             content = " ".join(re.findall(r"'[^'\n]{1,40}'", content))
         for rx in DB_VALUE_LISTS:
             content = rx.sub(" ", content)
+        content = NOTE_LINES.sub(" ", content)          # a user's note is not verified: never a condition's source
         support.add(content)
     for text in people:
         support.add(text, people=True)
