@@ -54,7 +54,9 @@ def team_rules() -> list[dict[str, Any]]:
 
 
 def _tables(text: str) -> set[str]:
-    """The indices, tables and metrics a query reads (SQL, else PromQL)."""
+    """The indices, tables and metrics a query reads (SQL, else PromQL), with the dictionary's names of them: a
+    query on "jobs*" reads the index the dictionary calls "jobs" (an alias, a family of dated indices), so the
+    checks that look its fields up (the values the question names, the team's rules, the periods) find them."""
     try:
         import sqlglot
         from sqlglot import exp
@@ -63,10 +65,61 @@ def _tables(text: str) -> set[str]:
         ctes = {c.alias_or_name for c in tree.find_all(exp.CTE)}
         names = {t.name for t in tree.find_all(exp.Table) if t.name and t.name not in ctes}
         if names:
-            return names
+            return dictionary_names(names)
     except Exception:  # pylint: disable=broad-except
         pass
     return promql_metrics(text)
+
+
+_KNOWN: dict[str, Any] = {"at": 0.0, "stamp": None, "names": frozenset()}
+
+
+def _known_tables() -> frozenset:
+    """The indices the dictionary knows (cached a minute, reloaded when the knowledge changes)."""
+    import time
+
+    from supagent.models import KObject
+
+    try:
+        from supagent.knowledge.freshness import stamp
+
+        s = stamp()
+    except Exception:  # pylint: disable=broad-except
+        s = None
+    if _KNOWN["stamp"] == s and time.time() - _KNOWN["at"] < 60:
+        return _KNOWN["names"]
+    try:
+        names = frozenset(n for (n,) in db.session.query(KObject.name).filter(
+            KObject.kind == "index", KObject.gone_at.is_(None)).distinct())
+    except Exception:  # pylint: disable=broad-except   (no dictionary yet)
+        db.session.rollback()
+        names = frozenset()
+    _KNOWN.update(at=time.time(), stamp=s, names=names)
+    return names
+
+
+def forget_tables() -> None:
+    """The dictionary's indices read again at the next check (tests; a learning run touches the knowledge)."""
+    _KNOWN.update(at=0.0, stamp=None)
+
+
+def dictionary_names(names: set[str]) -> set[str]:
+    """The tables of a query with the dictionary's indices they read: "jobs*" also as "jobs" and every index of
+    the dictionary the pattern matches; "jobs-2026.10" also as the dictionary's pattern "jobs-*" that covers it."""
+    import fnmatch
+
+    if not names:
+        return names
+    known = _known_tables()
+    if not known:
+        return set(names)
+    out = set(names)
+    for n in names:
+        if any(ch in n for ch in "*?"):
+            out |= {k for k in known if fnmatch.fnmatchcase(k, n) or fnmatch.fnmatchcase(k.rstrip("*"), n)}
+        else:
+            out |= {k for k in known if any(ch in k for ch in "*?") and fnmatch.fnmatchcase(n, k)}
+    return out
 
 
 EXCLUDING = re.compile(r"\b(exclude|excluding|without|never|remove|ignore|skip|do not|don'?t|not|exclure|exclu\w*|"

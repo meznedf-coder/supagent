@@ -381,6 +381,23 @@ def test_a_value_the_question_names_and_no_query_uses_is_sent_back(ruled, monkey
     assert answer.endswith("(Check: the question names BILLING (APPLICATION); no query of this answer filters on it.)")
 
 
+def test_a_table_written_as_a_pattern_is_the_dictionarys_index(ruled):
+    """A production answer queried "<alias>*" (the dictionary's index is "<alias>") and dropped the application the
+    question named: the checks looked the pattern's fields up by its exact name and found none. A pattern reads the
+    dictionary's indices it matches; a dated index reads the dictionary's pattern that covers it."""
+    from supagent.knowledge.named import unused
+    from supagent.knowledge.rulecheck import _tables, dictionary_names, forget_tables
+
+    forget_tables()                                                 # the fixture's dictionary, not a cached one
+    starred = 'SELECT "ERROR_CATEGORY", COUNT(*) FROM "jobs*" WHERE "STATUS" = \'KO\' GROUP BY 1'
+    assert _tables(starred) == {"jobs*", "jobs"}
+    assert unused("For the application BILLING, the KO errors by category?", [starred]) == \
+        [("BILLING", "APPLICATION", "jobs")]
+    assert unused("For the application BILLING, the KO errors by category?",
+                  [starred.replace("WHERE", "WHERE \"APPLICATION\" = 'BILLING' AND")]) == []
+    assert dictionary_names({"no-such-*"}) == {"no-such-*"}
+
+
 def test_a_follow_up_keeps_the_previous_questions_conditions(ruled, monkeypatch):
     """"when I say billing you should know the filter is APPLICATION=BILLING ... show me now only billing", after
     an answer counted with a label: the new queries added the application and dropped the label. The previous

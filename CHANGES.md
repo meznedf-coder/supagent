@@ -1,5 +1,15 @@
 # Changes
 
+## 0.7.1 — 2 Oct 2026
+
+* **A value the question names is kept when the query writes its table as a pattern.** A production answer to
+  "the application X's KO errors of D-1, by category" queried `"<index>*"` while the dictionary knows the index as
+  `"<index>"` (an alias, a family of dated indices): the checks looked the table's fields up by the exact name,
+  found none, and the query that left the application out was not sent back. A query's table written with `*` now
+  reads the dictionary's indices it matches (and a dated index the dictionary's pattern that covers it), for every
+  check that looks fields up: the values the question names, the team's rules, the periods.
+* No table change: `pip install --upgrade` and a restart.
+
 ## 0.7.0 — 1 Oct 2026
 
 * **Notes**: any user writes one in seconds (what a meeting decided), for the team or for themselves: the chat's

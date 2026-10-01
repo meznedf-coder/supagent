@@ -1,19 +1,21 @@
-supagent 0.7.0 - the AI agent inside Apache Superset
+supagent 0.7.1 - the AI agent inside Apache Superset
 ====================================================
 
 What is in this folder
-  supagent-0.7.0-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
+  supagent-0.7.1-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
 
-Upgrading? From 0.6.0: "Upgrade from 0.6.0 to 0.7.0" below; from 0.5.4: the steps of "Upgrade from 0.5.4
-to 0.6.0" with this wheel (init then goes from schema 7 to 13). Steps 1-8 are for a new install.
+Upgrading? From 0.7.0: pip install --upgrade this wheel on every host, then restart the web servers, the Celery
+workers and beat (no table change; superset supagent init is not needed). From 0.6.0: "Upgrade from 0.6.0 to
+0.7.0" below; from 0.5.4: the steps of "Upgrade from 0.5.4 to 0.6.0" with this wheel (init then goes from schema 7
+to 13). Steps 1-8 are for a new install.
 
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.7.0-py3-none-any.whl
+   $PY -m pip install supagent-0.7.1-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
 
 2. Register it: one line in superset_config.py (no logic)
