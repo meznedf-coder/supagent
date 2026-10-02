@@ -492,6 +492,10 @@ def test_a_question_that_goes_on_from_the_last_exchange_is_a_follow_up(ctx, monk
     from supagent.knowledge.topics import Decision
 
     assert refers_back("What was its failure rate?") and refers_back("Quel est son taux d'échec ?")
+    assert refers_back("And their total notional?") and refers_back("How many of its failures were timeouts?")
+    assert not refers_back("Which servers exceeded their memory limit yesterday?")       # its own antecedent
+    assert not refers_back("Did any desk breach its VaR limit on 23 September?")
+    assert not refers_back("Quels serveurs ont dépassé leur limite mémoire hier ?")
     history = [{"role": "user", "content": "How many pricing requests of pricer-eq failed on 22 September?"},
                {"role": "assistant", "content": "37 requests failed."}]
     a, _ran = agent_with(monkeypatch, [say("ok")])

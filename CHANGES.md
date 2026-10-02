@@ -1,5 +1,16 @@
 # Changes
 
+## 0.8.1 — 2 Oct 2026
+
+Two refinements of 0.8.0's checks, found by replaying them on the recorded answers of the end-to-end suite:
+* **The number check accepts the time units said as written** (60 minutes in an hour, 24 hours in a day, 1,440 minutes
+  in a day), as it does 3,600 seconds and the bytes of a GiB: 0.8.0 marked "more than one hour (60 minutes)" or "a
+  24-hour target" with a check note when no result held 60 or 24. A number close to them (59, 61, 23) is still a
+  figure to find in the results.
+* **"its", "their", "son", "leur" refer to the answer before only with nothing before them they could stand for**:
+  "What was its failure rate?", "And their notional?" do; "Which servers exceeded their memory limit yesterday?"
+  is a question of its own (0.8.0 read it as a follow-up: the previous question's conditions could be pushed onto it).
+
 ## 0.8.0 — 2 Oct 2026
 
 The pages:

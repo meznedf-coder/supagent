@@ -39,7 +39,8 @@ CONVERSIONS = (1.0, 100.0, 1 / 60, 1 / 3600, 1 / 86400, 1e-3, 1e-6, 1e-9, 1 / 10
 MAX_ROWS = 300
 APPROX = re.compile(r"\b(about|around|roughly|approximately|approx|nearly|almost|some|over|under|more than|less than|"
                     r"environ|pr[èe]s de|presque|autour de|plus de|moins de)\b|~|≈", re.I)
-UNIT_CONSTANTS = (1024.0, 3600.0, 86400.0, 1024.0 ** 2, 1024.0 ** 3)   # said when converting (bytes per GiB...)
+UNIT_CONSTANTS = (60.0, 24.0, 1440.0, 1024.0, 3600.0, 86400.0, 1024.0 ** 2, 1024.0 ** 3)   # said when converting
+# ("one hour (60 minutes)", "a 24-hour target", bytes per GiB...): as written only
 RATE_ROWS = 50           # rates within a row: of the first rows only (more would make any number "found")
 
 

@@ -64,6 +64,8 @@ def test_a_unit_constant_grounds_only_itself():
     prev = [{"role": "assistant", "content": "The two most-traded products were IRS and SWAPTION, 19 trades each."}]
     assert ungrounded("The desk had 61 trades booked by voice.", prev) == ["61"]
     assert ungrounded("An hour is 3,600 seconds and a GiB 1,073,741,824 bytes.", []) == []
+    assert ungrounded("A 24-hour target; 192 jobs ran more than one hour (60 minutes).",
+                      [{"role": "tool", "content": '{"rows": [{"n": 192}]}'}]) == []     # time units said, as written
 
 
 def test_small_counts_and_years_are_not_checked():

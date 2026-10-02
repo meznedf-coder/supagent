@@ -282,16 +282,28 @@ def intents(question: str) -> set[str]:
 
 # "that finding", "the same", "ce résultat": the question is about an earlier answer
 REFERS_BACK = re.compile(
-    r"\b(that|these|those|it|its|them|their|same|above|previous|earlier|findings?|results?)\b|"
+    r"\b(that|these|those|it|them|same|above|previous|earlier|findings?|results?)\b|"
     r"\bthis\b(?!\s+(week|month|year|morning|afternoon|evening|night|quarter)\b)|"
-    r"\b(cela|ça|celui|celle|ceux|son|sa|ses|leur|leurs|m[êe]mes?|pr[ée]c[ée]dente?s?|ci-dessus|r[ée]sultats?|"
-    r"trouvailles?)\b|"
+    r"\b(cela|ça|celui|celle|ceux|m[êe]mes?|pr[ée]c[ée]dente?s?|ci-dessus|r[ée]sultats?|trouvailles?)\b|"
     r"\b(cet|cette|ces)\b(?!\s+(semaine|ann[ée]e|matin|nuit|apr[èe]s-midi)\b)|"
     r"\bce\s+(graphique|chiffre|r[ée]sultat|tableau|calcul|constat)", re.I)
 
 
+# "What was its failure rate?", "And their notional?", "Quel est son taux ?": a possessive with nothing before it that
+# it could stand for refers to the answer before; "Which servers exceeded their limit?" has its own antecedent
+POSSESSIVE = re.compile(r"\b(its|their|son|sa|ses|leur|leurs)\b", re.I)
+LEAD_WORDS = frozenset(
+    "what was were is are and also then so how about much many did does do which where when why who the of for in on at "
+    "to with by a an has had have et aussi alors quel quelle quels quelles est était sont étaient combien de du des le la "
+    "les a-t-il ont avait".split())
+
+
 def refers_back(question: str) -> bool:
-    return bool(REFERS_BACK.search(question or ""))
+    text = question or ""
+    if REFERS_BACK.search(text):
+        return True
+    m = POSSESSIVE.search(text)
+    return bool(m) and all(w in LEAD_WORDS for w in re.findall(r"[a-zà-ÿ'-]+", text[:m.start()].lower()))
 
 
 def queries_note(history: list[dict] | None) -> str:
