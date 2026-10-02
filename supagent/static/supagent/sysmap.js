@@ -14,7 +14,10 @@
                                         // box (servers...), any category with more than 60
   var BOX_W = 224, GAP = 14, COL_GAP = 96, PAD = 28, HEAD_H = 40, LINE = 16;
   var st = { data: null, edit: false, open: {}, focus: "", sel: null, from: null, view: { x: 0, y: 0, k: 1 },
-             boxes: {}, saveTimer: null, fitted: false };
+             boxes: {}, saveTimer: null, fitted: false, seq: 0, sig: "", fresh: null, freshTimer: null, autoAt: 0, note: "", freshAt: -1, freshCats: [], inputAt: Date.now() };
+  var AUTO_MS = 20000, FRESH_MS = 20000;   // read again every 20 s while it is looked at; what is new stays outlined 20 s
+  var IDLE_MS = 15 * 60000;                // nobody at the page for 15 minutes: it stops reading (the session may end)
+  var OTHERS_MS = 60000;                   // who is not an admin: read again once a minute
 
   // ------------------------------------------------------------------ the colours of the page (tokens), resolved
   function tok(name, fallback) {
@@ -53,15 +56,108 @@
       return l;
     });
   }
-  function catLabel(name, n) {
+  function catLabel(name, n) {                                // Subjects, Applications, Components; one's own: as named
     var s = name.charAt(0).toUpperCase() + name.slice(1);
-    return n === 1 ? s : s + (/s$/.test(s) ? "" : "s");
+    return n === 1 || ["subject", "application", "component"].indexOf(name) < 0 ? s : s + "s";
   }
 
   // ------------------------------------------------------------------ what is shown
-  function load() {
+  /* The map follows the categories by itself: it is read again each time it is shown, when the window comes back,
+     and every 20 seconds while it is looked at (quietly: drawn again only when something changed, never while an
+     admin edits it). While it is read the page says so; what a reading brought (a new part, a new "part of") is
+     outlined for a moment and said next to the title. */
+  function signature(d) { return JSON.stringify([d.values, d.links, d.categories, d.proposed, d.layout && [d.layout.positions, d.layout.hidden, d.layout.folded]]); }
+  function setState(text, cls) {
+    var box = $("map-state");
+    if (!box) return;
+    box.textContent = text || "";
+    box.className = "map-state" + (cls ? " " + cls : "");
+  }
+  function changes(before, after) {                           // what a reading brought
+    var had = {}, pairs = {}, now = {}, out = { ids: [], pairs: [], gone: 0, cats: [] };
+    var cats = before.categories.map(function (c) { return c.name; });
+    after.categories.forEach(function (c) { if (cats.indexOf(c.name) < 0) out.cats.push(c.name); });
+    before.values.forEach(function (v) {
+      had[v.id] = true;
+      (v.parents || []).forEach(function (p) { pairs[p + ">" + v.id] = true; });
+    });
+    after.values.forEach(function (v) {
+      now[v.id] = true;
+      if (!had[v.id]) out.ids.push(v.id);
+      (v.parents || []).forEach(function (p) { if (!pairs[p + ">" + v.id]) out.pairs.push(p + ">" + v.id); });
+    });
+    before.values.forEach(function (v) { if (!now[v.id]) out.gone++; });
+    return out;
+  }
+  function unfresh() {
+    st.fresh = null;
+    st.freshCats = [];
+    st.note = "";
+    document.querySelectorAll("#map-canvas .map-new, #map-canvas .map-edge-new").forEach(function (x) {
+      x.classList.remove("map-new", "map-edge-new"); });
+    setState("");
+  }
+  function say(what) {                                        // what the reading brought, for a moment
+    if (what && (what.ids.length || what.pairs.length || what.gone || what.cats.length)) {
+      var parts = [];
+      if (what.cats.length) parts.push(what.cats.length === 1 ? "new category “" + catLabel(what.cats[0], 1) + "”" : what.cats.length + " new categories");
+      if (what.ids.length) parts.push(what.ids.length === 1 ? "new part “" + st.byId[what.ids[0]].value + "”" : what.ids.length + " new parts");
+      if (what.pairs.length) parts.push(what.pairs.length + " new “part of”");
+      if (what.gone) parts.push(what.gone + " part" + (what.gone > 1 ? "s" : "") + " removed");
+      st.note = "Updated: " + parts.join(", ");
+      clearTimeout(st.freshTimer);
+      st.freshTimer = setTimeout(unfresh, FRESH_MS);
+    }
+    setState(st.note || "", st.note ? "changed" : "");
+    if (st.note && ((st.fresh && Object.keys(st.fresh.ids).length) || st.freshCats.length)) {
+      $("map-state").appendChild(el("button", { type: "button", class: "linkish", text: "Show", onclick: showNew,
+                                                title: "Bring what is new in view (again: the next one)" }));
+    }
+  }
+  function onScreen(n) {
+    var c = $("map-canvas"), k = st.view.k, x0 = n.x * k + st.view.x, y0 = n.y * k + st.view.y;
+    return x0 >= 0 && y0 >= 0 && x0 + n.w * k <= c.clientWidth && y0 + n.h * k <= c.clientHeight;
+  }
+  function newNodes() {              // the boxes of the new parts (a folded category: its box), of the new categories
+    var seen = {};
+    return (st.fresh ? Object.keys(st.fresh.ids) : []).map(function (i) { return real(st.layout.nodes, i); })
+      .concat(st.freshCats.map(function (c) { return st.layout.nodes["none:" + c]; }))
+      .filter(function (n) { if (!n || seen[n.id]) return false; seen[n.id] = true; return true; });
+  }
+  function showNew() {                                        // the next new part brought in view
+    var nodes = newNodes();
+    if (!nodes.length) return;
+    st.freshAt = (st.freshAt + 1) % nodes.length;
+    inView(nodes[st.freshAt]);
+  }
+  function load(quiet) {
+    quiet = quiet === true;
+    var seq = ++st.seq;
+    if (!quiet) {
+      setState(st.data ? "Updating…" : "Loading the map…", "busy");
+      $("map-canvas").setAttribute("aria-busy", "true");
+    }
     return S.dict("GET", "map").then(function (d) {
-      if (d.error) { $("map-canvas").textContent = d.error; return; }
+      if (seq !== st.seq) return;                             // a later reading answers
+      $("map-canvas").removeAttribute("aria-busy");
+      if (d.error) {
+        if (st.data) { setState("Not updated (" + d.error + "): the map of before", "warn"); return; }
+        setState("");
+        $("map-canvas").textContent = d.error;
+        return;
+      }
+      var sig = signature(d), before = st.data;
+      if (quiet && (sig === st.sig || editing())) {           // nothing new, or an admin is editing: later
+        if ($("map-state").classList.contains("warn")) setState(st.note || "", st.note ? "changed" : "");
+        return;
+      }
+      var what = before ? changes(before, d) : null;
+      st.sig = sig;
+      if (what && (what.ids.length || what.pairs.length)) {
+        st.fresh = { ids: {}, pairs: {} };
+        what.ids.forEach(function (i) { st.fresh.ids[i] = true; });
+        what.pairs.forEach(function (k) { st.fresh.pairs[k] = true; });
+      }
       st.data = d;
       st.byId = {};
       d.values.forEach(function (v) { st.byId[v.id] = v; });
@@ -74,7 +170,28 @@
       focusOptions();
       draw();
       if (!st.fitted) { fit(true); st.fitted = true; }
+      st.freshAt = -1;
+      st.freshCats = what ? what.cats : [];
+      if (!quiet && (st.fresh || st.freshCats.length)) {      // just made elsewhere on the page: brought in view
+        if (st.freshCats.length) fit(true);                   // one more column: the first view again
+        var nodes = newNodes();
+        if (nodes.length && !nodes.some(onScreen)) { st.freshAt = 0; inView(nodes[0]); }
+      }
+      say(what);
     });
+  }
+  function editing() {                                        // an admin moves boxes, draws an interaction or types
+    var a = document.activeElement;
+    return st.edit || !!st.from || (!!a && $("map-side").contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+  }
+  function auto() {
+    if (!st.data || !D.isActive("map") || document.visibilityState !== "visible" || editing()) return;
+    if (Date.now() - st.inputAt > IDLE_MS) return;            // nobody there: no request keeps the session alive
+    // admins change the categories and see it at once; for the others (their map costs the server what each of
+    // its items costs to check) once a minute is enough
+    if (Date.now() - st.autoAt < (st.data.is_admin ? 3000 : OTHERS_MS - 2000)) return;
+    st.autoAt = Date.now();
+    load(true);
   }
   function focusOptions() {
     var sel = $("map-focus"), keep = sel.value;
@@ -83,6 +200,7 @@
     st.data.categories.forEach(function (c) {
       var vals = st.data.values.filter(function (v) { return v.facet === c.name; })
         .sort(function (a, b) { return a.value.localeCompare(b.value); });
+      if (!vals.length) return;
       sel.appendChild(el("optgroup", { label: catLabel(c.name, 2) + " (" + c.count + ")" }, vals.map(function (v) {
         return el("option", { value: String(v.id), text: v.value }); })));
     });
@@ -122,7 +240,9 @@
       (cols[v.facet] = cols[v.facet] || []).push(v);
     });
     var C = colors(), titleFont = "600 13.5px " + C.font, textFont = "12px " + C.font;
-    var order = cats.filter(function (c) { return cols[c] && cols[c].length; });
+    var none = !!st.data.is_admin && !st.focus;              // an admin: a category with no value yet has its column
+    cats.forEach(function (c) { if (none && !cols[c]) cols[c] = []; });
+    var order = cats.filter(function (c) { return cols[c] && (cols[c].length || none); });
     var folded = {};
     order.forEach(function (c) {
       var fromData = cols[c].filter(function (v) { return v.source === "data"; }).length * 2 >= cols[c].length;
@@ -150,6 +270,10 @@
     order.forEach(function (c, ci) {
       var x = PAD + ci * (BOX_W + COL_GAP), y = PAD + HEAD_H;
       heads.push({ cat: c, x: x, n: cols[c].length, color: C.series[st.data.categories.map(function (k) { return k.name; }).indexOf(c) % 8] });
+      if (!cols[c].length) {                                  // no value yet: said in its column
+        nodes["none:" + c] = { id: "none:" + c, none: c, x: x, y: y, w: BOX_W, h: 58 };
+        return;
+      }
       if (folded[c]) {
         var names = cols[c].slice(0, 6).map(function (v) { return v.value; }).join(", ") + (cols[c].length > 6 ? "…" : "");
         var lines = wrap(names, textFont, BOX_W - 24, 3);
@@ -226,15 +350,16 @@
         if (!ids[p]) return;
         var a = real(L.nodes, p), b = real(L.nodes, v.id);
         if (!a || !b || a === b) return;
-        var key = a.id + ">" + b.id;
-        if (drawn[key]) { drawn[key].n++; return; }
-        drawn[key] = { a: a, b: b, n: 1, ids: [p, v.id] };
+        var key = a.id + ">" + b.id, isNew = !!(st.fresh && st.fresh.pairs[p + ">" + v.id]);
+        if (drawn[key]) { drawn[key].n++; drawn[key].fresh = drawn[key].fresh || isNew; return; }
+        drawn[key] = { a: a, b: b, n: 1, ids: [p, v.id], fresh: isNew };
       });
     });
     Object.keys(drawn).forEach(function (k) {
       var e = drawn[k], path = curve(e.a, e.b);
       var line = svg("path", { d: path, fill: "none", stroke: C.axis, "stroke-width": e.n > 1 ? "2.5" : "1.5",
-                               class: "map-edge", "data-a": String(e.a.id), "data-b": String(e.b.id) });
+                               class: "map-edge" + (e.fresh ? " map-edge-new" : ""), "data-a": String(e.a.id),
+                               "data-b": String(e.b.id) });
       line.appendChild(svg("title", {}, [document.createTextNode((e.b.v ? e.b.v.value : e.b.title[0]) + " is part of " +
         (e.a.v ? e.a.v.value : e.a.title[0]) + (e.n > 1 ? " (" + e.n + " parts)" : ""))]));
       gEdges.appendChild(line);
@@ -280,7 +405,7 @@
     Object.keys(L.nodes).forEach(function (k) {
       var n = L.nodes[k];
       if (n.alias) return;
-      gNodes.appendChild(nodeView(n, C));
+      gNodes.appendChild(n.none ? noneView(n, C) : nodeView(n, C));
     });
     box.appendChild(root);
     st.svg = root;
@@ -300,10 +425,32 @@
     if (!interaction) return d;
     return { d: d, mx: (ax + 3 * c1x + 3 * c2x + bx) / 8, my: (ay + by) / 2 };
   }
+  function noneView(n, C) {                                   // a category with no value yet (admins): where to add one
+    var g = svg("g", { class: "map-none", transform: "translate(" + n.x + "," + n.y + ")", tabindex: "0", role: "button",
+                       "aria-label": catLabel(n.none, 2) + ": no value yet, add one in Categories" });
+    g.appendChild(svg("rect", { width: n.w, height: n.h, rx: 8, fill: "none", stroke: C.axis, "stroke-width": "1.2",
+                                "stroke-dasharray": "5 4", "pointer-events": "all" }));     // the whole box takes the click
+    var t = svg("text", { x: 14, y: 24, fill: C.muted, "font-family": C.font, "font-size": "12.5" });
+    t.textContent = "No value yet";
+    g.appendChild(t);
+    var a = svg("text", { x: 14, y: 43, fill: C.accent, "font-family": C.font, "font-size": "12", "font-weight": "600" });
+    a.textContent = "Add one in Categories";
+    g.appendChild(a);
+    var go = function () {
+      D.show("categories");
+      var sel = $("fac-new-facet"), inp = $("fac-new-value");
+      if (sel && sel.querySelector('option[value="' + n.none + '"]')) sel.value = n.none;
+      if (inp) inp.focus();
+    };
+    g.addEventListener("click", go);
+    g.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); } });
+    return g;
+  }
   function nodeView(n, C) {
     var catIdx = st.data.categories.map(function (k) { return k.name; }).indexOf(n.fold || n.v.facet);
     var color = C.series[(catIdx < 0 ? 0 : catIdx) % 8];
-    var g = svg("g", { class: "map-node" + (n.fold ? " map-fold" : "") + (n.v && n.v.gone ? " map-gone" : ""),
+    var isNew = !!st.fresh && (n.fold ? n.members.some(function (i) { return st.fresh.ids[i]; }) : !!st.fresh.ids[n.id]);
+    var g = svg("g", { class: "map-node" + (n.fold ? " map-fold" : "") + (n.v && n.v.gone ? " map-gone" : "") + (isNew ? " map-new" : ""),
                        transform: "translate(" + n.x + "," + n.y + ")", "data-id": String(n.id), tabindex: "0",
                        role: "button", "aria-label": n.fold ? n.title[0] + ": open" : n.v.value });
     g.appendChild(svg("rect", { width: n.w, height: n.h, rx: 8, fill: C.panel, stroke: n.v && n.v.gone ? C.warn : C.line,
@@ -371,6 +518,10 @@
     });
     if (st.focus) box.appendChild(el("button", { type: "button", class: "chip", text: "Show everything",
       onclick: function () { $("map-focus").value = ""; st.focus = ""; draw(); fit(true); } }));
+    if (st.data.proposed) box.appendChild(el("button", { type: "button", class: "chip",
+      title: "The map draws the approved values: a proposed one comes once approved",
+      text: S.num(st.data.proposed) + " proposed value" + (st.data.proposed > 1 ? "s wait" : " waits") + " in To review",
+      onclick: function () { D.show("review"); } }));
     if (st.hidden.length && st.data.is_admin) box.appendChild(el("button", { type: "button", class: "chip",
       text: "Show the " + st.hidden.length + " hidden", onclick: function () { st.hidden = []; saveLayout(); draw(); } }));
   }
@@ -550,7 +701,7 @@
       apply();
     }, { passive: false });
     c.addEventListener("pointerdown", function (ev) {
-      if (ev.target.closest && ev.target.closest(".map-node")) return;
+      if (ev.target.closest && ev.target.closest(".map-node, .map-none")) return;      // a box: its own click
       drag = { x: ev.clientX, y: ev.clientY, vx: st.view.x, vy: st.view.y, moved: false };
       c.setPointerCapture(ev.pointerId);
     });
@@ -617,6 +768,8 @@
     var C = colors(), b = bbox(), title = "System map";
     var copy = st.svg.cloneNode(true);
     copy.querySelectorAll(".dim").forEach(function (x) { x.classList.remove("dim"); });
+    copy.querySelectorAll(".map-new, .map-edge-new").forEach(function (x) { x.classList.remove("map-new", "map-edge-new"); });
+    copy.querySelectorAll(".map-none").forEach(function (x) { x.remove(); });     // "add one": of the page, not of a file
     copy.setAttribute("xmlns", NS);
     copy.setAttribute("width", String(Math.ceil(b.w)));
     copy.setAttribute("height", String(Math.ceil(b.h + 40)));
@@ -693,5 +846,18 @@
   if (!S.isAdmin) $("map-edit").hidden = true;
   wire();
   D.register("map", load);
-  window.supagentMap = { load: load, data: function () { return st.data; }, png: png, standalone: standalone };
+  setInterval(auto, AUTO_MS);
+  /* someone is at the page: a key, the pointer, the wheel, the window coming back (after a pause, read at once) */
+  function input() {
+    var was = Date.now() - st.inputAt > IDLE_MS;
+    st.inputAt = Date.now();
+    if (was) auto();
+  }
+  ["pointerdown", "keydown", "wheel", "touchstart"].forEach(function (name) {
+    document.addEventListener(name, input, { passive: true, capture: true });
+  });
+  document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") { st.inputAt = Date.now(); auto(); } });
+  window.addEventListener("focus", function () { st.inputAt = Date.now(); auto(); });
+  window.supagentMap = { load: load, data: function () { return st.data; }, png: png, standalone: standalone,
+                         idleFor: function (ms) { st.inputAt = Date.now() - ms; } };       // (the tests: nobody there)
 })();

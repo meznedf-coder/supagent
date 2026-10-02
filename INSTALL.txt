@@ -1,13 +1,13 @@
-supagent 0.8.1 - the AI agent inside Apache Superset
+supagent 0.8.2 - the AI agent inside Apache Superset
 ====================================================
 
 What is in this folder
-  supagent-0.8.1-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
+  supagent-0.8.2-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
 
-Upgrading? From 0.8.0: pip install this wheel on every host and restart (no schema change). From 0.7.0 or
+Upgrading? From 0.8.0 or 0.8.1: pip install this wheel on every host and restart (no schema change). From 0.7.0 or
 0.7.1: "Upgrade from 0.7 to 0.8.0" below (with this wheel). From 0.6.0: the same steps (init then goes
 from schema 9 to 14). From 0.5.4: the steps of "Upgrade from 0.5.4 to 0.6.0" with this wheel (schema 7 to 14).
 Steps 1-8 are for a new install.
@@ -24,7 +24,7 @@ role): three packages must be pinned, or Superset itself does not start (none is
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.8.1-py3-none-any.whl
+   $PY -m pip install supagent-0.8.2-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
 
 2. Register it: one line in superset_config.py (no logic)
@@ -145,11 +145,11 @@ What changes:
 Steps (Superset stopped for a few minutes):
  1. Stop the web servers, the Celery workers and beat, on every host.
  2. Back up: pg_dump -Fc -f superset-before-0.8.0.dump "<Superset's database>"; $PY -m pip freeze > pip-before-0.8.0.txt
- 3. On every host: $PY -m pip install supagent-0.8.1-py3-none-any.whl     ($PY -m pip show supagent: 0.8.1)
+ 3. On every host: $PY -m pip install supagent-0.8.2-py3-none-any.whl     ($PY -m pip show supagent: 0.8.2)
  4. Once, on one host: superset supagent init
       tables: schema version 13 -> 14
       knowledge store: N pieces of the catalog's notes are guides now      (when the store is used and had some)
- 5. Start everything. Checks: Settings -> Chat settings shows "supagent 0.8.1 (tables v14)"; Data dictionary ->
+ 5. Start everything. Checks: Settings -> Chat settings shows "supagent 0.8.2 (tables v14)"; Data dictionary ->
     Knowledge -> Catalog: the former notes are guides; a question in the chat answers.
 
 Back to 0.7.1: stop, pip install the 0.7.1 wheel, then in Superset's database:

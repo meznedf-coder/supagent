@@ -24,7 +24,7 @@ INTERACTIONS = {"depends_on": "depends on", "sends_to": "sends data to", "reads_
 LAYOUT_KEY = "system_map"
 HINT_KINDS = ("doc", "guide", "context")
 HINT_CHARS = 220
-_HINTS: dict[str, Any] = {"stamp": None, "at": 0.0, "hints": {}}
+_HINTS: dict[str, Any] = {"state": None, "at": 0.0, "names": {}, "partial": False}   # per name, while the texts stay
 _LOCK = threading.Lock()
 
 
@@ -60,52 +60,76 @@ def _score(sentence: str, start: int, end: int, kind: str) -> float:
     return score
 
 
+def _documents_state() -> str:
+    """The state of the texts the explanations are read from (their number, the last change)."""
+    from sqlalchemy import func
+
+    from supagent.models import Chunk
+
+    n, last = db.session.query(func.count(Chunk.id), func.max(Chunk.updated_at)).filter(Chunk.kind.in_(HINT_KINDS)).one()
+    return f"{n}:{last}"
+
+
 def hints(values: dict[int, Any]) -> dict[int, list[tuple[str, str, str]]]:
     """For the values with no description: the sentences of the documents, guides and Context pages that say what
     they are {facet id: [(ref, title, sentence)]} (the 3 best each: the part as the sentence's subject, a document
-    before the AI-written Context), read once per state of the knowledge."""
-    from supagent.knowledge.freshness import stamp
+    before the AI-written Context). Kept per name while those texts do not change: a value approved, renamed or
+    added costs the reading of its own name only (every change used to read all the texts again for every value,
+    seconds on a big platform, while the page still showed the map of before)."""
     from supagent.models import Chunk
 
-    s = stamp()
-    with _LOCK:
-        if _HINTS["stamp"] == s and time.time() - _HINTS["at"] < 600:
-            cached = _HINTS["hints"]
-            if all(fid in cached or values[fid].description for fid in values):
-                return cached
     wanted = {fid: v.value for fid, v in values.items() if not (v.description or "").strip() and len(v.value) >= 3}
-    found: dict[int, list[tuple[float, str, str, str]]] = {}
-    if wanted:
-        by_name: dict[str, list[int]] = {}
-        for fid, name in wanted.items():
-            by_name.setdefault(name.lower(), []).append(fid)
-        names = sorted(by_name, key=len, reverse=True)
-        rx = re.compile(r"(?<![\w-])(" + "|".join(re.escape(n) for n in names[:2000]) + r")(?![\w-])", re.I)
-        t0 = time.time()
+    if not wanted:
+        return {}
+    state = _documents_state()
+    with _LOCK:
+        if _HINTS["state"] != state or len(_HINTS["names"]) > 20000 or \
+                (_HINTS["partial"] and time.time() - _HINTS["at"] > 600):
+            _HINTS.update(state=state, at=time.time(), names={}, partial=False)
+        known = dict(_HINTS["names"])
+    by_name: dict[str, list[int]] = {}
+    for fid, name in wanted.items():
+        by_name.setdefault(name.lower(), []).append(fid)
+    missing = sorted((n for n in by_name if n not in known), key=len, reverse=True)[:2000]
+    if missing:
+        found: dict[str, list[tuple[float, str, str, str]]] = {n: [] for n in missing}
+        rx = re.compile(r"(?<![\w-])(" + "|".join(re.escape(n) for n in missing) + r")(?![\w-])", re.I)
+        every = re.compile(r"(?<![\w-])(" + "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True)[:2000])
+                           + r")(?![\w-])", re.I) if len(by_name) > len(missing) else rx
+        t0, cut = time.time(), False
         q = db.session.query(Chunk.ref, Chunk.kind, Chunk.title, Chunk.text).filter(Chunk.kind.in_(HINT_KINDS)).yield_per(500)
         for ref, kind, title, text in q:
-            if time.time() - t0 > 8:                     # the page answers; the next load goes on
+            if time.time() - t0 > 8:                     # the page answers; these names are read again later
+                cut = True
                 break
+            if not rx.search(text or ""):
+                continue
             for sentence in _sentences(text or ""):
                 sentence = CITES.sub("", sentence).strip()
-                named = {m.group(1).lower() for m in rx.finditer(sentence)}
+                hits = list(rx.finditer(sentence))
+                if not hits:
+                    continue
+                named = {m.group(1).lower() for m in every.finditer(sentence)}
                 if len(named) >= 3 or sentence.count(",") >= 5:
                     continue                             # a list of parts: it says what they are, not what one is
                 if len(sentence) < 25 or sentence.strip(" .:").lower() in named:
                     continue                             # a heading, the name alone: no explanation
-                for m in rx.finditer(sentence):
-                    for fid in by_name.get(m.group(1).lower(), []):
-                        got = found.setdefault(fid, [])
-                        if any(x[1] == ref and x[3] == sentence for x in got):
-                            continue
-                        short = sentence[:HINT_CHARS] + ("…" if len(sentence) > HINT_CHARS else "")
-                        got.append((_score(sentence, m.start(), m.end(), kind or ""), ref, title or ref, short))
+                for m in hits:
+                    got = found[m.group(1).lower()]
+                    if any(x[1] == ref and x[3] == sentence for x in got):
+                        continue
+                    short = sentence[:HINT_CHARS] + ("…" if len(sentence) > HINT_CHARS else "")
+                    got.append((_score(sentence, m.start(), m.end(), kind or ""), ref, title or ref, short))
         db.session.commit()
-    out = {fid: [(ref, title, sentence) for _sc, ref, title, sentence in sorted(got, key=lambda x: -x[0])[:3]]
-           for fid, got in found.items()}
-    with _LOCK:
-        _HINTS.update(stamp=s, at=time.time(), hints=out)
-    return out
+        best = {n: [(ref, title, sentence) for _sc, ref, title, sentence in sorted(got, key=lambda x: -x[0])[:3]]
+                for n, got in found.items()}
+        with _LOCK:
+            if _HINTS["state"] == state:
+                _HINTS["names"].update(best)
+                if cut:
+                    _HINTS.update(partial=True, at=time.time())
+        known.update(best)
+    return {fid: known[n] for n, fids in by_name.items() for fid in fids if known.get(n)}
 
 
 def _visible_refs(refs: set[str]) -> set[str]:
@@ -294,6 +318,10 @@ def map_data(admin: bool) -> dict[str, Any]:
     for v in values:
         counts[v["facet"]] = counts.get(v["facet"], 0) + 1
     order = sorted({v["facet"] for v in values} | set(cats), key=rank)
+    # an admin sees every category, the ones with no value yet too (a category just added has its column at once),
+    # and how many proposed values wait (they are drawn once approved)
+    proposed = db.session.query(Facet.id).filter(Facet.status == "proposed", Facet.facet.in_(cats)).count() if admin else 0
     return {"categories": [{"name": c, "count": counts.get(c, 0), "builtin": c in ("subject", "application", "component")}
-                           for c in order if counts.get(c)],
-            "values": values, "links": links, "layout": layout(), "interactions": INTERACTIONS, "is_admin": admin}
+                           for c in order if counts.get(c) or admin],
+            "values": values, "links": links, "layout": layout(), "interactions": INTERACTIONS, "is_admin": admin,
+            "proposed": proposed}

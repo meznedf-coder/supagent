@@ -147,7 +147,6 @@
     ["relations", "Categories part of others", "What the texts say about known values: a component of two applications, an application of a subject."],
     ["tags", "Categories given to items", "The LLM was not sure enough to give these alone."],
     ["links", "Relations between items", "What the LLM found related (explains, about, depends on)."],
-    ["descriptions", "AI-written descriptions of the data", "Already used by the agent; approve or correct the ones you know."],
     ["routes", "Kinds of work learned from the chats", "Already used as examples by the router; set the right kind, or remove a wrong one."]
   ];
   var TITLES = {};
@@ -156,11 +155,12 @@
   function summaryLine(waiting) {
     var box = $("review-summary");
     box.innerHTML = "";
-    if (!waiting && !(counts.descriptions || counts.routes)) {
+    if (!waiting && !counts.routes) {
       box.appendChild(el("p", { class: "lead", text: "Nothing waits for you. What the chats and the daily learning propose shows here, each with its actions." }));
       return;
     }
-    box.appendChild(el("p", { class: "lead", text: waiting ? S.num(waiting) + " item" + (waiting > 1 ? "s wait" : " waits") + " for you. Nothing here is used by the agent until approved, except the two last groups, which it already uses." :
+    box.appendChild(el("p", { class: "lead", text: waiting ? S.num(waiting) + " item" + (waiting > 1 ? "s wait" : " waits") + " for you. Nothing here is used by the agent until approved" +
+      (counts.routes ? ", except the last group, which it already uses." : ".") :
       "Nothing waits for you. The agent already uses the items below; check them when you have time." }));
     var chips = el("div", { class: "rchips" });
     GROUPS.forEach(function (g) {
@@ -285,28 +285,79 @@
             ]);
         }),
         group("values", d.values || [], function (v) {
-          var name = el("div", { class: "rtext" }, [el("span", { class: "facet-chip", text: v.facet + ": " + v.value })]);
-          var desc = v.description ? el("div", { class: "muted", text: v.description }) : null;
-          var parts = (v.parents || []).length ? el("div", { class: "muted", text: "part of: " + partsText(v.parents) }) : null;
+          var name = el("div", { class: "rtext" }, [el("span", { class: "facet-chip" })]);
+          var desc = el("div", { class: "muted" }), parts = el("div", { class: "muted" });
+          var paint = function () {                 // the card says the value as it is now (after an Edit saved)
+            name.firstChild.textContent = v.facet + ": " + v.value;
+            desc.textContent = v.description || "";
+            desc.hidden = !v.description;
+            parts.textContent = (v.parents || []).length ? "part of: " + partsText(v.parents) : "";
+            parts.hidden = !(v.parents || []).length;
+          };
+          paint();
           var same = v.same_as ? el("div", { class: "rsame" }, [
             el("span", { class: "muted", text: "The LLM thinks it is the same as " + v.same_as.facet + " " + v.same_as.value + ". " })]) : null;
           var acts = [
             act("Approve", "primary", "values", function () { return S.admin("POST", "facets/" + v.id, { status: "approved" }).then(function (r) { return r.error ? r : { done: "approved" }; }); }),
-            toggleButton("Rename", "p-rename", function () {
-              var inp = el("input", { type: "text", class: "rename", "aria-label": "New name" });
-              inp.value = v.value;
-              var line = el("div", { class: "actions" });
-              var ok = el("button", { type: "button", class: "btn small", text: "Save the name", onclick: function () {
-                S.admin("POST", "facets/" + v.id, { value: inp.value }).then(function (r) {
-                  if (r.error) return;
-                  v.value = r.value;
-                  name.firstChild.textContent = v.facet + ": " + v.value;
-                  line.remove();
+            /* Edit: everything about the value at once, as in Categories (its category, its name, what it covers,
+               its other names, what it is part of), then approved with it, or saved to decide later */
+            toggleButton("Edit…", "p-edit", function () {
+              var cat = el("select", { "aria-label": "Category" }, Object.keys(FACET_NAMES).map(function (k) {
+                return el("option", { value: k, text: FACET_NAMES[k], selected: k === v.facet ? "selected" : null }); }));
+              var nm = el("input", { type: "text", class: "rename", "aria-label": "Name", maxlength: "128" });
+              nm.value = v.value;
+              var ds = el("input", { type: "text", "aria-label": "What it covers", placeholder: "what it covers" });
+              ds.value = v.description || "";
+              var sy = el("input", { type: "text", "aria-label": "Also called", placeholder: "also called (comma separated)" });
+              sy.value = (v.synonyms || []).join(", ");
+              var part = el("select", { multiple: "multiple", size: "6", class: "parts facet-parents-select",
+                                        "aria-label": "Part of (Ctrl or Cmd + click for several)" });
+              var field = null;                 // set below, with the buttons that wait for the list
+              var send = function (approve) {
+                var body = { facet: cat.value, value: nm.value, description: ds.value, synonyms: sy.value, parents: field.ids() };
+                if (approve) body.status = "approved";
+                return S.admin("POST", "facets/" + v.id, body);
+              };
+              var merged = function (r) {            // that name exists there already: one value, said
+                return { done: "merged into " + r.facet + " " + r.value + " (it exists already)", reload: true };
+              };
+              var saveApprove = act("Save and approve", "primary", "values", function () {
+                return send(true).then(function (r) {
+                  if (r.error) return r;
+                  return r.merged_into ? merged(r) : { done: "approved as " + r.facet + ": " + r.value };
                 });
-              } });
-              line.appendChild(inp);
-              line.appendChild(ok);
-              return line;
+              });
+              var saveOnly = act("Save", "", "values", function (c) {
+                    var was = {};
+                    (v.parents || []).forEach(function (p) { was[p.id] = p; });
+                    var shown = {};
+                    Array.prototype.forEach.call(part.options, function (o) {
+                      if (o.selected) shown[+o.value] = { id: +o.value, facet: o.getAttribute("data-facet"), value: o.textContent };
+                    });
+                    var chosen = field.ids().map(function (i) { return shown[i] || was[i]; }).filter(Boolean);
+                    return send(false).then(function (r) {
+                      if (r.error) return r;
+                      if (r.merged_into) return merged(r);
+                      v.facet = r.facet; v.value = r.value; v.description = ds.value.trim();
+                      v.synonyms = sy.value.split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+                      v.parents = chosen;
+                      paint();
+                      c.querySelectorAll(".rpanel").forEach(function (x) { x.remove(); });
+                      c.querySelectorAll("button[aria-expanded]").forEach(function (b) { b.setAttribute("aria-expanded", "false"); b.classList.remove("on"); });
+                      var note = c.querySelector(".rsaved") || c.querySelector(".rbody").appendChild(el("div", { class: "rsaved result good" }));
+                      note.textContent = "saved: it still waits for your approval";
+                      saved();
+                      return { keep: true };
+                    });
+              });
+              field = partsField(part, v.id, (v.parents || []).map(function (p) { return p.id; }), [saveApprove, saveOnly]);
+              return el("div", { class: "facet-edit" }, [
+                el("label", { class: "field" }, [el("span", { text: "Category" }), cat]),
+                el("label", { class: "field" }, [el("span", { text: "Name" }), nm]),
+                el("label", { class: "field" }, [el("span", { text: "What it covers" }), ds]),
+                el("label", { class: "field" }, [el("span", { text: "Also called" }), sy]),
+                el("label", { class: "field" }, [el("span", { text: "Part of (Ctrl or Cmd + click for several)" }), part]),
+                el("div", { class: "actions" }, [saveApprove, saveOnly])]);
             }),
             toggleButton("Merge into…", "p-merge", function () {
               var sel = el("select", { class: "merge", "aria-label": "Merge into" }, [el("option", { value: "", text: "Loading…" })]);
@@ -329,12 +380,12 @@
           acts.splice(2, 0, toggleButton("Part of…", "p-parts", function () {
             var sel = el("select", { multiple: "multiple", size: "6", class: "parts facet-parents-select",
                                      "aria-label": "Part of (Ctrl or Cmd + click for several)" });
-            fillParents(sel, v.id, (v.parents || []).map(function (p) { return p.id; }));
+            var go = act("Save and approve", "primary", "values", function () {
+              return S.admin("POST", "facets/" + v.id, { parents: field.ids(), status: "approved" }).then(function (r) { return r.error ? r : { done: "approved with what it is part of" }; });
+            });
+            var field = partsField(sel, v.id, (v.parents || []).map(function (p) { return p.id; }), [go]);
             return el("div", { class: "actions" }, [
-              el("span", { class: "muted", text: "Part of (Ctrl or Cmd + click for several):" }), sel,
-              act("Save and approve", "primary", "values", function () {
-                return S.admin("POST", "facets/" + v.id, { parents: chosenIds(sel), status: "approved" }).then(function (r) { return r.error ? r : { done: "approved with what it is part of" }; });
-              })]);
+              el("span", { class: "muted", text: "Part of (Ctrl or Cmd + click for several):" }), sel, go]);
           }));
           if (v.same_as) acts.unshift(act("Merge into " + v.same_as.value, "primary", "values", function () {
             return S.admin("POST", "facets/" + v.id, { merge_into: v.same_as.id }).then(function (r) {
@@ -353,12 +404,12 @@
               toggleButton("Change…", "p-change", function () {
                 var sel = el("select", { multiple: "multiple", size: "6", class: "parts facet-parents-select",
                                          "aria-label": "Part of (Ctrl or Cmd + click for several)" });
-                fillParents(sel, x.id, (x.suggested || []).map(function (p) { return p.id; }));
+                var go = act("Save and approve", "primary", "relations", function () {
+                  return S.admin("POST", "facets/" + x.id, { accept_parents: field.ids() }).then(function (r) { return r.error ? r : { done: "changed and approved" }; });
+                });
+                var field = partsField(sel, x.id, (x.suggested || []).map(function (p) { return p.id; }), [go]);
                 return el("div", { class: "actions" }, [
-                  el("span", { class: "muted", text: "Part of (Ctrl or Cmd + click for several):" }), sel,
-                  act("Save and approve", "primary", "relations", function () {
-                    return S.admin("POST", "facets/" + x.id, { accept_parents: chosenIds(sel) }).then(function (r) { return r.error ? r : { done: "changed and approved" }; });
-                  })]);
+                  el("span", { class: "muted", text: "Part of (Ctrl or Cmd + click for several):" }), sel, go]);
               }),
               act("Reject", "", "relations", function () { return S.admin("POST", "facets/" + x.id, { reject_parents: true }).then(function (r) { return r.error ? r : { done: "rejected" }; }); })
             ]);
@@ -398,14 +449,7 @@
               act("Reject", "", "links", function () { return S.admin("POST", "links/" + x.id, { status: "rejected" }).then(function (r) { return r.error ? r : { done: "rejected" }; }); })
             ]);
         }, { bulk: (d.links || []).length > 1 ? bulk("Approve all shown", "links", d.links, function (x) { return S.admin("POST", "links/" + x.id, { status: "approved" }); }) : null }),
-        (counts.descriptions || counts.routes) ? el("h2", { class: "section-title later", text: "When you have time (already used by the agent)" }) : null,
-        group("descriptions", d.descriptions || [], function (o) {
-          return card([el("div", { class: "rtext nm", text: (o.parent ? o.parent + " › " : "") + o.name }), el("div", { class: "muted", text: o.description })],
-            o.kind + (o.database ? " \u00b7 " + o.database : "") + " · AI-written", [
-              act("Approve", "primary", "descriptions", function () { return S.dict("POST", "objects/" + o.id, { approve: true }).then(function (r) { return r.error ? r : { done: "approved" }; }); }),
-              el("button", { type: "button", class: "btn small", text: "Correct", onclick: function () { D.detail(o.id, reviewLoad); } })
-            ]);
-        }, { fold: 10, more: el("button", { type: "button", class: "linkish", text: "check them all in Data → Browse", onclick: function () { D.browseUnverified(null); } }) }),
+        counts.routes ? el("h2", { class: "section-title later", text: "When you have time (already used by the agent)" }) : null,
         group("routes", d.routes || [], function (r) {
           var sel = el("select", { "aria-label": "Kind of work" }, ROUTES.map(function (k) { return el("option", { value: k, text: k, selected: k === r.route ? "selected" : null }); }));
           return card([el("div", { class: "rtext", text: r.question }), el("div", {}, [el("span", { class: "facet-chip", text: r.route })])],
@@ -620,8 +664,9 @@
       var acts = el("td", { class: "row-actions" });
       if (admin) {
         var post = function (body) { return S.admin("POST", "memory/" + m.id, body).then(function (r) { if (!r.error) saved(); memLoad(); }); };
-        if (m.status === "catalog") {
-          acts.appendChild(el("span", { class: "muted", text: "edit it in the catalog" }));
+        if (m.status === "catalog" && m.entry_id) {          // a catalog entry replaced it: edited there
+          acts.appendChild(el("button", { type: "button", class: "linkish", text: "Edit it in the catalog",
+            title: "Open its catalog entry", onclick: function () { D.openEntry(m.entry_id); } }));
         } else {
           if (m.status !== "active") acts.appendChild(el("button", { type: "button", class: "linkish", text: "Approve", onclick: function () { post({ status: "active" }); } }));
           if (m.status !== "disabled") acts.appendChild(el("button", { type: "button", class: "linkish", text: "Disable", onclick: function () { post({ status: "disabled" }); } }));
@@ -841,7 +886,7 @@
       tb.innerHTML = "";
       var all = d.facets || [];
       all.forEach(function (f) {
-        var post = function (body) { return S.admin("POST", "facets/" + f.id, body).then(function (r) { if (!r.error) saved(); facetsLoad(); return r; }); };
+        var post = function (body) { return S.admin("POST", "facets/" + f.id, body).then(function (r) { if (!r.error) { saved(); loadCategories(); } facetsLoad(); return r; }); };
         var valueCell = el("td", {}, [el("div", { class: "facet-value", text: f.value }),
           f.description ? el("div", { class: "muted", text: f.description }) : null,
           (f.synonyms || []).length ? el("div", { class: "muted", text: "also: " + f.synonyms.join(", ") }) : null,
@@ -864,22 +909,23 @@
           // what it is part of: values of the categories, several at once (a component of two applications)
           var part = cat ? el("select", { multiple: "multiple", size: "6", class: "facet-parents-select",
                                           "aria-label": "Part of (several: Ctrl or Cmd + click)" }) : null;
-          if (part) fillParents(part, f.id, (f.parents || []).map(function (x) { return x.id; }));
+          var save = el("button", { type: "button", class: "btn small primary", text: "Save", onclick: function () {
+            var body = { value: v.value, description: ds.value, synonyms: sy.value };
+            if (cat) body.facet = cat.value;
+            if (field) body.parents = field.ids();
+            S.admin("POST", "facets/" + f.id, body).then(function (r) {
+              if (r.error) { result(msg, r, ""); return; }
+              saved();
+              loadCategories();                               // the categories' counts follow
+              facetsLoad();
+            });
+          } });
+          var field = part ? partsField(part, f.id, (f.parents || []).map(function (x) { return x.id; }), [save]) : null;
           valueCell.innerHTML = "";
           valueCell.appendChild(el("div", { class: "facet-edit" }, [v, cat, ds, sy,
             part ? el("label", { class: "field" }, [el("span", { text: "Part of (Ctrl or Cmd + click for several)" }), part]) : null,
-            el("div", { class: "actions" }, [
-            el("button", { type: "button", class: "btn small primary", text: "Save", onclick: function () {
-              var body = { value: v.value, description: ds.value, synonyms: sy.value };
-              if (cat) body.facet = cat.value;
-              if (part) body.parents = chosenIds(part);
-              S.admin("POST", "facets/" + f.id, body).then(function (r) {
-                if (r.error) { result(msg, r, ""); return; }
-                saved();
-                facetsLoad();
-              });
-            } }),
-            el("button", { type: "button", class: "btn small", text: "Cancel", onclick: facetsLoad }), msg])]));
+            el("div", { class: "actions" }, [save,
+              el("button", { type: "button", class: "btn small", text: "Cancel", onclick: facetsLoad }), msg])]));
           v.focus();
         } }));
         var same = all.filter(function (x) { return x.facet === f.facet && x.id !== f.id && x.status === "approved"; });
@@ -906,6 +952,9 @@
     });
   }
   var FACET_NAMES = { subject: "Subject", application: "Application", component: "Component" };
+  function plural(k) {                         // Subjects, Applications, Components; one's own: as named
+    return FACET_NAMES[k] + (["subject", "application", "component"].indexOf(k) >= 0 ? "s" : "");
+  }
   /* the categories as the settings say (the deployment's own after the three): names, the selects, the panel */
   function loadCategories() {
     return S.admin("GET", "facets/categories").then(function (d) {
@@ -921,22 +970,75 @@
       filt.innerHTML = "";
       filt.appendChild(el("option", { value: "", text: "All categories" }));
       cats.concat([{ name: "aspect" }]).forEach(function (c) {
-        filt.appendChild(el("option", { value: c.name, text: c.name === "aspect" ? "Aspect" : FACET_NAMES[c.name] + "s" }));
+        filt.appendChild(el("option", { value: c.name, text: c.name === "aspect" ? "Aspect" : plural(c.name) }));
       });
       filt.value = was;
       var list = $("cat-own-list");
       list.innerHTML = "";
-      cats.forEach(function (c) {
-        list.appendChild(el("li", {}, [el("strong", { text: FACET_NAMES[c.name] }),
-          el("span", { class: "muted", text: (c.builtin ? " (built in)" : " (yours)") + (c.fields ? " · values read from the fields " + c.fields : " · no field read") })]));
-      });
+      cats.forEach(function (c) { list.appendChild(categoryRow(c)); });
     });
+  }
+  /* a category in the list: what it holds, where its values are read; an admin changes its name (their own ones)
+     and its field names, or removes it (their own ones) with everything that names its values, asked first */
+  function categoryRow(c) {
+    var li = el("li", {});
+    var n = c.values || 0;
+    var show = function () {
+      li.innerHTML = "";
+      li.appendChild(el("strong", { text: FACET_NAMES[c.name] }));
+      li.appendChild(el("span", { class: "muted", text: (c.builtin ? " (built in)" : " (yours)") + " · " + S.num(n) + " value" + (n === 1 ? "" : "s") +
+        (c.fields ? " · values read from the fields " + c.fields : " · no field read") }));
+      if (!admin) return;
+      var acts = el("span", { class: "row-actions cat-own-acts" });
+      acts.appendChild(el("button", { type: "button", class: "linkish", text: "Edit", onclick: edit }));
+      if (!c.builtin) {
+        var goes = [];
+        if (n) goes.push(S.num(n) + " value" + (n === 1 ? "" : "s"));
+        if (c.tags) goes.push(S.num(c.tags) + " link" + (c.tags === 1 ? "" : "s") + " to items");
+        if (c.parts) goes.push(S.num(c.parts) + " “part of”");
+        if (c.interactions) goes.push(S.num(c.interactions) + " interaction" + (c.interactions === 1 ? "" : "s") + " of the map");
+        acts.appendChild(sureButton("Remove", function () {
+          return S.admin("POST", "facets/categories", { name: c.name, remove: true }).then(function (r) {
+            result($("cat-own-result"), r, "removed: " + FACET_NAMES[c.name] + (r.removed && r.removed.values ? " with its " + S.num(r.removed.values) + " value" + (r.removed.values === 1 ? "" : "s") : ""));
+            if (!r.error) { saved(); loadCategories().then(function () { fillParents($("fac-new-parents"), null, []); }); facetsLoad(); }
+          });
+        }, "Remove the category “" + FACET_NAMES[c.name] + "”?",
+           (goes.length ? "These go with it: " + goes.join(", ") + ". " : "It has no value: only the category goes. ") + "This cannot be undone.",
+           "Remove"));
+      }
+      li.appendChild(acts);
+    };
+    var edit = function () {
+      li.innerHTML = "";
+      var name = el("input", { type: "text", maxlength: "24", "aria-label": "Name of the category", class: "cat-own-name" });
+      name.value = c.name;
+      name.disabled = !!c.builtin;
+      if (c.builtin) name.title = "Built in: its name stays";
+      var rx = el("input", { type: "text", "aria-label": "Field names it reads (a pattern)", class: "cat-own-rx",
+                             placeholder: "Field names it reads, e.g. ^(host|node|server)$" });
+      rx.value = c.fields || "";
+      var msg = el("span", { class: "result", role: "status" });
+      li.appendChild(el("span", { class: "filters cat-own-edit" }, [name, rx,
+        el("button", { type: "button", class: "btn small primary", text: "Save", onclick: function () {
+          var body = { name: c.name, fields: rx.value };
+          if (!c.builtin && name.value.trim().toLowerCase() !== c.name) body.rename = name.value;
+          S.admin("POST", "facets/categories", body).then(function (r) {
+            if (r.error) { result(msg, r, ""); return; }
+            result($("cat-own-result"), r, "saved" + (body.rename ? ": its values follow" : rx.value !== (c.fields || "") ? ": the next learning reads its values" : ""));
+            saved(); loadCategories(); facetsLoad();
+          });
+        } }),
+        el("button", { type: "button", class: "btn small", text: "Cancel", onclick: show }), msg]));
+      (c.builtin ? rx : name).focus();
+    };
+    show();
+    return li;
   }
   if (admin) {
     $("cat-own-add").addEventListener("click", function () {
       var res = $("cat-own-result");
       S.admin("POST", "facets/categories", { name: $("cat-own-name").value, fields: $("cat-own-fields").value }).then(function (r) {
-        result(res, r, "saved: the next learning reads its values (or add them below)");
+        result(res, r, "added: the next learning reads its values (or add them above); it has its column on the System map");
         if (!r.error) { $("cat-own-name").value = ""; $("cat-own-fields").value = ""; loadCategories(); facetsLoad(); }
       });
     });
@@ -946,20 +1048,37 @@
   }
   /* the approved values, by category, as options (what a value may be part of) */
   function fillParents(sel, skipId, chosen) {
-    return S.admin("GET", "facets?status=approved").then(function (d) {
+    return S.admin("GET", "facets?status=approved&brief=1").then(function (d) {
       sel.innerHTML = "";
       var by = {};
       (d.facets || []).forEach(function (x) { if (FACET_NAMES[x.facet] && x.id !== skipId) (by[x.facet] = by[x.facet] || []).push(x); });
       Object.keys(FACET_NAMES).forEach(function (k) {
         if (!by[k]) return;
-        sel.appendChild(el("optgroup", { label: FACET_NAMES[k] + "s" }, by[k].map(function (x) {
-          return el("option", { value: x.id, text: x.value, selected: (chosen || []).indexOf(x.id) >= 0 ? "selected" : null });
+        sel.appendChild(el("optgroup", { label: plural(k) }, by[k].map(function (x) {
+          return el("option", { value: x.id, text: x.value, "data-facet": k, selected: (chosen || []).indexOf(x.id) >= 0 ? "selected" : null });
         })));
       });
     });
   }
   function chosenIds(sel) {
     return Array.prototype.filter.call(sel.options, function (o) { return o.selected; }).map(function (o) { return +o.value; });
+  }
+  /* What a value is part of, edited in a list that fills after a request and holds 5,000 values at most: what the
+     list does not show (not loaded yet, or more values than it holds) stays as it is. Saving never takes away a
+     part the admin could not see. `gate`: the buttons that wait for the list. */
+  function partsField(sel, skipId, current, gate) {
+    var cur = (current || []).slice();
+    (gate || []).forEach(function (b) { b.disabled = true; });
+    var ready = fillParents(sel, skipId, cur).then(function () { (gate || []).forEach(function (b) { b.disabled = false; }); });
+    return {
+      ready: ready,
+      ids: function () {
+        var shown = {}, out = chosenIds(sel);
+        Array.prototype.forEach.call(sel.options, function (o) { shown[+o.value] = true; });
+        cur.forEach(function (i) { if (!shown[i] && out.indexOf(i) < 0) out.push(i); });
+        return out;
+      }
+    };
   }
 
   if (admin) {
@@ -975,6 +1094,7 @@
         if (!r.error) {
           ["fac-new-value", "fac-new-desc", "fac-new-syn"].forEach(function (id) { $(id).value = ""; });
           saved();
+          loadCategories();                                   // the categories' counts follow
           facetsLoad();
           fillParents($("fac-new-parents"), null, []);
         }
@@ -1032,7 +1152,16 @@
   $("note-who").addEventListener("change", function () { notePage.page = 0; notesLoad(); });
 
   // ------------------------------------------------------------------ the tabs of this file
-  D.register("review", reviewLoad);
+  /* To review needs the categories as the settings say them (one's own too): the Category of Edit…, the values a
+     proposed one can be part of. The page may open on this tab, before Categories was ever shown. */
+  var categoriesRead = null;                   // once per page: Categories keeps them current after that
+  D.register("review", function () {
+    var box = $("review");
+    box.innerHTML = "";
+    box.appendChild(el("p", { class: "muted", text: "Loading…" }));
+    categoriesRead = categoriesRead || loadCategories();
+    return categoriesRead.then(reviewLoad, reviewLoad);
+  });
   D.register("catalog", function () { catLoad(false); });
   D.register("memory", memLoad);
   D.register("docs", docsLoad);

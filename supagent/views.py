@@ -185,6 +185,7 @@ def expire_stale(messages: list) -> bool:
 
 
 SEARCH_ALL = 500        # the Data dictionary's search lists at most this many pieces (page by page)
+BRIEF_VALUES = 5000          # values in a "part of" list at most (names only)
 
 
 def _body() -> dict:
@@ -1572,13 +1573,19 @@ class AdminView(BaseView):
                                                                                  Memory.id.desc()).limit(500).all())
         names: dict[int, str] = {}
         out = []
+        # a memory "in the catalog": the entry that replaced it (the page opens it to edit it)
+        from supagent.models import Entry
+
+        moved = [f"memory:{m.id}" for m in rows if m.status == "catalog"]
+        entries = {o: i for o, i in db.session.query(Entry.origin, Entry.id).filter(
+            Entry.origin.in_(moved or ["-"]), Entry.deleted_at.is_(None))}
         for m in rows:
             if m.user_id not in names:
                 u = security_manager.get_user_by_id(m.user_id) if m.user_id else None
                 names[m.user_id] = u.username if u is not None else "?"
             out.append({"id": m.id, "text": m.text, "kind": m.kind, "category": m.category, "status": m.status,
                         "source": m.source, "by": names[m.user_id], "created_at": m.created_at,
-                        "approved_by": m.approved_by})
+                        "approved_by": m.approved_by, "entry_id": entries.get(f"memory:{m.id}")})
         return _json({"memory": out})
 
     @expose("/api/memory/<int:mem_id>", methods=("POST",))
@@ -2016,7 +2023,7 @@ class AdminView(BaseView):
         from superset import db
 
         from supagent.governed.gate import CONFIRMED
-        from supagent.models import Facet, KObject, Link, Memory, Recipe, Route, Tag
+        from supagent.models import Facet, Link, Memory, Recipe, Route, Tag
 
         limit = min(max(int(request.args.get("limit", 50)), 1), 500)
         mem_q = db.session.query(Memory).filter(Memory.scope == "team", Memory.status == "proposed")
@@ -2026,14 +2033,8 @@ class AdminView(BaseView):
         recipes = [{"id": r.id, "question": r.question, "tool": r.tool, "target": r.target,
                     "query": (r.query or "")[:1500], "uses": r.uses, "created_at": r.created_at}
                    for r in rec_q.order_by(Recipe.id.desc()).limit(limit)]
-        desc_q = db.session.query(KObject).filter(KObject.gone_at.is_(None), KObject.description.isnot(None),
-                                                  KObject.description_source == "llm", KObject.verified.isnot(True))
-        from supagent.knowledge.curated import sources_of_user
-
-        dbs = {x.id: x.database_name for x in sources_of_user()}
-        described = [{"id": o.id, "name": o.name, "parent": o.parent, "kind": o.kind, "description": o.description,
-                      "source_id": o.source_id, "database": dbs.get(o.source_id)}
-                     for o in desc_q.order_by(KObject.kind, KObject.name).limit(limit)]
+        # (the AI-written descriptions of the data are not listed here: tens of thousands on a platform, nobody
+        # approves them one by one; Data -> Browse shows them, to correct the ones that matter)
         val_q = db.session.query(Facet).filter(Facet.status == "proposed")
         vals = val_q.order_by(Facet.facet, Facet.value).limit(limit).all()
         n_items = dict(db.session.query(Tag.facet_id, func.count(Tag.id)).filter(
@@ -2053,7 +2054,7 @@ class AdminView(BaseView):
                     for i in (ids or []) if i in others]
 
         values = [{"id": f.id, "facet": f.facet, "value": f.value, "description": f.description,
-                   "items": n_items.get(f.id, 0), "parents": brief(f.parents),
+                   "synonyms": list(f.synonyms or []), "items": n_items.get(f.id, 0), "parents": brief(f.parents),
                    "same_as": (brief([(f.suggested or {}).get("same_as")]) or [None])[0]} for f in vals]
         relations = [{"id": f.id, "facet": f.facet, "value": f.value, "parents": brief(f.parents),
                       "suggested": brief((f.suggested or {}).get("parents")),
@@ -2075,10 +2076,10 @@ class AdminView(BaseView):
                  for x in link_rows]
         routes = [{"id": r.id, "question": r.question, "route": r.moa, "by": r.moa_by, "signal": r.signal,
                    "at": r.signal_at} for r in route_rows]
-        counts = {"memory": mem_q.count(), "recipes": rec_q.count(), "descriptions": desc_q.count(),
+        counts = {"memory": mem_q.count(), "recipes": rec_q.count(),
                   "values": val_q.count(), "relations": len(rel_all), "tags": tag_q.count(), "links": link_q.count(),
                   "routes": route_q.count()}
-        return _json({"memory": memories, "recipes": recipes, "descriptions": described, "values": values,
+        return _json({"memory": memories, "recipes": recipes, "values": values,
                       "relations": relations, "tags": tags, "links": links, "routes": routes, "counts": counts,
                       "waiting": sum(counts[k] for k in ("memory", "recipes", "values", "relations", "tags", "links"))})
 
@@ -2099,6 +2100,17 @@ class AdminView(BaseView):
             q = q.filter(Facet.status == request.args["status"])
         if request.args.get("q"):
             q = q.filter(Facet.value.ilike(f"%{request.args['q'][:100]}%"))
+        if request.args.get("brief"):
+            # the lists of what a value can be part of: the names only, every category, the wider ones first (the
+            # full list stops at 1,000 values in the order of the categories' names: with a big category read from
+            # the data, the subjects were not in it, and saving an edit then took a value's subjects away)
+            from supagent.knowledge.facets import editable
+
+            place = {c: i for i, c in enumerate(editable())}
+            found = [r for r in q.with_entities(Facet.id, Facet.facet, Facet.value, Facet.status).all() if r[1] in place]
+            found.sort(key=lambda r: (place[r[1]], r[2].lower()))
+            return _json({"facets": [{"id": i, "facet": c, "value": v, "status": st} for i, c, v, st in found[:BRIEF_VALUES]],
+                          "capped": len(found) > BRIEF_VALUES})
         rows = q.order_by(Facet.facet, Facet.value).limit(1000).all()
         ids = [f.id for f in rows] or [-1]
         n_items = dict(db.session.query(Tag.facet_id, func.count(Tag.id)).filter(
@@ -2167,11 +2179,15 @@ class AdminView(BaseView):
     @has_access_api
     def facet_categories(self) -> Response:
         """The categories: subject, application, component and the deployment's own, each with the fields its
-        values are read from (categories.fields). POST {"name": "server", "fields": "^(host|node|server)$"} adds
-        or changes one (the settings categories.custom and categories.fields)."""
+        values are read from (categories.fields) and what it holds (values, items, "part of", interactions).
+        POST {"name": "server", "fields": "^(host|node|server)$"} adds or changes one (the settings
+        categories.custom and categories.fields); with "rename": "host", one of the deployment's own takes another
+        name (its values follow); with "remove": true it goes with its values and everything that names them (the
+        page asks first)."""
         from supagent import settings
-        from supagent.knowledge.facets import BUILTIN, NAME_OK, editable
+        from supagent.knowledge.facets import BUILTIN, NAME_OK, categories_info, remove_category, rename_category
 
+        removed = None
         if request.method == "POST":
             if not _is_admin():
                 abort(403)
@@ -2179,12 +2195,23 @@ class AdminView(BaseView):
             name = " ".join(str(body.get("name") or "").lower().split())
             if not NAME_OK.match(name) or name == "aspect":
                 return _json({"error": "a name of 2 to 24 letters, digits, spaces or _ (not aspect)"}, 400)
+            if body.get("remove"):
+                try:
+                    removed = remove_category(name, g.user.username)
+                except ValueError as ex:
+                    return _json({"error": str(ex)}, 400)
+                return _json({"removed": removed, "categories": categories_info()})
             rx = str(body.get("fields") or "").strip()
             if rx:
                 try:
                     re.compile(rx)
                 except re.error as ex:
                     return _json({"error": f"the field names pattern is not a regular expression: {ex}"}, 400)
+            if str(body.get("rename") or "").strip():
+                try:
+                    name = rename_category(name, str(body["rename"]), g.user.username)
+                except ValueError as ex:
+                    return _json({"error": str(ex)}, 400)
             if name not in BUILTIN and name not in [str(x).lower() for x in settings.get("categories.custom") or []]:
                 settings.set_value("categories.custom", list(settings.get("categories.custom") or []) + [name],
                                    by=g.user.username)
@@ -2194,9 +2221,7 @@ class AdminView(BaseView):
             elif "fields" in body:
                 fields.pop(name, None)
             settings.set_value("categories.fields", fields, by=g.user.username)
-        fields = dict(settings.get("categories.fields") or {})
-        return _json({"categories": [{"name": c, "builtin": c in BUILTIN, "fields": fields.get(c) or ""}
-                                     for c in editable()]})
+        return _json({"categories": categories_info()})
 
     @expose("/api/facets/map", methods=("GET",))
     @has_access_api
@@ -2255,7 +2280,16 @@ class AdminView(BaseView):
             touch()
             db.session.commit()
             return _json({"id": f.id, "parents": f.parents or []})
-        new_facet = str(body.get("facet") or "").strip() or f.facet
+        def approve(v: Any) -> None:
+            from supagent.knowledge.facets import review_all
+
+            v.status = "approved"
+            if not review_all():                      # its confident tags are used at once
+                for t in db.session.query(Tag).filter(Tag.facet_id == v.id, Tag.status == "proposed"):
+                    if (t.confidence or 0) >= CONFIDENT:
+                        t.status = "approved"
+
+        new_facet = str(body.get("facet") or "").strip().lower() or f.facet
         if new_facet != f.facet and (f.facet not in editable() or new_facet not in editable()):
             return _json({"error": "the aspect (functional, technical) is fixed; a value moves between "
                                    + ", ".join(editable())}, 400)
@@ -2266,7 +2300,13 @@ class AdminView(BaseView):
             if there is not None:                    # that value exists there already: one value, its items together
                 if there.status == "rejected":
                     there.status = f.status
+                if "parents" in body:                 # what the admin chose with the change: its parts go along
+                    from supagent.knowledge.facets import clean_parents
+
+                    f.parents = [p for p in clean_parents(f.id, body.get("parents")) if p != there.id] or None
                 merge_value(f, there)
+                if body.get("status") == "approved" and there.status != "approved":
+                    approve(there)                    # "Save and approve" on a value that names an existing proposal
                 if str(body.get("description") or "").strip() and not there.description:
                     there.description = str(body["description"]).strip()
                 syn = body.get("synonyms")
@@ -2277,16 +2317,14 @@ class AdminView(BaseView):
                 db.session.commit()
                 touch()
                 db.session.commit()
-                return _json({"merged_into": there.id, "facet": there.facet, "value": there.value})
+                return _json({"merged_into": there.id, "facet": there.facet, "value": there.value,
+                              "status": there.status})
         f.facet = new_facet
         if body.get("status") in ("approved", "proposed", "rejected"):
-            from supagent.knowledge.facets import review_all
-
-            f.status = body["status"]
-            if f.status == "approved" and not review_all():        # its confident tags are used at once
-                for t in db.session.query(Tag).filter(Tag.facet_id == f.id, Tag.status == "proposed"):
-                    if (t.confidence or 0) >= CONFIDENT:
-                        t.status = "approved"
+            if body["status"] == "approved":
+                approve(f)
+            else:
+                f.status = body["status"]
         if str(body.get("value") or "").strip():
             f.value = name
         if "description" in body:

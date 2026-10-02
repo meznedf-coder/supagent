@@ -102,7 +102,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.8.1-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.8.2-py3-none-any.whl          # Superset 6.1: nothing else to install
 ```
 
 One line in `superset_config.py` registers it. It holds no logic:
@@ -804,8 +804,12 @@ says what goes with it (0.8):
 
 * **To review** (admins; the page opens on it when something waits, the count is on the tab and in Settings): the
   team memory proposed from the chats, the answers marked Helpful, the categories and relations the LLM proposes,
-  each a card with its actions (approve, correct, merge, reject; approve all shown); then, folded, what the agent
-  already uses and an admin may check (AI-written descriptions, the kinds of work learned by the router);
+  each a card with its actions (approve, correct, merge, reject; approve all shown). A proposed value is edited
+  whole before it is approved (**Edit…**, 0.8.2: its category, its name, what it covers, its other names and what
+  it is part of, then *Save and approve*, or *Save* to decide later). Then, folded, what the agent already uses
+  and an admin may check (the kinds of work learned by the router). The AI-written descriptions of the data are
+  not listed there (0.8.2: tens of thousands on a platform); *Data → Browse → AI-written, not approved* shows
+  them, to correct the ones that matter;
 * **Knowledge**: the catalog, the team memory, the documents and sites, the notes, the Context, **Learned by the
   agent** (the learned answers, most useful first, which an admin may correct before confirming them: Edit, then
   *Check the query* runs it with the admin's permissions, and a changed query is confirmed only if it runs; the
@@ -838,7 +842,10 @@ LLM proposes these relations for new values and for known ones (To review), and 
 draws the whole system from them (see *The System map*), with the items about each value that exist now. Categories of your own
 (server, environment, team...) are added there too, each with the field names its values are read from in the
 data (`categories.fields`): their values are kept with where they come from, and two such fields of one index
-show which values go together, proposed as "part of" for an admin to approve. In To review every suggestion can
+show which values go together, proposed as "part of" for an admin to approve. In that list (0.8.2) **Edit**
+changes the name of one of yours (its values follow) and the field names of any, and **Remove** takes one of yours
+away with its values and everything that names them (the items they were given to, the "part of", the interactions
+of the map), after asking and saying what goes. In To review every suggestion can
 be approved, rejected or changed first (Change…); `categories.review_all` (on by default) makes every category
 and relation the LLM finds wait for an admin, even the ones it is sure of; off, what it is sure of is used at
 once (the 0.6 behaviour).
@@ -862,6 +869,14 @@ with what it is part of, what it is made of and what it interacts with. Click a 
 interactions, its knowledge in the search). Admins: **Edit** to move the boxes (their places are kept for
 everyone), draw an interaction (a part, *Draw an interaction from here*, then another part), write what a part is
 (or take the sentence found), hide a part. Exports: **PNG, SVG, PDF** (the map as drawn, the focus too).
+
+The map follows the categories by itself (0.8.2): it is read again each time it is shown, when the window comes
+back and every 20 seconds while it is looked at (once a minute for who is not an admin; never while an admin
+edits it; not after 15 minutes with nobody at the page), and says what the reading
+brought next to its title ("Updated: new part ..."), the new box and the new "part of" outlined for a moment;
+*Show* brings them in view. An admin sees every category, the ones with no value yet too (a dashed "No value
+yet" box that leads to Categories), and how many proposed values wait in To review: the map draws the approved
+values, a proposed one comes once approved.
 
 ## The subjects of a chat (0.8)
 

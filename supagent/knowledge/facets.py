@@ -26,7 +26,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from superset import db
 
@@ -644,6 +644,166 @@ def _approved() -> dict[str, list[str]]:
     return out
 
 
+def _chunks(ids: list[int], size: int = 500) -> Iterator[list[int]]:
+    for i in range(0, len(ids), size):
+        yield ids[i:i + size]
+
+
+def categories_info() -> list[dict[str, Any]]:
+    """The categories (subject, application, component, then the deployment's own) with what each holds: its
+    values in use or proposed, the items they are given to, the "part of" that name them, the interactions drawn
+    with them. What removing one takes is said from these."""
+    from sqlalchemy import func
+
+    from supagent import settings
+    from supagent.models import Facet, Link, Tag
+
+    fields = settings.get("categories.fields")
+    fields = {str(k).strip().lower(): str(v) for k, v in (fields if isinstance(fields, dict) else {}).items()}
+    info = {c: {"name": c, "builtin": c in BUILTIN, "fields": fields.get(c) or "", "values": 0, "tags": 0, "parts": 0,
+                "interactions": 0} for c in editable()}
+    cat_of: dict[int, str] = {}
+    rows = db.session.query(Facet.id, Facet.facet, Facet.status, Facet.parents).filter(Facet.facet.in_(list(info))).all()
+    for fid, cat, _status, _parents in rows:
+        cat_of[fid] = cat
+    for fid, cat, status, parents in rows:
+        if status != "rejected":
+            info[cat]["values"] += 1
+        for p in parents or []:
+            info[cat]["parts"] += 1
+            if p in cat_of and cat_of[p] != cat:
+                info[cat_of[p]]["parts"] += 1                 # named as what a value of another category is part of
+    for cat, n in db.session.query(Facet.facet, func.count(Tag.id)).join(Tag, Tag.facet_id == Facet.id).filter(
+            Facet.facet.in_(list(info))).group_by(Facet.facet):
+        info[cat]["tags"] = int(n)
+    for a, b in db.session.query(Link.a_ref, Link.b_ref).filter(Link.a_ref.like("facet:%"), Link.b_ref.like("facet:%")):
+        cats = {cat_of.get(int(r.split(":", 1)[1])) for r in (a, b) if r.split(":", 1)[1].isdigit()}
+        for cat in cats - {None}:
+            info[cat]["interactions"] += 1
+    return list(info.values())
+
+
+def _own(name: str) -> str:
+    """The name of a category of the deployment's own, as it is kept (an error: built in, unknown)."""
+    name = " ".join(str(name or "").lower().split())
+    if name in BUILTIN or name == "aspect":
+        raise ValueError(f"{name} is built in: it is not renamed nor removed (its field names can change)")
+    if name not in editable():
+        raise ValueError(f"no category {name!r}")
+    return name
+
+
+def _set_categories(change: Callable[[list[str], dict[str, str]], None], by: str) -> None:
+    from supagent import settings
+
+    custom = [str(x).strip().lower() for x in (settings.get("categories.custom") or [])]
+    fields = settings.get("categories.fields")
+    fields = {str(k).strip().lower(): str(v) for k, v in (fields if isinstance(fields, dict) else {}).items()}
+    change(custom, fields)
+    settings.set_value("categories.custom", list(dict.fromkeys(custom)), by=by)
+    settings.set_value("categories.fields", fields, by=by)
+
+
+def rename_category(old: str, new: str, by: str) -> str:
+    """A category of the deployment's own under another name: its values follow, with everything given to them
+    (their ids do not change), the field names it reads, its fold on the map."""
+    from supagent.knowledge import sysmap
+    from supagent.knowledge.freshness import touch
+    from supagent.models import Facet
+
+    old = _own(old)
+    new = " ".join(str(new or "").lower().split())
+    if not NAME_OK.match(new) or new == "aspect":
+        raise ValueError("a name of 2 to 24 letters, digits, spaces or _ (not aspect)")
+    if new == old:
+        return old
+    if new in editable() or db.session.query(Facet.id).filter(Facet.facet == new).first() is not None:
+        raise ValueError(f"the category {new!r} exists already: move the values there (Edit), then remove this one")
+    db.session.query(Facet).filter(Facet.facet == old).update({"facet": new}, synchronize_session=False)
+
+    def change(custom: list[str], fields: dict[str, str]) -> None:
+        if old in custom:
+            custom[custom.index(old)] = new
+        else:
+            custom.append(new)
+        if old in fields:
+            fields[new] = fields.pop(old)
+
+    _set_categories(change, by)
+    lay = sysmap.layout()
+    if old in (lay.get("folded") or {}):
+        lay["folded"][new] = lay["folded"].pop(old)
+        sysmap.save_layout(lay, by)
+    touch()
+    db.session.commit()
+    return new
+
+
+def remove_category(name: str, by: str) -> dict[str, int]:
+    """A category of the deployment's own goes with everything that names it: its values (the retired ones too),
+    the items they were given to, the "part of" that name them (other values' and the LLM's suggestions), the
+    interactions drawn with them, their places on the map; then its name and its field names in the settings.
+    The built-in ones (subject, application, component) stay. What went, counted."""
+    from sqlalchemy import or_
+
+    from supagent.knowledge import sysmap
+    from supagent.knowledge.freshness import touch
+    from supagent.models import Facet, Link, Tag
+
+    name = _own(name)
+    ids = [i for (i,) in db.session.query(Facet.id).filter(Facet.facet == name)]
+    gone = set(ids)
+    out = {"values": len(ids), "tags": 0, "parts": 0, "interactions": 0}
+    if ids:
+        for part in _chunks(ids):
+            out["tags"] += db.session.query(Tag).filter(Tag.facet_id.in_(part)).delete(synchronize_session=False)
+            refs = [f"facet:{i}" for i in part]
+            out["interactions"] += db.session.query(Link).filter(
+                or_(Link.a_ref.in_(refs), Link.b_ref.in_(refs))).delete(synchronize_session=False)
+        for f in db.session.query(Facet):
+            if f.id in gone:
+                out["parts"] += len(f.parents or [])
+                continue
+            if f.parents and any(p in gone for p in f.parents):
+                kept = [p for p in f.parents if p not in gone]
+                out["parts"] += len(f.parents) - len(kept)
+                f.parents = kept or None
+            sug = dict(f.suggested or {})
+            before = json.dumps(sug, sort_keys=True, default=str)
+            for key in ("parents", "declined"):
+                if sug.get(key):
+                    sug[key] = [p for p in sug[key] if p not in gone]
+                    if not sug[key]:
+                        sug.pop(key)
+            if sug.get("same_as") in gone:
+                sug.pop("same_as")
+            if isinstance(sug.get("from"), dict):
+                sug["from"] = {k: v for k, v in sug["from"].items() if not (str(k).isdigit() and int(k) in gone)}
+                if not sug["from"] or not sug.get("parents"):
+                    sug.pop("from")
+            if json.dumps(sug, sort_keys=True, default=str) != before:
+                f.suggested = sug or None
+        db.session.flush()
+        for part in _chunks(ids):
+            db.session.query(Facet).filter(Facet.id.in_(part)).delete(synchronize_session=False)
+
+    def change(custom: list[str], fields: dict[str, str]) -> None:
+        while name in custom:
+            custom.remove(name)
+        fields.pop(name, None)
+
+    _set_categories(change, by)
+    lay = sysmap.layout()
+    places = {k: v for k, v in (lay.get("positions") or {}).items() if not (str(k).isdigit() and int(k) in gone)}
+    hidden = [i for i in lay.get("hidden") or [] if i not in gone]
+    folded = {k: v for k, v in (lay.get("folded") or {}).items() if k != name}
+    if lay and (places != (lay.get("positions") or {}) or hidden != (lay.get("hidden") or []) or folded != (lay.get("folded") or {})):
+        sysmap.save_layout({"positions": places, "hidden": hidden, "folded": folded}, by)
+    touch()
+    db.session.commit()
+    return out
+
+
 def clean_parents(fid: int | None, wanted: Any) -> list[int]:
     """The parents asked for a value (ids or "1,2"), kept when they are other values of the editable categories
     that are not retired; the order kept, each once."""
@@ -700,11 +860,14 @@ def system_map() -> list[dict[str, Any]]:
         refs.setdefault(fid, set()).add(base_ref(ref))
     every = {r for rs in refs.values() for r in rs}
     obj_ids = [int(r.split(":")[1]) for r in every if re.match(r"^object:\d+$", r)]
-    objs = {o.id: o for o in db.session.query(KObject).filter(KObject.id.in_(obj_ids or [-1]))}
+    # the columns only: a platform has tens of thousands of metrics, each with its statistics (the page waited on them)
+    objs = {o.id: o for o in db.session.query(KObject.id, KObject.kind, KObject.gone_at).filter(
+        KObject.id.in_(obj_ids or [-1]))}
     live_families = set()
     if any(r.startswith("family:") for r in every):
-        for o in db.session.query(KObject).filter(KObject.kind == "metric", KObject.gone_at.is_(None)):
-            live_families.add(family_of(o.source_id, o.name))
+        for source_id, name in db.session.query(KObject.source_id, KObject.name).filter(
+                KObject.kind == "metric", KObject.gone_at.is_(None)):
+            live_families.add(family_of(source_id, name))
     pieces = {r.split("#", 1)[0] for (r,) in db.session.query(Chunk.ref).filter(
         Chunk.ref.notlike("object:%"), Chunk.ref.notlike("superset:%"))}
 

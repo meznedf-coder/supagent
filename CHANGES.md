@@ -1,5 +1,41 @@
 # Changes
 
+## 0.8.2 — 2 Oct 2026
+
+The Data dictionary, from a first day of review on a real platform:
+* **To review: a proposed value is edited whole before it is approved.** *Edit…* on its card (in place of Rename)
+  has what the Categories page's Edit has: its category (subject, application, component, your own), its name,
+  what it covers, its other names and what it is part of, then *Save and approve*, or *Save* to keep it waiting
+  with what was changed. A name that exists already in the category it moves to makes one value of the two, with
+  the parts chosen, approved when asked.
+* **Saving an edit never takes away a "part of" the admin could not see.** The list of what a value can be part of
+  fills after a request and held the first 1,000 values in the order of the categories' names: with a big category
+  read from the data (servers), the subjects were not in it, and saving an edit of a value (Categories → Edit, To
+  review → Part of…) then removed its subjects without a word. The list now has every category, the wider ones
+  first (5,000 names at most); the save buttons wait for it; a part the list does not show stays as it is.
+* **The AI-written descriptions of the data are no longer listed in To review** (tens of thousands on a platform:
+  nobody approves them one by one). *Data → Browse → AI-written, not approved* shows them, to correct the ones that
+  matter; the page's first line counts them without calling them to check.
+* **Categories of your own are edited and removed** (Knowledge → Categories → *Categories and where their values
+  come from*): *Edit* changes the name of one of yours (its values follow) and the field names of any; *Remove*
+  takes one of yours away with its values and everything that names them (the items they were given to, the "part
+  of", the interactions of the map, their places), after asking and saying what goes. Each category says how many
+  values it has. A name of your own is shown as you wrote it (no "s" added: Infra, Monitoring).
+* **The System map follows the categories by itself**: read again when it is shown, when the window comes back and
+  every 20 seconds while it is looked at (once a minute for who is not an admin; never while an admin edits it; not
+  after 15 minutes with nobody at the page, so that an open map does not keep a session alive); it says what a
+  reading brought ("Updated:
+  new part ..., 1 new “part of”", *Show* brings it in view) and outlines it for a moment. An admin sees every
+  category, the ones with no value yet too (a category just added has its column, with "No value yet: add one in
+  Categories"), and how many proposed values wait in To review (the map draws the approved ones). While it reads,
+  the page says "Updating…".
+* **The map answers fast on a big platform**: it read every metric with its statistics (seconds with tens of
+  thousands of metrics) and looked all the documents up again for every value after each change; it now reads the
+  two columns it needs, and keeps each value's explanation while the documents do not change.
+* **Team memory: "Edit it in the catalog" opens the entry** that replaced the memory (it was a text, not a link).
+
+No schema change: from 0.8.0 or 0.8.1, `pip install` on every host and restart.
+
 ## 0.8.1 — 2 Oct 2026
 
 Two refinements of 0.8.0's checks, found by replaying them on the recorded answers of the end-to-end suite:

@@ -327,7 +327,7 @@ def test_a_parts_explanation_comes_from_the_sentence_about_it(ctx):
             Chunk(ref="context:902#0", kind="context", title="Apps", text="Ticketing is the helpdesk's tool [E2, E3].")]
     db.session.add_all(rows)
     db.session.commit()
-    sysmap._HINTS.update(stamp=None, at=0.0, hints={})
+    sysmap._HINTS.update(state=None, at=0.0, names={}, partial=False)
     try:
         values = {1: SimpleNamespace(value="Payment gateway", description=None),
                   2: SimpleNamespace(value="Ticketing", description=None),
@@ -338,6 +338,25 @@ def test_a_parts_explanation_comes_from_the_sentence_about_it(ctx):
         assert all(h[2] != "Payment gateway" for h in got[1])            # nor its heading
         assert got[2][0][2] == "Ticketing is the helpdesk's tool."       # without the citations
         assert 3 not in got                                              # named in a list only
+        # a value approved or added later: its name alone is read (the others are kept while the texts stay)
+        read: list[str] = []
+        real = sysmap._sentences
+        sysmap._sentences = lambda text: read.append(text) or real(text)
+        try:
+            values[4] = SimpleNamespace(value="Checkout", description=None)
+            again = sysmap.hints(values)
+            assert again[1] == got[1] and again[2] == got[2] and len(read) == 1      # the one text that names it
+            assert again[4][0][2].startswith("Customers order on the shop; the checkout asks")
+            read.clear()
+            assert sysmap.hints(values) == again and read == []                       # nothing new: nothing read
+            # the texts changed: everything is read again (a runbook now says what the Refund batch is)
+            more = Chunk(ref="doc:902#0", kind="doc", title="Refunds", text="The Refund batch pays the refunds every night.")
+            db.session.add(more)
+            db.session.commit()
+            rows.append(more)
+            assert sysmap.hints(values)[3][0][2] == "The Refund batch pays the refunds every night."
+        finally:
+            sysmap._sentences = real
     finally:
         db.session.query(Chunk).filter(Chunk.ref.in_([c.ref for c in rows])).delete(synchronize_session=False)
         db.session.commit()

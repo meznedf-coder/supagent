@@ -524,6 +524,11 @@ tr.demoted > td:first-child > div:first-child { text-decoration: line-through; c
 .cat-own { margin: 10px 0; }
 .cat-own summary { cursor: pointer; font-weight: 600; }
 .cat-own-list { margin: 6px 0; padding-left: 18px; }
+.cat-own-list li { margin: 3px 0; }
+.cat-own-acts { margin-left: 10px; }
+.cat-own-edit { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 2px 0; }
+.cat-own-edit .cat-own-name { width: 14em; }
+.cat-own-edit .cat-own-rx { width: 26em; max-width: 100%; }
 .facet-origins { font-size: 12px; }
 
 /* 0.8: the "i" buttons (an explanation on demand) and the small cards next to a button (explanations, the
@@ -646,10 +651,25 @@ tr.editing > td { background: var(--line-2); }
 .map-svg { width: 100%; height: 100%; display: block; user-select: none; }
 .map-node { cursor: pointer; transition: opacity .15s; }
 .map-node:focus { outline: none; }
+/* the map reads itself again: said next to the title; what a reading brought is outlined for a moment */
+.map-state { font-size: 12.5px; color: var(--muted); }
+.map-state.busy::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%;
+  background: var(--accent); animation: map-pulse 1s ease-in-out infinite; }
+.map-state.changed { color: var(--accent); font-weight: 600; }
+.map-state .linkish { margin-left: 8px; font-weight: 600; }
+.map-state.warn { color: var(--warn); }
+.map-canvas[aria-busy="true"] svg { opacity: .6; transition: opacity .2s; }
+.map-node.map-new rect:first-child { stroke: var(--accent); stroke-width: 2.6; }
+.map-edge.map-edge-new { stroke: var(--accent); stroke-width: 2.6; }
+@keyframes map-pulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .map-state.busy::before { animation: none; } }
 .map-node:focus rect:first-child, .map-node.on rect:first-child { stroke: var(--accent); stroke-width: 2.2; }
 .map-node.dim, .map-edge.dim, .map-link.dim { opacity: .22; }
 .map-edge.on { stroke: var(--accent); stroke-width: 2.5; }
 .map-fold rect:first-child { stroke-dasharray: 2 3; }
+.map-none { cursor: pointer; }
+.map-none:focus { outline: none; }
+.map-none:hover rect, .map-none:focus rect { stroke: var(--accent); }
 .map-side { width: min(360px, 40vw); max-height: max(520px, calc(100vh - 300px)); overflow: auto; background: var(--panel);
   border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; position: relative; display: grid;
   gap: 8px; align-content: start; font-size: 13.5px; }

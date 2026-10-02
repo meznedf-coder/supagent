@@ -276,12 +276,13 @@
         <div class="explain" id="x-cat-own">Subject, application and component, and your own (server, environment,
           team…). A category can read its values from the data: the fields whose names match its pattern (e.g.
           <code>^(host|node|server)$</code>); two such fields of one index tell which values go together, proposed to you
-          as "part of" in To review.</div>
+          as "part of" in To review. Edit changes the name of one of yours (its values follow) and the field names
+          of any; Remove takes one of yours away with its values and everything that names them (it asks first).</div>
         <ul id="cat-own-list" class="cat-own-list"></ul>
         <div class="filters" role="group" aria-label="Add a category">
           <input id="cat-own-name" type="text" maxlength="24" placeholder="New category, e.g. server" aria-label="New category">
           <input id="cat-own-fields" type="text" placeholder="Field names it reads, e.g. ^(host|node|server)$" aria-label="Field names pattern">
-          <button type="button" class="btn" id="cat-own-add">Add or change</button>
+          <button type="button" class="btn" id="cat-own-add">Add</button>
           <span id="cat-own-result" class="result" role="status" aria-live="polite"></span>
         </div>
       </details>
@@ -293,6 +294,7 @@
     <div id="sub-map" class="sub" hidden>
       <div class="sec-head"><h2>System map</h2>
         <button type="button" class="info" aria-controls="x-map" aria-label="About the system map">i</button>
+        <span id="map-state" class="map-state" role="status" aria-live="polite"></span>
         <span class="grow"></span>
         <span class="map-tools">
           <select id="map-focus" aria-label="Show"><option value="">Everything</option></select>
@@ -308,7 +310,10 @@
         category (subjects, applications, components, servers…), each part in its box with what it does (its description,
         else a sentence of the documents that name it), a grey line from a part to what it is part of, and the
         interactions between parts (depends on, sends data to, calls…) as arrows. A big category is folded into one box:
-        click it to open it. It follows the data: a part whose items are gone says so. Admins: Edit to move the boxes,
+        click it to open it. It follows the categories by itself (read again every 20 seconds while you look at it, not
+        after 15 minutes with nobody at the page: a new part or a new "part of" is outlined for a moment) and the data:
+        a part whose items are gone says so. It
+        draws the approved values: a proposed one comes once approved in To review. Admins: Edit to move the boxes,
         draw an interaction (click a box, then another), and write what a part or an interaction is.</div>
       <div id="map-legend" class="map-legend"></div>
       <div class="map-wrap">

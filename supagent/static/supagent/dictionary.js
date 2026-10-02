@@ -88,8 +88,8 @@
           el("div", { class: "counts" }, parts.filter(function (p) { return p[1]; }).map(function (p) {
             return el("span", { text: S.num(p[1]) + " " + p[0] });
           }).concat([el("span", { text: S.num(s.described) + " described" }),
-                     s.unverified ? el("button", { type: "button", class: "linkish", html: S.num(s.unverified) + ' <span class="badge llm">AI-written</span> to check',
-                       onclick: function () { browseUnverified(s.id); } }) : null]))
+                     s.unverified ? el("button", { type: "button", class: "linkish", html: S.num(s.unverified) + ' <span class="badge llm">AI-written</span>',
+                       title: "Browse them in Data, to correct the ones that matter", onclick: function () { browseUnverified(s.id); } }) : null]))
         ]);
         box.appendChild(card);
         if (!sel.querySelector('option[value="' + s.id + '"]')) sel.appendChild(el("option", { value: s.id, text: s.database }));
@@ -102,7 +102,7 @@
       var unverified = src.reduce(function (n, s) { return n + (s.unverified || 0); }, 0);
       $("sources-line").textContent = src.length ? S.num(src.length) + " database" + (src.length > 1 ? "s" : "") + " you may query · " +
         S.num(learned) + " learned · " + S.num(described) + " objects described" +
-        (unverified ? " · " + S.num(unverified) + " AI-written to check" : "") : "No database learned yet";
+        (unverified ? " · " + S.num(unverified) + " of them AI-written" : "") : "No database learned yet";
       if (!learned) $("sources-box").open = true;
     });
   }
@@ -350,7 +350,7 @@
       box.appendChild(el("span", { class: "muted", text: S.num(d.relations_measured) + " relations measured" }));
       (d.to_verify || []).forEach(function (v) {
         box.appendChild(document.createTextNode(" · "));
-        box.appendChild(el("button", { type: "button", class: "linkish", text: S.num(v.count) + " AI descriptions to verify in " + v.database,
+        box.appendChild(el("button", { type: "button", class: "linkish", text: S.num(v.count) + " AI-written descriptions in " + v.database,
           onclick: function () { browseUnverified(v.source_id); } }));
       });
       var te = $("agent-entries").querySelector("tbody");
