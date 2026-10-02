@@ -5,18 +5,18 @@
   <h1>Chat settings</h1>
   <div id="status" class="status"></div>
   <section class="card" id="sec-llm">
-    <h2>LLM</h2>
-    <p class="muted">An OpenAI-compatible chat API with tool calls. Authentication: none, a fixed access token, or a token
+    <div class="sec-head"><h2>LLM</h2><button type="button" class="info" aria-controls="x-llm" aria-label="About the LLM">i</button></div>
+    <div class="explain" id="x-llm">An OpenAI-compatible chat API with tool calls. Authentication: none, a fixed access token, or a token
       from the company middleware (OAuth2 client credentials with the consumer key and secret, and a client certificate
-      when the middleware asks for one), renewed before it expires.</p>
+      when the middleware asks for one), renewed before it expires.</div>
     <div class="fields" data-group="llm"></div>
     <div class="actions"><button type="button" class="btn primary" data-save="llm">Save</button>
       <button type="button" class="btn" id="test-llm">Test the LLM</button><span id="llm-result" class="result"></span></div>
   </section>
   <section class="card" id="sec-learn">
-    <h2>Daily learning</h2>
-    <p class="muted">Every day at the chosen hour, the metrics (promagg) and the indices (osagg) are read as the learning
-      user: types, units, values, series, time ranges, relations, and what changed since the day before.</p>
+    <div class="sec-head"><h2>Daily learning</h2><button type="button" class="info" aria-controls="x-learn" aria-label="About the daily learning">i</button></div>
+    <div class="explain" id="x-learn">Every day at the chosen hour, the metrics (promagg) and the indices (osagg) are read as the learning
+      user: types, units, values, series, time ranges, relations, and what changed since the day before.</div>
     <div class="fields" data-group="learn context"></div>
     <div class="actions"><button type="button" class="btn primary" data-save="learn context">Save</button>
       <button type="button" class="btn" id="learn-now">Learn now</button>
@@ -35,18 +35,19 @@
     <div class="actions"><button type="button" class="btn primary" data-save="tools mcp chats">Save</button></div>
   </section>
   <section class="card" id="sec-search">
-    <h2>Knowledge search and memory</h2>
-    <p class="muted">With each question the agent gets the knowledge that looks relevant: the dictionary, the catalog's
-      notes and rules, the team's learned answers and memory, the documents. Words are searched with PostgreSQL's
-      full-text search; with an embedding model (e.g. bge-m3 on the same gateway), meanings too. The vectors are
-      kept in Superset's database (no extension, no service) or in a Qdrant server.</p>
+    <div class="sec-head"><h2>Knowledge search and memory</h2><button type="button" class="info" aria-controls="x-search" aria-label="About the knowledge search">i</button></div>
+    <div class="explain" id="x-search">With each question the agent gets the knowledge that looks relevant: the dictionary, the catalog's
+      guides and rules, the team's learned answers and memory, the documents and sites. Words are searched with
+      PostgreSQL's full-text search; with an embedding model (e.g. bge-m3 on the same gateway), meanings too. With
+      pgvector, pg_textsearch or pg_trgm in Superset's database, everything is also kept in the knowledge store
+      (schema supagent_store).</div>
     <div class="fields" data-group="search embed qdrant memory docs"></div>
     <div class="actions"><button type="button" class="btn primary" data-save="search embed qdrant memory docs">Save</button></div>
   </section>
   <section class="card" id="sec-knowledge">
-    <h2>Knowledge</h2>
-    <p class="muted">The catalog, the team memory, the documents and sites, and the categories are edited in the Data
-      dictionary, next to what waits for an admin's review.</p>
+    <div class="sec-head"><h2>Knowledge</h2><button type="button" class="info" aria-controls="x-knowledge" aria-label="About the knowledge">i</button></div>
+    <div class="explain" id="x-knowledge">The catalog, the team memory, the documents and sites, the categories and the system map are
+      edited in the Data dictionary, next to what waits for an admin's review.</div>
     <div class="actions">
       <a class="btn primary" id="go-review" href="#">What waits for review</a>
       <a class="btn" id="go-catalog" href="#">Catalog</a>

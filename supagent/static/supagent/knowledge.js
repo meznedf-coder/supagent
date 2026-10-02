@@ -14,14 +14,30 @@
     node.className = "result " + (r && r.error ? "bad" : "good");
   }
   function badge(text, cls) { return el("span", { class: "badge" + (cls ? " " + cls : ""), text: text }); }
-  function sureButton(label, fn) {            // a second click confirms (no browser dialogs)
-    return el("button", { type: "button", class: "linkish", text: label, onclick: function () {
-      if (this.dataset.sure) { fn(); return; }
-      this.dataset.sure = "1";
-      this.textContent = label + ": sure?";
-      var b = this;
-      setTimeout(function () { delete b.dataset.sure; b.textContent = label; }, 4000);
-    } });
+  /* what cannot be undone: confirmed in a small card next to the button (common.js) */
+  function sureButton(label, fn, ask, detail, yes) {
+    return S.sureButton(label, fn, { ask: ask || label + "?", detail: detail, yes: yes || label });
+  }
+  /* a card's panel (Part of…, Merge into…, Rename, Change…, Edit): its button opens it, the same button closes it;
+     one panel open at a time on a card */
+  function panelToggle(btn, cls, build) {
+    var c = btn.closest(".rcard"), body = c.querySelector(".rbody");
+    var open = body.querySelector(".rpanel." + cls);
+    c.querySelectorAll(".rpanel").forEach(function (x) { if (x._close) x._close(); x.remove(); });
+    c.querySelectorAll("button[aria-expanded]").forEach(function (b) { b.setAttribute("aria-expanded", "false"); b.classList.remove("on"); });
+    if (open) return;                                       // it was open: closed now
+    var panel = build(c);
+    if (!panel) return;
+    panel.classList.add("rpanel", cls);
+    body.appendChild(panel);
+    btn.setAttribute("aria-expanded", "true");
+    btn.classList.add("on");
+    var first = panel.querySelector("input, select, textarea");
+    if (first) first.focus();
+  }
+  function toggleButton(label, cls, build) {
+    return el("button", { type: "button", class: "btn small", text: label, "aria-expanded": "false",
+      onclick: function (ev) { panelToggle(ev.currentTarget, cls, build); } });
   }
 
   // ------------------------------------------------------------------ the agent's search after a save
@@ -160,10 +176,11 @@
   function group(key, items, render, extra) {
     var g = GROUPS.filter(function (x) { return x[0] === key; })[0];
     if (!counts[key]) return null;
-    var head = el("div", { class: "rgroup-head" }, [el("h2", { text: g[1] }), el("span", { class: "count", id: "rg-count-" + key, text: S.num(counts[key]) })]);
+    var head = el("div", { class: "rgroup-head" }, [el("h2", { text: g[1] }), S.info(g[2], g[1]),
+      el("span", { class: "count", id: "rg-count-" + key, text: S.num(counts[key]) })]);
     if (extra && extra.bulk) head.appendChild(extra.bulk);
     var list = el("div", { class: "rlist" }, items.map(render));
-    var sec = el("section", { class: "rgroup", id: "rg-" + key }, [head, el("p", { class: "muted", text: g[2] }), list]);
+    var sec = el("section", { class: "rgroup", id: "rg-" + key }, [head, list]);
     if (extra && extra.fold && items.length > extra.fold) {          // a long optional group: the first ones
       var hidden = Array.prototype.slice.call(list.children, extra.fold);
       hidden.forEach(function (c) { c.hidden = true; });
@@ -182,7 +199,12 @@
   function bulk(label, key, items, fn) {        // "Approve all shown": a second click confirms
     var box = el("span", { class: "rbulk" });
     var go = el("button", { type: "button", class: "btn small", text: label, onclick: function () {
-      if (!go.dataset.sure) { go.dataset.sure = "1"; go.textContent = label + " (" + items.length + "): sure?"; return; }
+      S.confirm(go, label + ": the " + items.length + " shown?", { yes: "Approve " + items.length, no: "Cancel",
+        detail: "Each one is used by the agent at once; you can still change or retire them in Categories." }).then(function (ok) {
+        if (ok) all();
+      });
+    } });
+    var all = function () {
       go.disabled = true;
       var cards = $("rg-" + key).querySelectorAll(".rcard");
       var chain = Promise.resolve(), n = 0;
@@ -196,7 +218,7 @@
         });
       });
       chain.then(function () { go.remove(); done(key, n); setTimeout(reviewLoad, 450); });
-    } });
+    };
     box.appendChild(go);
     return box;
   }
@@ -216,25 +238,49 @@
           var text = el("div", { class: "rtext", text: m.text });
           return card([text], [m.kind, m.category, m.source === "chat" ? "from a chat" : "written by a user", S.when(m.created_at)].filter(Boolean).join(" · "), [
             act("Approve", "primary", "memory", function () { return S.admin("POST", "memory/" + m.id, { status: "active" }).then(function (r) { return r.error ? r : { done: "approved" }; }); }),
-            el("button", { type: "button", class: "btn small", text: "Edit", onclick: function () {
-              var c = this.closest(".rcard");
-              if (c.querySelector("textarea")) return;
+            toggleButton("Edit", "p-edit", function () {
               var ta = el("textarea", { rows: "2", "aria-label": "Memory" });
               ta.value = m.text;
-              text.replaceWith(ta);
-              ta.focus();
-              c._acts.insertBefore(act("Save and approve", "primary", "memory", function () {
+              text.hidden = true;
+              var panel = el("div", { class: "actions" }, [ta, act("Save and approve", "primary", "memory", function () {
                 return S.admin("POST", "memory/" + m.id, { text: ta.value, status: "active" }).then(function (r) { return r.error ? r : { done: "corrected and approved" }; });
-              }), c._acts.firstChild);
-            } }),
+              })]);
+              panel._close = function () { text.hidden = false; };
+              return panel;
+            }),
             act("Reject", "", "memory", function () { return S.admin("POST", "memory/" + m.id, { status: "disabled" }).then(function (r) { return r.error ? r : { done: "rejected (kept, not used)" }; }); })
           ]);
         }),
         group("recipes", d.recipes || [], function (r) {
-          return card([el("div", { class: "rtext", text: r.question }),
-                       el("details", { class: "query" }, [el("summary", { text: (r.tool || "") + (r.target ? " · " + r.target : "") }), el("pre", { text: r.query || "" })])],
+          var q = el("div", { class: "rtext", text: r.question });
+          var way = el("details", { class: "query" }, [el("summary", { text: (r.tool || "") + (r.target ? " · " + r.target : "") }), el("pre", { text: r.query || "" })]);
+          return card([q, way],
             "used " + S.num(r.uses || 1) + " time" + ((r.uses || 1) > 1 ? "s" : "") + " · " + S.when(r.created_at), [
               act("Confirm", "primary", "recipes", function () { return S.dict("POST", "recipes/" + r.id, { status: "confirmed" }).then(function (x) { return x.error ? x : { done: "confirmed" }; }); }),
+              toggleButton("Edit", "p-edit", function () {
+                var qa = el("textarea", { rows: "2", class: "recipe-q", "aria-label": "The generic question", maxlength: "2000" });
+                qa.value = r.question || "";
+                var code = el("textarea", { rows: "6", class: "recipe-query", spellcheck: "false", "aria-label": "The query" });
+                code.value = r.query || "";
+                var res = el("div", { class: "result", role: "status" });
+                q.hidden = true; way.hidden = true;
+                var panel = el("div", { class: "recipe-edit" }, [qa, code, el("div", { class: "actions" }, [
+                  el("button", { type: "button", class: "btn small", text: "Check the query", onclick: function () {
+                    res.className = "result"; res.textContent = "running it with your permissions…";
+                    S.dict("POST", "recipes/" + r.id + "/check", { query: code.value }).then(function (x) {
+                      res.className = "result " + (x.error ? "bad" : "good");
+                      res.textContent = x.error || ("The query runs: " + S.num(x.rows) + " row" + (x.rows === 1 ? "" : "s") +
+                        (x.columns && x.columns.length ? " (" + x.columns.join(", ") + ")" : ""));
+                    });
+                  } }),
+                  act("Save and confirm", "primary", "recipes", function () {
+                    return S.dict("POST", "recipes/" + r.id, { question: qa.value, query: code.value, status: "confirmed" }).then(function (x) {
+                      return x.error ? x : { done: "corrected and confirmed" };
+                    });
+                  })]), res]);
+                panel._close = function () { q.hidden = false; way.hidden = false; };
+                return panel;
+              }),
               act("Reject", "", "recipes", function () { return S.dict("POST", "recipes/" + r.id, { status: "rejected" }).then(function (x) { return x.error ? x : { done: "rejected" }; }); })
             ]);
         }),
@@ -246,28 +292,25 @@
             el("span", { class: "muted", text: "The LLM thinks it is the same as " + v.same_as.facet + " " + v.same_as.value + ". " })]) : null;
           var acts = [
             act("Approve", "primary", "values", function () { return S.admin("POST", "facets/" + v.id, { status: "approved" }).then(function (r) { return r.error ? r : { done: "approved" }; }); }),
-            el("button", { type: "button", class: "btn small", text: "Rename", onclick: function () {
-              var c = this.closest(".rcard");
-              if (c.querySelector("input.rename")) return;
+            toggleButton("Rename", "p-rename", function () {
               var inp = el("input", { type: "text", class: "rename", "aria-label": "New name" });
               inp.value = v.value;
+              var line = el("div", { class: "actions" });
               var ok = el("button", { type: "button", class: "btn small", text: "Save the name", onclick: function () {
                 S.admin("POST", "facets/" + v.id, { value: inp.value }).then(function (r) {
                   if (r.error) return;
                   v.value = r.value;
                   name.firstChild.textContent = v.facet + ": " + v.value;
-                  inp.remove(); ok.remove();
+                  line.remove();
                 });
               } });
-              c.querySelector(".rbody").appendChild(el("div", { class: "actions" }, [inp, ok]));
-              inp.focus();
-            } }),
-            el("button", { type: "button", class: "btn small", text: "Merge into…", onclick: function () {
-              var c = this.closest(".rcard");
-              if (c.querySelector("select.merge")) return;
+              line.appendChild(inp);
+              line.appendChild(ok);
+              return line;
+            }),
+            toggleButton("Merge into…", "p-merge", function () {
               var sel = el("select", { class: "merge", "aria-label": "Merge into" }, [el("option", { value: "", text: "Loading…" })]);
               var line = el("div", { class: "actions" }, [sel]);
-              c.querySelector(".rbody").appendChild(line);
               S.admin("GET", "facets?facet=" + encodeURIComponent(v.facet) + "&status=approved").then(function (f) {
                 sel.innerHTML = "";
                 sel.appendChild(el("option", { value: "", text: "Merge into…" }));
@@ -279,21 +322,20 @@
                   });
                 }));
               });
-            } }),
+              return line;
+            }),
             act("Reject", "", "values", function () { return S.admin("POST", "facets/" + v.id, { status: "rejected" }).then(function (r) { return r.error ? r : { done: "rejected" }; }); })
           ];
-          acts.splice(2, 0, el("button", { type: "button", class: "btn small", text: "Part of…", onclick: function () {
-            var c = this.closest(".rcard");
-            if (c.querySelector("select.parts")) return;
+          acts.splice(2, 0, toggleButton("Part of…", "p-parts", function () {
             var sel = el("select", { multiple: "multiple", size: "6", class: "parts facet-parents-select",
                                      "aria-label": "Part of (Ctrl or Cmd + click for several)" });
             fillParents(sel, v.id, (v.parents || []).map(function (p) { return p.id; }));
-            c.querySelector(".rbody").appendChild(el("div", { class: "actions" }, [
+            return el("div", { class: "actions" }, [
               el("span", { class: "muted", text: "Part of (Ctrl or Cmd + click for several):" }), sel,
               act("Save and approve", "primary", "values", function () {
                 return S.admin("POST", "facets/" + v.id, { parents: chosenIds(sel), status: "approved" }).then(function (r) { return r.error ? r : { done: "approved with what it is part of" }; });
-              })]));
-          } }));
+              })]);
+          }));
           if (v.same_as) acts.unshift(act("Merge into " + v.same_as.value, "primary", "values", function () {
             return S.admin("POST", "facets/" + v.id, { merge_into: v.same_as.id }).then(function (r) {
               return r.error ? r : { done: "merged into " + v.same_as.value, reload: true };
@@ -308,18 +350,16 @@
             (x.from || []).length ? el("div", { class: "muted", text: "seen in the data: " + x.from.join("; ") }) : null],
             (x.from || []).length ? "found in the data (values that go together)" : "said by the texts the LLM read", [
               act("Approve", "primary", "relations", function () { return S.admin("POST", "facets/" + x.id, { accept_parents: true }).then(function (r) { return r.error ? r : { done: "approved" }; }); }),
-              el("button", { type: "button", class: "btn small", text: "Change…", onclick: function () {
-                var c = this.closest(".rcard");
-                if (c.querySelector("select.parts")) return;
+              toggleButton("Change…", "p-change", function () {
                 var sel = el("select", { multiple: "multiple", size: "6", class: "parts facet-parents-select",
                                          "aria-label": "Part of (Ctrl or Cmd + click for several)" });
                 fillParents(sel, x.id, (x.suggested || []).map(function (p) { return p.id; }));
-                c.querySelector(".rbody").appendChild(el("div", { class: "actions" }, [
+                return el("div", { class: "actions" }, [
                   el("span", { class: "muted", text: "Part of (Ctrl or Cmd + click for several):" }), sel,
                   act("Save and approve", "primary", "relations", function () {
                     return S.admin("POST", "facets/" + x.id, { accept_parents: chosenIds(sel) }).then(function (r) { return r.error ? r : { done: "changed and approved" }; });
-                  })]));
-              } }),
+                  })]);
+              }),
               act("Reject", "", "relations", function () { return S.admin("POST", "facets/" + x.id, { reject_parents: true }).then(function (r) { return r.error ? r : { done: "rejected" }; }); })
             ]);
         }, { bulk: (d.relations || []).length > 1 ? bulk("Approve all shown", "relations", d.relations, function (x) { return S.admin("POST", "facets/" + x.id, { accept_parents: true }); }) : null }),
@@ -327,17 +367,15 @@
           return card([el("div", { class: "rtext" }, [document.createTextNode(t.title + " "), el("span", { class: "facet-chip", text: t.facet + ": " + t.value })])],
             t.ref + (t.confidence !== null && t.confidence !== undefined ? " · confidence " + Math.round(t.confidence * 100) + "%" : ""), [
               act("Approve", "primary", "tags", function () { return S.admin("POST", "tags/" + t.id, { status: "approved" }).then(function (r) { return r.error ? r : { done: "approved" }; }); }),
-              el("button", { type: "button", class: "btn small", text: "Change…", onclick: function () {
-                var c = this.closest(".rcard");
-                if (c.querySelector("select.retag")) return;
+              toggleButton("Change…", "p-retag", function () {
                 var sel = el("select", { class: "retag", "aria-label": "Another value" }, [el("option", { value: "", text: "Loading…" })]);
-                c.querySelector(".rbody").appendChild(el("div", { class: "actions" }, [sel,
+                var panel = el("div", { class: "actions" }, [sel,
                   act("Save and approve", "primary", "tags", function () {
                     if (!sel.value) return { keep: true };
                     return S.admin("POST", "tags/" + t.id, { facet_id: +sel.value }).then(function (r) {
                       return r.error ? r : { done: "changed to " + sel.options[sel.selectedIndex].text + " and approved" };
                     });
-                  })]));
+                  })]);
                 S.admin("GET", "facets?status=approved").then(function (d) {
                   sel.innerHTML = "";
                   sel.appendChild(el("option", { value: "", text: "Another value…" }));
@@ -347,7 +385,8 @@
                     sel.appendChild(el("optgroup", { label: k }, by[k].map(function (v) { return el("option", { value: v.id, text: v.value }); })));
                   });
                 });
-              } }),
+                return panel;
+              }),
               act("Reject", "", "tags", function () { return S.admin("POST", "tags/" + t.id, { status: "rejected" }).then(function (r) { return r.error ? r : { done: "rejected" }; }); })
             ]);
         }, { bulk: (d.tags || []).length > 1 ? bulk("Approve all shown", "tags", d.tags, function (t) { return S.admin("POST", "tags/" + t.id, { status: "approved" }); }) : null }),
@@ -478,7 +517,7 @@
     $("e-enabled").checked = e ? e.enabled : true;
     $("e-content").value = e ? (e.content || "") : "";
     $("e-result").textContent = ""; $("e-result").className = "result";
-    $("e-confirm").hidden = true; $("e-delete").hidden = !e;
+    $("e-delete").hidden = !e;
     $("e-history-box").hidden = !e; $("e-history").innerHTML = ""; $("e-history-box").open = false;
     $("e-evidence").hidden = !(e && e.origin);
     $("e-evidence").textContent = e && e.origin ? evidenceText(e) : "";
@@ -516,7 +555,7 @@
     $("e-history-box").addEventListener("toggle", function () { if ($("e-history-box").open) catHistory(); });
     $("e-class").addEventListener("change", function () {
       catHelp();
-      if (!cat.current) $("e-fmt").value = ["rule", "note", "formula"].indexOf($("e-class").value) >= 0 ? "text" : "yaml";
+      if (!cat.current) $("e-fmt").value = ["rule", "guide", "formula"].indexOf($("e-class").value) >= 0 ? "text" : "yaml";
     });
     $("e-save").addEventListener("click", function () {
       var body = { title: $("e-title").value, classification: $("e-class").value, category: $("e-category").value,
@@ -536,12 +575,15 @@
         catLoad(false);
       });
     });
-    $("e-delete").addEventListener("click", function () { $("e-confirm").hidden = false; $("e-delete").hidden = true; });
-    $("e-delete-no").addEventListener("click", function () { $("e-confirm").hidden = true; $("e-delete").hidden = false; });
-    $("e-delete-yes").addEventListener("click", function () {
-      S.admin("DELETE", "entries/" + cat.current.id + "?version=" + cat.current.version).then(function (r) {
-        if (r.error) { $("e-result").textContent = r.error; $("e-result").className = "result bad"; return; }
-        $("entry-drawer").hidden = true; cat.current = null; saved(); catLoad(false);
+    $("e-delete").addEventListener("click", function () {
+      if (!cat.current) return;
+      S.confirm($("e-delete"), "Delete \u201c" + cat.current.title + "\u201d?", { detail: "The agent no longer uses it. " +
+          "It can be restored from its history (Export YAML keeps a copy too)." }).then(function (ok) {
+        if (!ok) return;
+        S.admin("DELETE", "entries/" + cat.current.id + "?version=" + cat.current.version).then(function (r) {
+          if (r.error) { $("e-result").textContent = r.error; $("e-result").className = "result bad"; return; }
+          $("entry-drawer").hidden = true; cat.current = null; saved(); catLoad(false);
+        });
       });
     });
     $("entry-close").addEventListener("click", function () { $("entry-drawer").hidden = true; });
@@ -591,7 +633,8 @@
               el("button", { type: "button", class: "btn small", text: "Cancel", onclick: memRender })]));
             ta.focus();
           } }));
-          acts.appendChild(sureButton("Delete", function () { S.chat("DELETE", "memory/" + m.id).then(function (r) { if (!r.error) saved(); memLoad(); }); }));
+          acts.appendChild(sureButton("Delete", function () { S.chat("DELETE", "memory/" + m.id).then(function (r) { if (!r.error) saved(); memLoad(); }); },
+            "Delete this team memory?", "It is gone for good and the agent no longer uses it. Disable keeps it without using it."));
         }
       }
       tb.appendChild(el("tr", {}, [text, el("td", { text: m.kind + (m.category ? ", " + m.category : "") }),
@@ -627,6 +670,73 @@
   }
 
   // ------------------------------------------------------------------ Documents and sites
+  var READS = { web: "web page or site", confluence: "Confluence wiki", bitbucket: "Bitbucket repository", upload: "uploaded file" };
+  var SIGNIN = { bearer: "token (Bearer)", basic: "user and password or token", header: "token in a header" };
+  function inSearch(x) {
+    if (x.pieces) return S.num(x.pieces) + " piece" + (x.pieces === 1 ? "" : "s");
+    return x.status === "ok" ? "not yet" : "";
+  }
+  /* the sign-in fields: shown for the kind chosen (a user for basic, a header's name for header) */
+  function signInFields(box, auth) {
+    auth = auth || {};
+    var type = el("select", { "aria-label": "Sign-in" }, [["", "None (a public site)"], ["bearer", "Token (Bearer)"],
+      ["basic", "User and password or app token (Basic)"], ["header", "Token in a header of its own"]].map(function (o) {
+        return el("option", { value: o[0], text: o[1], selected: (auth.type || "") === o[0] ? "selected" : null }); }));
+    var user = el("input", { type: "text", "aria-label": "User", placeholder: "user", autocomplete: "off" });
+    user.value = auth.user || "";
+    var header = el("input", { type: "text", "aria-label": "Header name", placeholder: "header, e.g. Private-Token", autocomplete: "off" });
+    header.value = auth.header || "";
+    var secret = el("input", { type: "password", "aria-label": "Token or password", autocomplete: "new-password",
+      placeholder: auth.secret_set ? "set: leave empty to keep it" : "token or password" });
+    var sync = function () {
+      user.hidden = type.value !== "basic";
+      header.hidden = type.value !== "header";
+      secret.hidden = !type.value;
+    };
+    type.addEventListener("change", sync);
+    sync();
+    [type, user, header, secret].forEach(function (x) { box.appendChild(x); });
+    return function () {
+      var out = { auth: { type: type.value, user: user.value, header: header.value } };
+      if (secret.value) out.secret = secret.value;
+      return out;
+    };
+  }
+  function docEditor(x, row) {
+    var cell = el("td", { colspan: "8" }), rowEd = el("tr", { class: "editing" }, [cell]);
+    var cat = el("input", { type: "text", "aria-label": "Category", placeholder: "category" }); cat.value = x.category || "";
+    var pages = el("input", { type: "number", min: "1", max: "500", "aria-label": "Pages or files at most" }); pages.value = x.max_pages || 1;
+    var days = el("input", { type: "number", min: "1", "aria-label": "Read again every (days)" }); days.value = x.refresh_days || 7;
+    var reader = el("select", { "aria-label": "Read as" }, [["", "detected (" + (READS[x.reads_as] || x.reads_as) + ")"],
+      ["web", READS.web], ["confluence", READS.confluence], ["bitbucket", READS.bitbucket]].map(function (o) {
+        return el("option", { value: o[0], text: o[1], selected: (x.reader || "") === o[0] ? "selected" : null }); }));
+    var auth = el("span", { class: "signin" });
+    var signIn = x.kind === "url" ? signInFields(auth, x.auth) : null;
+    var res = el("span", { class: "result" });
+    var save = el("button", { type: "button", class: "btn small primary", text: "Save", onclick: function () {
+      var body = { category: cat.value };
+      if (x.kind === "url") {
+        body.max_pages = +pages.value; body.refresh_days = +days.value; body.reader = reader.value;
+        Object.assign(body, signIn());
+      }
+      save.disabled = true;
+      S.admin("POST", "docs/" + x.id, body).then(function (r) {
+        save.disabled = false;
+        result(res, r, x.kind === "url" ? "saved: reading it again" : "saved");
+        if (!r.error) { saved(); setTimeout(docsLoad, x.kind === "url" ? 2500 : 300); }
+      });
+    } });
+    cell.appendChild(el("div", { class: "doc-edit" }, [
+      el("div", { class: "nm muted", text: x.url || x.title || "" }),
+      el("div", { class: "filters" }, x.kind === "url" ? [cat, el("label", { class: "inline" }, ["Pages ", pages]),
+        el("label", { class: "inline" }, ["Every ", days, " days"]), reader] : [cat]),
+      x.kind === "url" ? el("div", { class: "filters" }, [el("span", { class: "muted", text: "Sign-in:" }), auth]) : null,
+      x.kind === "url" ? el("p", { class: "muted small-note", text: "The token is kept encrypted and sent only to this site; " +
+        "what it reads becomes searchable by everyone who can open the Data dictionary." }) : null,
+      el("div", { class: "actions" }, [save, el("button", { type: "button", class: "btn small", text: "Cancel",
+        onclick: function () { rowEd.replaceWith(row); } }), res])]));
+    row.replaceWith(rowEd);
+  }
   function docsLoad() {
     var tb = $("docs").querySelector("tbody");
     if (!admin) {
@@ -638,40 +748,68 @@
               x.excerpt + (x.chars > (x.excerpt || "").length ? "\n… (" + S.num(x.chars) + " characters in all)" : ""));
           }, [el("td", {}, [el("div", { text: x.title || x.url || "document" }), x.url ? el("div", { class: "muted nm", text: x.url }) : null]),
               el("td", { text: x.category || "" }), el("td", { class: "num", text: S.num(x.pages || (x.kind === "url" ? 0 : 1)) }),
-              el("td", { class: "num", text: S.bytes(x.chars) }), el("td", {}, [badge(x.status || "", x.status === "ok" ? "ok" : x.status === "error" ? "bad" : "")]),
+              el("td", { class: "num", text: S.bytes(x.chars) }), el("td", { class: "num", text: inSearch(x) }),
+              el("td", {}, [badge(x.status || "", x.status === "ok" ? "ok" : x.status === "error" ? "bad" : "")]),
               el("td", { class: "muted", text: S.when(x.fetched_at) }), el("td", {})]));
         });
-        if (!(d.docs || []).length) tb.appendChild(D.emptyRow(7, "No document or site yet."));
+        if (!(d.docs || []).length) tb.appendChild(D.emptyRow(8, "No document or site yet."));
       });
     }
     return S.admin("GET", "docs").then(function (d) {
       tb.innerHTML = "";
       (d.docs || []).forEach(function (x) {
         var acts = el("td", { class: "row-actions" });
+        var row = el("tr", {});
         if (x.kind === "url") acts.appendChild(el("button", { type: "button", class: "linkish", text: "Read again", onclick: function () {
           this.disabled = true;
           S.admin("POST", "docs/" + x.id + "/refresh", {}).then(function () { setTimeout(docsLoad, 3000); });
         } }));
-        acts.appendChild(sureButton("Delete", function () { S.admin("DELETE", "docs/" + x.id).then(function (r) { if (!r.error) saved(); docsLoad(); }); }));
-        tb.appendChild(el("tr", {}, [el("td", {}, [el("div", { text: x.title || x.url || "document" }),
-            x.url ? el("div", { class: "muted nm", text: x.url }) : null]),
+        acts.appendChild(el("button", { type: "button", class: "linkish", text: "Edit", title: "Category, pages, how it is read, its sign-in",
+          onclick: function () { docEditor(x, row); } }));
+        acts.appendChild(sureButton("Delete", function () { S.admin("DELETE", "docs/" + x.id).then(function (r) { if (!r.error) saved(); docsLoad(); }); },
+          "Delete “" + (x.title || x.url || "this document") + "”?",
+          (x.pages && x.pages.length > 1 ? "Its " + x.pages.length + " pages leave" : "It leaves") + " the agent's search" +
+          (x.kind === "url" ? (x.auth && x.auth.type ? ", and its saved sign-in is deleted" : "") + "; the site can be added again." :
+            "; upload it again to get it back.")));
+        var how = x.kind === "url" ? (READS[x.reads_as] || x.reads_as) + (x.auth && x.auth.type ? " · signed in with a " +
+          (SIGNIN[x.auth.type] || x.auth.type) + (x.auth.user ? " (" + x.auth.user + ")" : "") : "") : READS.upload;
+        [el("td", {}, [el("div", { text: x.title || x.url || "document" }),
+            x.url ? el("div", { class: "muted nm", text: x.url }) : null, el("div", { class: "muted small-note", text: how })]),
           el("td", { text: x.category || "" }), el("td", { class: "num", text: S.num((x.pages || []).length || (x.kind === "upload" ? 1 : 0)) }),
-          el("td", { class: "num", text: S.bytes(x.chars) }),
+          el("td", { class: "num", text: S.bytes(x.chars) }), el("td", { class: "num", text: inSearch(x) }),
           el("td", {}, [badge(x.status || "", x.status === "ok" ? "ok" : x.status === "error" ? "bad" : ""), x.error ? el("div", { class: "muted", text: x.error }) : null]),
-          el("td", { class: "muted", text: x.fetched_at ? S.when(x.fetched_at) : "" }), acts]));
+          el("td", { class: "muted", text: x.fetched_at ? S.when(x.fetched_at) : "" }), acts].forEach(function (c) { row.appendChild(c); });
+        tb.appendChild(row);
       });
-      if (!(d.docs || []).length) tb.appendChild(D.emptyRow(7, "No document yet."));
+      if (!(d.docs || []).length) tb.appendChild(D.emptyRow(8, "No document yet."));
     });
   }
   if (admin) {
+    var docAuth = function () {
+      var t = $("doc-auth").value;
+      $("doc-user-box").hidden = t !== "basic";
+      $("doc-header-box").hidden = t !== "header";
+      $("doc-secret-box").hidden = !t;
+      $("doc-auth-note").hidden = !t;
+    };
+    $("doc-auth").addEventListener("change", docAuth);
+    docAuth();
     $("doc-add").addEventListener("click", function () {
       var res = $("doc-result"), btn = $("doc-add");
+      if (!$("doc-url").value.trim()) { res.textContent = "write the address first (or upload a file)"; res.className = "result bad"; return; }
       btn.disabled = true;
-      S.admin("POST", "docs", { url: $("doc-url").value, category: $("doc-category").value,
-                                max_pages: +$("doc-pages").value, refresh_days: +$("doc-days").value }).then(function (r) {
+      var body = { url: $("doc-url").value, category: $("doc-category").value, reader: $("doc-reader").value,
+                   max_pages: +$("doc-pages").value, refresh_days: +$("doc-days").value,
+                   auth: { type: $("doc-auth").value, user: $("doc-user").value, header: $("doc-header").value } };
+      if ($("doc-secret").value) body.secret = $("doc-secret").value;
+      S.admin("POST", "docs", body).then(function (r) {
         btn.disabled = false;
         result(res, r, "added: reading it now");
-        if (!r.error) { $("doc-url").value = ""; saved(); setTimeout(docsLoad, 3000); }
+        if (!r.error) {
+          ["doc-url", "doc-secret", "doc-user", "doc-header"].forEach(function (id) { $(id).value = ""; });
+          $("doc-auth").value = ""; docAuth();
+          saved(); setTimeout(docsLoad, 3000);
+        }
         docsLoad();
       });
     });
@@ -754,7 +892,10 @@
             sel.addEventListener("change", function () { if (sel.value) post({ merge_into: +sel.value }); });
           } }));
         }
-        if (f.source !== "seed") acts.appendChild(sureButton(f.status === "approved" ? "Retire" : "Reject", function () { post({ status: "rejected" }); }));
+        if (f.source !== "seed") acts.appendChild(sureButton(f.status === "approved" ? "Retire" : "Reject", function () { post({ status: "rejected" }); },
+          (f.status === "approved" ? "Retire " : "Reject ") + "\u201c" + f.value + "\u201d?",
+          (f.items ? "Its " + S.num(f.items) + " item" + (f.items === 1 ? "" : "s") + " lose this " + f.facet + ". " : "") +
+          "It is not proposed again; adding it by hand brings it back."));
         tb.appendChild(el("tr", {}, [valueCell, el("td", { text: f.facet }), el("td", { class: "num", text: S.num(f.items) }),
           el("td", { class: "muted", text: (f.examples || []).join(" · ") }),
           el("td", {}, [badge(f.status === "approved" ? "used" : "proposed", f.status === "approved" ? "ok" : "warn"),
@@ -821,62 +962,6 @@
     return Array.prototype.filter.call(sel.options, function (o) { return o.selected; }).map(function (o) { return +o.value; });
   }
 
-  // ------------------------------------------------------------------ the system map: what is part of what
-  var ONE = { metrics: "metric", indices: "index", "catalog entries": "catalog entry", "team memories": "team memory",
-              documents: "document", notes: "note", "Context pages": "Context page", "learned answers": "learned answer",
-              "metric families": "metric family" };
-  function facetsMap() {
-    var box = $("fac-map");
-    box.innerHTML = "";
-    box.appendChild(el("p", { class: "muted", text: "Loading…" }));
-    return S.admin("GET", "facets/map").then(function (d) {
-      var vals = d.values || [], byId = {}, kids = {};
-      vals.forEach(function (v) { byId[v.id] = v; });
-      vals.forEach(function (v) { (v.parents || []).forEach(function (p) { (kids[p] = kids[p] || []).push(v.id); }); });
-      var roots = vals.filter(function (v) { return !(v.parents || []).some(function (p) { return byId[p]; }); });
-      box.innerHTML = "";
-      box.appendChild(el("p", { class: "lead", text: "The system as the categories describe it: each value under what it is part of " +
-        "(a value of several appears under each), with the items about it that exist now. A metric removed or a note " +
-        "deleted is no longer counted; the daily learning proposes what new items and texts say (To review)." }));
-      if (!vals.length) { box.appendChild(el("p", { class: "muted", text: "No approved category yet." })); return; }
-      function counts(v) {
-        if (!v.items) return el("span", { class: "muted tcount" + (v.tagged ? " tgone" : ""), text: v.tagged ? "no item now (its items are gone)" : "no item yet" });
-        var parts = Object.keys(v.kinds).sort().map(function (k) { return S.num(v.kinds[k]) + " " + (v.kinds[k] === 1 ? (ONE[k] || k) : k); });
-        return el("span", { class: "muted tcount", text: S.num(v.items) + " item" + (v.items > 1 ? "s" : "") + ": " + parts.join(", ") });
-      }
-      function node(v, path) {
-        var others = (v.parents || []).filter(function (p) { return byId[p] && p !== path[path.length - 1]; });
-        var line = el("span", { class: "tnode" }, [
-          el("span", { class: "facet-chip", text: (FACET_NAMES[v.facet] || v.facet).toLowerCase() + ": " + v.value }), document.createTextNode(" "),
-          counts(v),
-          path.length && others.length ? el("span", { class: "muted tcount", text: " · also part of " + others.map(function (p) { return byId[p].value; }).join(", ") }) : null]);
-        if (v.description) line.title = v.description;
-        var children = (kids[v.id] || []).filter(function (c) { return path.indexOf(c) < 0 && c !== v.id; });
-        var li = el("li", {});
-        if (!children.length) { li.appendChild(line); return li; }
-        var det = el("details", { open: path.length < 2 ? "open" : null }, [el("summary", {}, [line])]);
-        var ul = el("ul", { class: "tree" });
-        children.sort(function (a, b) { return byId[a].value.localeCompare(byId[b].value); })
-          .forEach(function (c) { ul.appendChild(node(byId[c], path.concat([v.id]))); });
-        det.appendChild(ul);
-        li.appendChild(det);
-        return li;
-      }
-      var top = el("ul", { class: "tree tree-root" });
-      roots.forEach(function (v) { top.appendChild(node(v, [])); });
-      box.appendChild(top);
-    });
-  }
-  function facView(map) {
-    $("fac-list").hidden = map; $("fac-map").hidden = !map;
-    $("fac-view-list").classList.toggle("on", !map); $("fac-view-map").classList.toggle("on", map);
-    $("fac-view-list").setAttribute("aria-pressed", String(!map)); $("fac-view-map").setAttribute("aria-pressed", String(map));
-    if (map) facetsMap();
-  }
-  if (admin) {
-    $("fac-view-list").addEventListener("click", function () { facView(false); });
-    $("fac-view-map").addEventListener("click", function () { facView(true); });
-  }
   if (admin) {
     $("fac-add").addEventListener("click", function () {
       var res = $("fac-result"), btn = $("fac-add");
@@ -892,7 +977,6 @@
           saved();
           facetsLoad();
           fillParents($("fac-new-parents"), null, []);
-          if (!$("fac-map").hidden) facetsMap();
         }
       });
     });
@@ -924,7 +1008,8 @@
         }
         if (n.can_change) acts.appendChild(sureButton("Delete", function () {
           S.chat("DELETE", "notes/" + n.id).then(function () { saved(); notesLoad(); });
-        }));
+        }, "Delete the note \u201c" + (n.title || "Note") + "\u201d?", "It cannot be restored" +
+           (n.entry_id ? " (its catalog guide stays)." : ".")));
         var tags = (n.tags || []).length ? "#" + n.tags.join(" #") : "";
         tb.appendChild(el("tr", {}, [
           el("td", {}, [el("button", { type: "button", class: "linkish nm", text: n.title || "Note", onclick: function () {
@@ -955,7 +1040,7 @@
   D.register("categories", function () {
     return loadCategories().then(function () {
       if ($("fac-new-parents") && !$("fac-new-parents").options.length) fillParents($("fac-new-parents"), null, []);
-      return $("fac-map").hidden ? facetsLoad() : facetsMap();
+      return facetsLoad();
     });
   });
 })();

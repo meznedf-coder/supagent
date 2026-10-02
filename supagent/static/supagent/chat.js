@@ -52,8 +52,8 @@
         list.appendChild(el("li", { class: c.id === current ? "on" : "", "data-id": c.id }, [
           el("a", { href: "#", title: c.title || "", text: c.title || "Conversation " + c.id,
                     onclick: function (ev) { ev.preventDefault(); open(c.id); } }),
-          el("button", { type: "button", title: "Delete this conversation", "aria-label": "Delete", text: "×",
-                         onclick: function () { remove(c.id); } })
+          el("button", { type: "button", title: "Delete this conversation", "aria-label": "Delete " + (c.title || "this conversation"),
+                         text: "×", onclick: function (ev) { askRemove(ev.currentTarget, c); } })
         ]));
       });
       if (select === null) return;
@@ -91,6 +91,7 @@
       box.innerHTML = "";
       var msgs = data.messages || [];
       msgs.forEach(function (m, i) { box.appendChild(render(m, msgs[i - 1])); });
+      markSubjects();
       var last = msgs[msgs.length - 1];
       if (last && last.role === "assistant" && /^(pending|running|cancelling)$/.test(last.status)) poll(last.id);
       else busy(null);
@@ -135,6 +136,17 @@
   function remove(id) {
     S.chat("DELETE", "conversations/" + id).then(function () {
       if (id === current) loadConversations(undefined); else loadConversations(null);
+    });
+  }
+  /* a chat is deleted after a second confirmation, which says what goes (and that an answer is running) */
+  function askRemove(btn, c) {
+    var busyHere = c.id === current && running;
+    S.confirm(btn, "Delete \u201c" + (c.title || "Conversation " + c.id) + "\u201d?", {
+      detail: (busyHere ? "Its answer being written stops. " : "") + "Its messages, results and files go for good; what " +
+              "the agent learned from it (Helpful answers, memory) stays." }).then(function (ok) {
+      if (!ok) return;
+      if (busyHere) S.chat("POST", "messages/" + running + "/cancel", {});
+      remove(c.id);
     });
   }
 
@@ -326,16 +338,39 @@
     });
   }
 
+  /* the chat's subjects (0.8): a thin line where a question starts a new subject or goes back to an earlier one
+     (each answer is given the messages of its own subject only) */
+  function markSubjects() {
+    box.querySelectorAll(".subject-line").forEach(function (x) { x.remove(); });
+    var first = {}, prev = null;
+    box.querySelectorAll(".msg.user").forEach(function (node) {
+      var t = node.dataset.topic;
+      if (!t) return;
+      var text = (node.querySelector(".bubble") || {}).textContent || "";
+      var known = Object.prototype.hasOwnProperty.call(first, t);
+      if (prev !== null && t !== prev) {
+        var back = known ? first[t] : "";
+        node.parentNode.insertBefore(el("div", { class: "subject-line", role: "separator",
+          title: known ? "This question is about an earlier subject: the answer was given that subject's messages" :
+            "A new subject: the answer was given none of the earlier messages",
+          text: known ? "Back to: " + (back.length > 70 ? back.slice(0, 70) + "…" : back) : "New subject" }), node);
+      }
+      if (!known) first[t] = text;
+      prev = t;
+    });
+  }
+
   function render(m, prev) {
     if (m.role === "user") {
-      return el("div", { class: "msg user", "data-id": m.id }, [
+      return el("div", { class: "msg user", "data-id": m.id, "data-topic": m.topic === null || m.topic === undefined ? null : String(m.topic) }, [
         el("div", { class: "bubble", text: m.content }),
         el("div", { class: "stamp", text: "Asked " + S.whenFull(m.created_at || new Date()) }),
         el("div", { class: "tools" }, [copyButton("Copy", function () { return m.content; }, "Question"),
           el("button", { type: "button", class: "linkish", text: "Ask again", onclick: function () { input.value = m.content; submit(); } })])
       ]);
     }
-    var node = el("div", { class: "msg assistant" + (m.status === "error" ? " error" : ""), "data-id": m.id });
+    var node = el("div", { class: "msg assistant" + (m.status === "error" ? " error" : ""), "data-id": m.id,
+                           "data-topic": m.topic === null || m.topic === undefined ? null : String(m.topic) });
     node._question = prev && prev.role === "user" ? prev.content : "";
     var bubble = el("div", { class: "bubble" });
     node.appendChild(bubble);
@@ -428,6 +463,13 @@
         var nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
         node.className = "msg assistant" + (m.status === "error" ? " error" : "");
         fill(node, node.querySelector(".bubble"), m);
+        if (m.topic !== null && m.topic !== undefined && node.dataset.topic !== String(m.topic)) {
+          node.dataset.topic = String(m.topic);         // its subject is known once the answer starts
+          var q = node.previousElementSibling;
+          while (q && !q.classList.contains("user")) q = q.previousElementSibling;
+          if (q) q.dataset.topic = String(m.topic);
+          markSubjects();
+        }
         if (nearBottom) scrollDown();
       }
       if (/^(pending|running|cancelling)$/.test(m.status)) {
@@ -496,9 +538,9 @@
     var li = el("li", {}, [el("span", { text: m.text }),
       el("span", { class: "muted", text: " \u00b7 " + m.kind + (m.category ? ", " + m.category : "") + (m.source === "chat" ? " \u00b7 learned from a chat" : "") })]);
     if (canDelete) {
-      li.appendChild(el("button", { type: "button", class: "linkish", text: "Forget", onclick: function () {
-        S.chat("DELETE", "memory/" + m.id).then(loadMemory);
-      } }));
+      li.appendChild(S.sureButton("Forget", function () { S.chat("DELETE", "memory/" + m.id).then(loadMemory); }, {
+        ask: "Forget this?", yes: "Forget", detail: m.scope === "team" ? "The team's agent no longer uses it." :
+          "The agent no longer uses it in your answers." }));
     }
     return li;
   }
@@ -548,15 +590,8 @@
     var acts = el("div", { class: "note-acts" });
     if (n.can_change) {
       acts.appendChild(el("button", { type: "button", class: "linkish", text: "Edit", onclick: function () { editNote(li, n); } }));
-      acts.appendChild(el("button", { type: "button", class: "linkish", text: "Delete", onclick: function () {
-        if (!this.dataset.sure) {                            // a second click deletes (no browser dialog)
-          var b = this;
-          b.dataset.sure = "1"; b.textContent = "Delete: sure?";
-          setTimeout(function () { delete b.dataset.sure; b.textContent = "Delete"; }, 4000);
-          return;
-        }
-        S.chat("DELETE", "notes/" + n.id).then(function () { loadNotes(true); });
-      } }));
+      acts.appendChild(S.sureButton("Delete", function () { S.chat("DELETE", "notes/" + n.id).then(function () { loadNotes(true); }); }, {
+        ask: "Delete the note \u201c" + (n.title || "Note") + "\u201d?", detail: "It cannot be restored." }));
     }
     if (admin && n.scope === "team") {
       acts.appendChild(el("button", { type: "button", class: "linkish", text: n.pinned ? "Unpin" : "Pin for everyone",

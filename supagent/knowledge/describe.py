@@ -475,15 +475,15 @@ def describe(topic: str | None = None, name: str | None = None) -> str | None:
             if lines:
                 sections.append((sc, lines))
     try:
-        from supagent.knowledge.catalog import notes
+        from supagent.knowledge.catalog import guides
 
-        scored_notes = sorted(((_score(ws, n["title"], n["category"], n["text"]), n) for n in notes()),
-                              key=lambda x: -x[0])
+        scored_guides = sorted(((_score(ws, n["title"], n["category"], n["text"]), n) for n in guides()),
+                               key=lambda x: -x[0])
     except Exception:  # pylint: disable=broad-except
-        scored_notes = []
-    for sc, n in scored_notes[:2]:
+        scored_guides = []
+    for sc, n in scored_guides[:2]:
         if ws and sc > 0:
-            sections.append((sc + 0.5, [f"\nNote \u201c{n['title']}\u201d ({n['category'] or 'catalog'}):",
+            sections.append((sc + 0.5, [f"\nGuide \u201c{n['title']}\u201d ({n['category'] or 'catalog'}):",
                                         n["text"][:1500]]))
     try:
         from supagent.knowledge.catalog import formulas

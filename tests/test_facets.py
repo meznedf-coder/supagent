@@ -32,7 +32,7 @@ def world(lab):  # noqa: F811
 
     for model in (Tag, Link, Facet, Classified):
         db.session.query(model).delete()
-    e = Entry(title="Payments note", classification="note", category="Payments", enabled=True, version=1,
+    e = Entry(title="Payments note", classification="guide", category="Payments", enabled=True, version=1,
               content="Payments are settled by the BILLING batch every night.")
     db.session.add(e)
     db.session.commit()

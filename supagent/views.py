@@ -238,7 +238,7 @@ class ChatView(BaseView):
                 "html": render_markdown(m.content or "") if m.role == "assistant" else None,
                 "steps": m.steps or [], "files": files, "feedback": m.feedback, "feedback_reason": m.feedback_reason,
                 "results": (m.results or []) if final else [],
-                "created_at": m.created_at, "finished_at": m.finished_at}
+                "created_at": m.created_at, "finished_at": m.finished_at, "topic": m.topic}
 
     @expose("/api/conversations", methods=("GET",))
     @has_access_api
@@ -727,7 +727,9 @@ class _RecipesMixin:
                         "target": r.target, "query": r.query, "seconds": r.seconds, "rows": r.rows,
                         "steps": r.steps, "status": r.status, "uses": r.uses, "created_at": r.created_at,
                         "helpful": len(r.confirmations or []), "last_used_at": r.last_used_at,
-                        "use": u, "why": reasons(u), "rank": round(adjust(u), 3), "demoted": demoted(u)})
+                        "use": u, "why": reasons(u), "rank": round(adjust(u), 3), "demoted": demoted(u),
+                        "edited_by": r.edited_by, "edited_at": r.edited_at,
+                        "previous": r.previous if admin else None})
         if request.args.get("sort", "useful") == "useful":  # the most useful first, then the least tried
             out.sort(key=lambda x: (x["status"] == "rejected", x["demoted"], -x["rank"], -(x["use"] or {}).get("given", 0)))
         return _json({"recipes": out, "is_admin": admin})
@@ -749,9 +751,24 @@ class _RecipesMixin:
             db.session.commit()
             _sync_chunks("recipe:")
             return _json({"deleted": rid})
-        status = str(_body().get("status") or "")
-        if status not in ("helpful", "confirmed", "rejected"):
+        body = _body()
+        status = str(body.get("status") or "")
+        if status and status not in ("helpful", "confirmed", "rejected"):
             return _json({"error": "status: helpful, confirmed or rejected"}, 400)
+        if "question" in body or "query" in body:          # an admin's correction, before confirming it
+            from supagent.knowledge.experience import RecipeError, check_recipe_query, edit_recipe
+
+            try:
+                if status == "confirmed" and "query" in body and str(body["query"] or "").strip() != (r.query or "").strip():
+                    check_recipe_query(r, str(body["query"]))      # a changed query is confirmed only if it runs
+                edit_recipe(r, body.get("question"), body.get("query"), by=g.user.username)
+            except RecipeError as ex:
+                db.session.rollback()
+                return _json({"error": str(ex)}, 400)
+        if not status:
+            db.session.commit()
+            _sync_chunks("recipe:")
+            return _json({"id": rid, "status": r.status, "question": r.question, "query": r.query})
         r.status = status
         db.session.commit()
         if r.message_id:                             # the decider's route of the answer: confirmed or not
@@ -763,6 +780,27 @@ class _RecipesMixin:
 
         dispatch_catalog()                           # the formulas it supports (agent catalog)
         return _json({"id": rid, "status": status})
+
+    @expose("/api/recipes/<int:rid>/check", methods=("POST",))
+    @has_access_api
+    def check_recipe(self, rid: int) -> Response:
+        """An admin checks a learned answer's query (its own, or the one being written: {"query"}) on the data, with
+        their own permissions: {ok, rows, columns, sample, seconds} or {error}."""
+        from superset import db
+
+        from supagent.knowledge.experience import RecipeError, check_recipe_query
+        from supagent.models import Recipe
+
+        if not _is_admin():
+            return _json({"error": "only admins may change the learned answers"}, 403)
+        r = db.session.get(Recipe, rid)
+        if r is None:
+            abort(404)
+        query = str(_body().get("query") or r.query or "")
+        try:
+            return _json(check_recipe_query(r, query))
+        except RecipeError as ex:
+            return _json({"error": str(ex)}, 400)
 
     @expose("/api/timings", methods=("GET",))
     @has_access_api
@@ -792,10 +830,13 @@ class KnowledgeView(_RecipesMixin, BaseView):
     method_permission_name = {"index": "read", "summary": "read", "objects": "read", "obj": "read",
                               "changes": "read", "relations": "read", "edit": "write", "recipes": "read",
                               "set_recipe": "write", "timings": "read", "search": "read", "item": "read",
-                              "set_relation": "write",
+                              "set_relation": "write", "check_recipe": "write",
                               "knowledge": "read", "agent_knowledge": "read", "context": "read",
                               "context_page": "read", "context_edit": "write", "context_build": "write",
-                              "where_data": "read", "forget_where": "write"}
+                              "context_export": "read",
+                              "where_data": "read", "forget_where": "write", "add_where": "write",
+                              "where_tables": "read", "system_map": "read", "edit_system_map": "write",
+                              "map_pdf": "read"}
 
     @expose("/api/search", methods=("GET",))
     @has_access_api
@@ -1024,9 +1065,11 @@ class KnowledgeView(_RecipesMixin, BaseView):
             entries.append({"id": e.id, "title": e.title, "classification": e.classification, "category": e.category,
                             "fmt": e.fmt, "content": e.content or "", "updated_at": e.updated_at,
                             "by": "the agent" if e.updated_by == AGENT else (e.updated_by or e.created_by or "")})
+        pieces = AdminView._doc_pieces()
         docs = [{"id": d.id, "title": d.title or d.url or f"document {d.id}", "kind": d.kind, "url": d.url,
                  "category": d.category, "status": d.status, "pages": len(d.pages or []) or None,
-                 "chars": len(d.content or ""), "excerpt": (d.content or "")[:1500], "fetched_at": d.fetched_at}
+                 "chars": len(d.content or ""), "excerpt": (d.content or "")[:1500], "fetched_at": d.fetched_at,
+                 "pieces": pieces.get(d.id)}
                 for d in db.session.query(Doc).filter(Doc.enabled.is_(True)).order_by(Doc.title)]
         team = [{"id": m.id, "kind": m.kind, "text": m.text, "category": m.category, "created_at": m.created_at}
                 for m in (db.session.query(Memory).filter(Memory.scope == "team", Memory.status == "active")
@@ -1090,7 +1133,8 @@ class KnowledgeView(_RecipesMixin, BaseView):
                         "name": name, "uses": t["uses"], "answers": len(t["messages"]),
                         "helpful": len(t["messages"] & helpful), "updated_at": t["updated_at"],
                         "words": [{"word": a.word, "uses": a.uses or 0,
-                                   "elsewhere": len(leads[a.word]) - 1,
+                                   "elsewhere": len(leads[a.word]) - 1, "manual": a.source == "admin",
+                                   "added_by": a.added_by if a.source == "admin" else None,
                                    "other_databases": sorted({names.get(k[0], str(k[0])) for k in leads[a.word]
                                                               if k[0] != dbid})} for a in words]})
         return _json({"tables": out, "total": len(items), "offset": offset, "limit": limit,
@@ -1117,6 +1161,46 @@ class KnowledgeView(_RecipesMixin, BaseView):
              .delete(synchronize_session=False))
         db.session.commit()
         return _json({"forgotten": n})
+
+    @expose("/api/where_data/add", methods=("POST",))
+    @has_access_api
+    def add_where(self) -> Response:
+        """An admin puts words on a table by hand ({"words": "rejects, failed runs", "database_id": 1, "name": "jobs"}):
+        the team's own words for its data, stemmed like the learned ones, never fading."""
+        from supagent.knowledge.experience import RecipeError, add_associations
+
+        if not _is_admin():
+            abort(404)
+        b = _body()
+        try:
+            out = add_associations(str(b.get("words") or ""), int(b.get("database_id") or 0), str(b.get("name") or ""),
+                                   by=g.user.username)
+        except (RecipeError, ValueError) as ex:
+            return _json({"error": str(ex)}, 400)
+        return _json(out)
+
+    @expose("/api/where_data/tables", methods=("GET",))
+    @has_access_api
+    def where_tables(self) -> Response:
+        """The indices and metrics the dictionary knows in a database this user may query (?database=)."""
+        from superset import db
+
+        from supagent.models import KObject, Source
+
+        try:
+            dbid = int(request.args.get("database") or 0)
+        except ValueError:
+            return _json({"error": "database is a number"}, 400)
+        if dbid not in _visible_databases():
+            return _json({"tables": []})
+        src = db.session.query(Source).filter(Source.database_id == dbid).first()
+        if src is None:
+            return _json({"tables": []})
+        rows = (db.session.query(KObject.kind, KObject.name).filter(KObject.source_id == src.id,
+                                                                  KObject.kind.in_(("index", "metric")),
+                                                                  KObject.gone_at.is_(None))
+                .order_by(KObject.name).limit(5000).all())
+        return _json({"tables": [{"kind": k, "name": n} for k, n in rows]})
 
     @expose("/api/agent_knowledge", methods=("GET",))
     @has_access_api
@@ -1177,14 +1261,67 @@ class KnowledgeView(_RecipesMixin, BaseView):
         from supagent.knowledge.context import visible_pages
         from supagent.models import Run
 
-        pages = [{"id": p.id, "section": p.section, "slug": p.slug, "title": p.title, "kind": p.kind,
-                  "author": p.author or "agent", "ai": p.kind == "summary" and (p.author or "agent") == "agent",
-                  "version": p.version, "updated_at": p.updated_at} for p in visible_pages()]
+        full = request.args.get("full") == "1"
+        pages = []
+        for p in visible_pages():
+            row = {"id": p.id, "section": p.section, "slug": p.slug, "title": p.title, "kind": p.kind,
+                   "author": p.author or "agent", "ai": p.kind == "summary" and (p.author or "agent") == "agent",
+                   "version": p.version, "updated_at": p.updated_at}
+            if full:                                      # the reader: every page at once (and its words, to find)
+                row.update(html=render_markdown(p.content or ""), text=p.content or "", sources=p.sources or [],
+                           content=p.content or "" if _is_admin() else None)
+            pages.append(row)
+        order = {"functional": 0, "technical": 1}
+        pages.sort(key=lambda x: (order.get(x["section"], 2), _context_rank(x["slug"]), x["title"].lower()))
         last = db.session.query(Run).filter(Run.kind == "context").order_by(Run.id.desc()).first()
         return _json({"pages": pages, "enabled": bool(settings.get("context.enabled")),
                       "hour": settings.get("context.hour"),
                       "last_build": {"id": last.id, "status": last.status, "started_at": last.started_at,
                                      "finished_at": last.finished_at} if last else None})
+
+    @expose("/api/context/export.<fmt>", methods=("GET",))
+    @has_access_api
+    def context_export(self, fmt: str) -> Response:
+        """The Context as a Word document or a PDF (?page=<id>: that page; else every page this user may read)."""
+        from supagent import export as X
+        from supagent.knowledge.context import visible_pages
+
+        if fmt not in ("docx", "pdf"):
+            abort(404)
+        pages = visible_pages()
+        one = request.args.get("page", type=int)
+        if one:
+            pages = [p for p in pages if p.id == one]
+            if not pages:
+                abort(404)
+        order = {"functional": 0, "technical": 1}
+        pages.sort(key=lambda p: (order.get(p.section, 2), _context_rank(p.slug), (p.title or "").lower()))
+        sections = []
+        for key, title in (("functional", "Functional"), ("technical", "Technical")):
+            mine = [p for p in pages if p.section == key]
+            if mine:
+                sections.append(X.Section(title=title, pages=[X.Page(
+                    title=p.title, markdown=p.content or "",
+                    note=" · ".join(x for x in ("AI-written: check before relying on it"
+                                                if p.kind == "summary" and (p.author or "agent") == "agent" else
+                                                (f"edited by {p.author}" if (p.author or "agent") != "agent" else ""),
+                                                f"updated {p.updated_at:%d %b %Y}" if p.updated_at else "",
+                                                f"version {p.version}") if x),
+                    sources=[f"{x.get('title')} ({x.get('ref')})" for x in (p.sources or [])][:30]) for p in mine]))
+        now = dt.datetime.now()
+        title = pages[0].title if one else "Context"
+        doc = X.Document(title=title, subtitle="" if one else "What the system is, functionally and technically",
+                         sections=sections, toc=not one and len(pages) > 1,
+                         meta=[f"Exported {now:%d %b %Y %H:%M} by {g.user.username}",
+                               f"{len(pages)} page{'s' if len(pages) != 1 else ''}"])
+        data = X.to_docx(doc) if fmt == "docx" else X.to_pdf(doc)
+        from supagent.textsafe import content_disposition
+
+        name = re.sub(r"[^\w.-]+", "-", (title or "context").strip()).strip("-")[:60] or "context"
+        mime = ("application/vnd.openxmlformats-officedocument.wordprocessingml.document" if fmt == "docx"
+                else "application/pdf")
+        return Response(data, mimetype=mime, headers={"Content-Disposition": content_disposition(
+            "attachment", f"{name}.{fmt}"), "X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store"})
 
     @expose("/api/context/<int:pid>", methods=("GET",))
     @has_access_api
@@ -1239,6 +1376,90 @@ class KnowledgeView(_RecipesMixin, BaseView):
             name = "a context build" if busy.kind == "context" else "a learning run"
             return _json({"error": f"{name} is running (run {busy.id}): the Context is built after it"}, 409)
         return _json({"started": dispatch_context("manual")})
+
+    @expose("/api/map", methods=("GET",))
+    @has_access_api
+    def system_map(self) -> Response:
+        """The system map (knowledge.sysmap): the categories' values this user may see, what each is part of, its
+        explanation, the interactions an admin drew, the places of the boxes."""
+        from supagent.knowledge.sysmap import map_data
+
+        return _json(map_data(_is_admin()))
+
+    @expose("/api/map", methods=("POST",))
+    @has_access_api
+    def edit_system_map(self) -> Response:
+        """Admins: {"layout": {...}} the places of the boxes; {"interaction": {"a", "b", "kind", "note", "id"?}} draws or
+        changes one; {"remove_interaction": id}; {"describe": {"id", "description"}} what a part is."""
+        from superset import db
+
+        from supagent.knowledge import sysmap
+        from supagent.knowledge.freshness import touch
+        from supagent.models import Facet
+
+        if not _is_admin():
+            return _json({"error": "only admins may change the map"}, 403)
+        body = _body()
+        try:
+            if isinstance(body.get("layout"), dict):
+                return _json({"layout": sysmap.save_layout(body["layout"], g.user.username)})
+            if isinstance(body.get("interaction"), dict):
+                x = body["interaction"]
+                out = sysmap.save_interaction(int(x.get("a") or 0), int(x.get("b") or 0), str(x.get("kind") or ""),
+                                              str(x.get("note") or ""), g.user.username,
+                                              link_id=int(x["id"]) if str(x.get("id") or "").isdigit() else None)
+                touch()
+                db.session.commit()
+                return _json({"interaction": out})
+            if body.get("remove_interaction"):
+                ok = sysmap.delete_interaction(int(body["remove_interaction"]))
+                touch()
+                db.session.commit()
+                return _json({"removed": ok})
+            if isinstance(body.get("describe"), dict):
+                f = db.session.get(Facet, int(body["describe"].get("id") or 0))
+                if f is None:
+                    abort(404)
+                f.description = str(body["describe"].get("description") or "").strip()[:2000] or None
+                f.reviewed_by = g.user.username
+                db.session.commit()
+                touch()
+                db.session.commit()
+                return _json({"id": f.id, "description": f.description})
+        except (ValueError, TypeError) as ex:
+            db.session.rollback()
+            return _json({"error": str(ex)}, 400)
+        return _json({"error": "layout, interaction, remove_interaction or describe"}, 400)
+
+    @expose("/api/map/export.pdf", methods=("POST",))
+    @has_access_api
+    def map_pdf(self) -> Response:
+        """The map as a PDF: the page sends the picture it drew (PNG, base64) and its title."""
+        import base64
+
+        from supagent import export as X
+        from supagent.textsafe import content_disposition
+
+        body = _body()
+        try:
+            png = base64.b64decode(str(body.get("png") or "").split(",", 1)[-1], validate=True)
+        except ValueError:
+            return _json({"error": "png: a base64 PNG"}, 400)
+        if not png.startswith(b"\x89PNG") or len(png) > 30 * 1024 * 1024:
+            return _json({"error": "png: a PNG of 30 MB at most"}, 400)
+        title = " ".join(str(body.get("title") or "System map").split())[:120]
+        note = f"Exported {dt.datetime.now():%d %b %Y %H:%M} by {g.user.username}"
+        try:
+            scale = max(0.5, min(8.0, float(body.get("scale") or 1)))
+        except (TypeError, ValueError):
+            scale = 1.0
+        try:
+            data = X.image_pdf(png, title, note, dpi=96.0 * scale)
+        except Exception as ex:  # pylint: disable=broad-except   (not an image Pillow reads)
+            return _json({"error": f"png: {type(ex).__name__}"}, 400)
+        return Response(data, mimetype="application/pdf", headers={
+            "Content-Disposition": content_disposition("attachment", "system-map.pdf"),
+            "X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store"})
 
     @expose("/api/relations", methods=("GET",))
     @has_access_api
@@ -1296,6 +1517,20 @@ class KnowledgeView(_RecipesMixin, BaseView):
         return _json({"id": rid, "rejected": wrong})
 
 
+# the Context's pages in reading order: the overviews first, then the applications, the glossary, the rules; the
+# technical side: its overview, the data sources, the inventories, the links between databases
+CONTEXT_FIRST = ("overview", "architecture", "application-", "glossary", "rules-and-facts", "data-sources-",
+                 "inventory-", "links-")
+
+
+def _context_rank(slug: str | None) -> int:
+    slug = slug or ""
+    for i, word in enumerate(CONTEXT_FIRST):
+        if slug == word or (word.endswith("-") and slug.startswith(word)):
+            return i
+    return len(CONTEXT_FIRST)
+
+
 def _obj_row(o: Any, sources: dict[int, Any]) -> dict:
     st = o.stats or {}
     src = sources.get(o.source_id)
@@ -1316,6 +1551,7 @@ class AdminView(BaseView):
                               "delete_entry": "write", "entry_history": "read", "restore_entry": "write",
                               "export_catalog": "read", "team_memory": "read", "set_memory": "write",
                               "docs": "read", "add_doc": "write", "refresh_doc": "write", "delete_doc": "write",
+                              "edit_doc": "write",
                               "usage": "read", "usage_data": "read", "review": "read", "facets": "read",
                               "add_facet": "write", "set_facet": "write", "facet_map": "read",
                               "facet_categories": "read", "set_tag": "write",
@@ -1371,11 +1607,31 @@ class AdminView(BaseView):
 
     # ---- documents and sites
     @staticmethod
-    def _doc_json(d: Any) -> dict:
+    def _doc_json(d: Any, pieces: dict[int, int] | None = None) -> dict:
+        """A document for the page: never its secret (describe_auth says whether one is set)."""
+        from supagent.knowledge.docs import describe_auth, reader_of
+
         return {"id": d.id, "kind": d.kind, "title": d.title, "url": d.url, "category": d.category,
-                "pages": d.pages or [], "chars": len(d.content or ""), "max_pages": d.max_pages,
+                "pages": [{k: p.get(k) for k in ("url", "title", "chars")} for p in (d.pages or [])],
+                "chars": len(d.content or ""), "max_pages": d.max_pages,
                 "refresh_days": d.refresh_days, "enabled": d.enabled, "status": d.status, "error": d.error,
-                "fetched_at": d.fetched_at, "created_by": d.created_by}
+                "fetched_at": d.fetched_at, "created_by": d.created_by, "reader": d.reader or "",
+                "reads_as": reader_of(d) if d.kind == "url" else "upload", "auth": describe_auth(d),
+                "pieces": (pieces or {}).get(d.id)}
+
+    @staticmethod
+    def _doc_pieces() -> dict[int, int]:
+        """The pieces of each document in the agent's search (supagent_chunk refs doc:<id>#<n>)."""
+        from superset import db
+
+        from supagent.models import Chunk
+
+        out: dict[int, int] = {}
+        for (ref,) in db.session.query(Chunk.ref).filter(Chunk.kind == "doc"):
+            ident = ref.split(":", 1)[1].split("#", 1)[0]
+            if ident.isdigit():
+                out[int(ident)] = out.get(int(ident), 0) + 1
+        return out
 
     @expose("/api/docs", methods=("GET",))
     @has_access_api
@@ -1384,7 +1640,8 @@ class AdminView(BaseView):
 
         from supagent.models import Doc
 
-        return _json({"docs": [self._doc_json(d) for d in db.session.query(Doc).order_by(Doc.id.desc())]})
+        pieces = self._doc_pieces()
+        return _json({"docs": [self._doc_json(d, pieces) for d in db.session.query(Doc).order_by(Doc.id.desc())]})
 
     @expose("/api/docs", methods=("POST",))
     @has_access_api
@@ -1397,12 +1654,15 @@ class AdminView(BaseView):
         body = _body()
         kind = "url" if body.get("url") else "upload"
         d = Doc(kind=kind, title=(str(body.get("title") or "").strip() or None), category=body.get("category"),
-                created_by=g.user.username, max_pages=max(1, min(int(body.get("max_pages") or 1), 200)),
+                created_by=g.user.username, max_pages=max(1, min(int(body.get("max_pages") or 1), 500)),
                 refresh_days=max(1, int(body.get("refresh_days") or 7)))
         if kind == "url":
+            from supagent.knowledge.docs import configure
+
             d.url = str(body["url"]).strip()
             try:
                 check_url(d.url)
+                configure(d, body)                         # how it is read, its sign-in (the secret encrypted)
             except DocError as ex:
                 return _json({"error": str(ex)}, 400)
         else:
@@ -1428,6 +1688,50 @@ class AdminView(BaseView):
         else:
             _sync_chunks("doc:")
         return _json({"doc": self._doc_json(d)})
+
+    @expose("/api/docs/<int:doc_id>", methods=("POST",))
+    @has_access_api
+    def edit_doc(self, doc_id: int) -> Response:
+        """Change a document: its category, its title, how often it is read, how many pages, its address, how it is
+        read and its sign-in (an empty secret keeps the saved one; a site read with a sign-in is read again)."""
+        from superset import db
+
+        from supagent.knowledge.docs import DocError, check_url, configure
+        from supagent.models import Doc
+
+        d = db.session.get(Doc, doc_id)
+        if d is None:
+            abort(404)
+        body = _body()
+        before = d.url
+        try:
+            if "title" in body:
+                d.title = str(body.get("title") or "").strip()[:255] or d.title
+            if "category" in body:
+                d.category = str(body.get("category") or "").strip()[:128] or None
+            if "max_pages" in body:
+                d.max_pages = max(1, min(int(body.get("max_pages") or 1), 500))
+            if "refresh_days" in body:
+                d.refresh_days = max(1, int(body.get("refresh_days") or 7))
+            if "enabled" in body:
+                d.enabled = bool(body.get("enabled"))
+            if d.kind == "url":
+                if str(body.get("url") or "").strip():
+                    d.url = str(body["url"]).strip()
+                    check_url(d.url)
+                if any(k in body for k in ("reader", "auth", "secret")) or d.url != before:
+                    configure(d, body, previous_url=before)
+        except (DocError, ValueError) as ex:
+            db.session.rollback()
+            return _json({"error": str(ex)}, 400)
+        db.session.commit()
+        if d.kind == "url" and (d.url != before or any(k in body for k in ("reader", "auth", "secret", "max_pages"))):
+            from supagent.tasks import dispatch_doc
+
+            dispatch_doc(d.id)                             # read again with what changed
+        else:
+            _sync_chunks("doc:")
+        return _json({"doc": self._doc_json(d, self._doc_pieces())})
 
     @expose("/api/docs/<int:doc_id>/refresh", methods=("POST",))
     @has_access_api

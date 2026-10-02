@@ -21,12 +21,13 @@ import time
 from typing import Any, Callable
 
 from supagent import settings
+from supagent.dates import MONTH
 from supagent.llm import LLM, EmptyAnswer, LLMError, add_usage
 
 log = logging.getLogger(__name__)
 MAX_TOOL_CHARS = 8000
 TOOL_CHARS = {"describe_data": 16000}
-HISTORY_MESSAGES = 6
+HISTORY_MESSAGES = 40      # of the chat given with a question at most (the runner gives its subject's: knowledge.topics)
 HISTORY_CHARS = 3000      # of one earlier message given with the question
 REPLY_WORDS = 25          # a reply to the agent's question back is at most this long
 MANY_PARTS = 4            # a question of this many parts (commas, "and") gets half as many calls more
@@ -281,9 +282,10 @@ def intents(question: str) -> set[str]:
 
 # "that finding", "the same", "ce résultat": the question is about an earlier answer
 REFERS_BACK = re.compile(
-    r"\b(that|these|those|it|them|same|above|previous|earlier|findings?|results?)\b|"
+    r"\b(that|these|those|it|its|them|their|same|above|previous|earlier|findings?|results?)\b|"
     r"\bthis\b(?!\s+(week|month|year|morning|afternoon|evening|night|quarter)\b)|"
-    r"\b(cela|ça|celui|celle|ceux|m[êe]mes?|pr[ée]c[ée]dente?s?|ci-dessus|r[ée]sultats?|trouvailles?)\b|"
+    r"\b(cela|ça|celui|celle|ceux|son|sa|ses|leur|leurs|m[êe]mes?|pr[ée]c[ée]dente?s?|ci-dessus|r[ée]sultats?|"
+    r"trouvailles?)\b|"
     r"\b(cet|cette|ces)\b(?!\s+(semaine|ann[ée]e|matin|nuit|apr[èe]s-midi)\b)|"
     r"\bce\s+(graphique|chiffre|r[ée]sultat|tableau|calcul|constat)", re.I)
 
@@ -394,9 +396,8 @@ def _refs(node: Any, path: str = "") -> list[tuple[str, dict]]:
 
 
 CONFIG_NAME = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_\s\-.]*$")     # a column name Superset's chart config accepts
-PERIOD = re.compile(r"\b(\d{1,2}(?:st|nd|rd|th|er)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|f[ée]v|"
-                    r"mars|avr|mai|juin|juil|ao[uû]|sept|d[ée]c)\w*|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
-                    r"\w*\.?\s+\d{1,2}|\d{4}-\d{2}-\d{2}|yesterday|today|tonight|this (?:week|month|morning|night)|"
+PERIOD = re.compile(rf"\b(\d{{1,2}}(?:st|nd|rd|th|er)?\s+(?:of\s+)?{MONTH}|{MONTH}\s+\d{{1,2}}|\d{{4}}-\d{{2}}-\d{{2}}|"
+                    r"yesterday|today|tonight|this (?:week|month|morning|night)|"
                     r"last \d+ (?:hours?|days?|weeks?|months?)|hier|aujourd'hui|cette (?:nuit|semaine)|"
                     r"\d+ derni[eè]res? (?:heures|jours|semaines))\b", re.I)
 
@@ -937,6 +938,24 @@ NO_TOOL_NUDGE = ("(Check before answering: you called no tool. The knowledge giv
                  "the query (execute_sql, promql_query...) for any number or list. If the question really needs "
                  "no data, give the same answer again. Either way "
                  "write the whole answer for the user as if for the first time: they see neither the one above nor this check, so never mention it, apologise or say what changed.)")
+LOOKUP_NUDGE = ("(Check before answering: your answer says the data has no such field or value, but you called no "
+                "tool in this answer and the chat's earlier answers may be wrong. Look it up first: describe_data "
+                "gives an index's fields with their values, and a value the question names may be in a field with "
+                "another name (a channel, a direction, a source). Then answer, or ask back if it really is not there. "
+                "Either way write the whole answer for the user as if for the first time: they see neither the one "
+                "above nor this check, so never mention it, apologise or say what changed.)")
+WRITTEN_SQL_NUDGE = ("(Check before answering: your answer shows a query that was not run, with numbers that no query "
+                     "returned. Call execute_sql with that query now: the tool runs it on the data and gives you its "
+                     "rows; then answer from its result. Never write a query in the answer instead of running it. Then "
+                     "write the whole answer for the user as if for the first time: they see neither the one above nor "
+                     "this check, so never mention it, apologise or say what changed.)")
+WRITTEN_SQL = re.compile(r"```[a-z]*\s*\n\s*(?:WITH|SELECT)\b", re.I)       # a query written out, not run
+# "The data does not contain a 'voice' field", "there is no such column", "n'existe pas": a claim of absence
+ABSENCE = re.compile(
+    r"\b(?:does not|doesn't|do not|don't) (?:contain|have|include|hold|record)\b|\bno (?:such )?(?:field|column|"
+    r"value|data)\b|\b(?:is|are) not (?:available|present|recorded|stored|tracked) in\b|\bthere (?:is|are) no\b[^.\n]{0,40}"
+    r"\b(?:field|column|value|direction|flag|attribute)s?\b|\bn'(?:existe|y a) pas\b|\bne contient (?:pas|aucun)|"
+    r"\baucun(?:e)? (?:champ|colonne|valeur)\b", re.I)
 NUMBERS_NUDGE = ("(Check before answering: these numbers or names of your answer are in none of the results "
                  "above: {numbers}. Either run a query that returns them (totals, rates, averages and differences "
                  "are computed in the query itself: execute_sql, promql_query), or delete the sentences that hold "
@@ -976,16 +995,21 @@ HOW_MANY = re.compile(r"\b(how many|how much|combien|quel(?:le)? (?:nombre|quant
 NONE_SAID = re.compile(r"\b(no|none|zero|nothing|aucun\w*|z[ée]ro|pas de|rien)\b", re.I)
 
 
-def adds_to(question: str, before: str) -> bool:
-    """The question names a day, a period or a value the previous one did not ("And on 22 September?",
-    "The CPU of srv-amer-002 yesterday."): its answer needs its own query."""
+def adds_to(question: str, before: str, earlier: list[str] | None = None) -> bool:
+    """The question names a day, a period or a value the previous one did not ("And on 22 September?", "And on
+    the 23rd?", "And the day before?", "The CPU of srv-amer-002 yesterday."): its answer needs its own query. The
+    earlier questions (oldest first, the previous one last) give the day "the 23rd" is relative to."""
     if not before:
         return False
-    from supagent.knowledge.period import PERIOD_WORDS, days_named
+    from supagent.knowledge.period import PERIOD_WORDS, anchor_of, days_named
     from supagent.knowledge.resolve import VALUE_TOKEN
 
     today = now().date()
-    if set(days_named(question, today)) - set(days_named(before, today)):
+    asked = [str(q) for q in earlier or [] if q] or [before]
+    if asked[-1] != before:
+        asked.append(before)
+    said = set(days_named(before, today, anchor_of(asked[:-1], today)))
+    if set(days_named(question, today, anchor_of(asked, today))) - said:
         return True
     said_before = {w.lower() for w in PERIOD_WORDS.findall(before)}
     if {w.lower() for w in PERIOD_WORDS.findall(question)} - said_before:
@@ -1072,9 +1096,13 @@ def unsupported_answer(answer: str, trace: list[dict]) -> str | None:
     """A reminder when an answer was written without the tools: no tool called at all, or
     results shown (a JSON block, "SQL run", a table of numbers) with no query run. A question
     back to the user (what they meant) is an answer."""
+    if not trace and ABSENCE.search(answer or ""):
+        return LOOKUP_NUDGE                            # "the data has no such field": said without looking
     if asks_back(answer) and not _has_data(answer):   # a question back, not results with an offer at the end
         return None
     done = {t.get("called") or t["tool"] for t in trace if t.get("status") == "done"}
+    if WRITTEN_SQL.search(answer or "") and _has_data(answer) and not done & set(QUERY_TOOLS):
+        return WRITTEN_SQL_NUDGE                       # the query in the text, its figures made up
     if not trace:
         return NO_TOOL_NUDGE
     if RESULT_CLAIM.search(answer or "") and not done & set(QUERY_TOOLS):
@@ -1093,7 +1121,7 @@ UNSUPPORTED_NOTE = ("\n\n(Check: no query ran in this answer: numbers or rows sh
 def unsupported_note(answer: str, trace: list[dict]) -> str:
     """After the reminder: an answer that still shows results no query returned is marked."""
     nudge = unsupported_answer(answer, trace)
-    if nudge == NO_QUERY_NUDGE or (nudge == NO_TOOL_NUDGE and (RESULT_CLAIM.search(answer or "") or len(
+    if nudge in (NO_QUERY_NUDGE, WRITTEN_SQL_NUDGE) or (nudge == NO_TOOL_NUDGE and (RESULT_CLAIM.search(answer or "") or len(
             TABLE_WITH_NUMBERS.findall(answer or "")) >= 2)):
         return UNSUPPORTED_NOTE
     return ""
@@ -1319,6 +1347,7 @@ class Agent:
         self.open_question = False               # "what is happening", "why": the agent chooses what to look at
         self.people_words = ""
         self.asks_new = False                    # a follow-up with another day, value or period
+        self.period_text: str | None = None      # what the period checks read (a follow-up's own day in place)
         self.max_steps = int(settings.get("agent.max_steps"))
 
     def close(self) -> None:
@@ -1545,11 +1574,20 @@ class Agent:
         # question), or completes the previous question after an answer ("The failed jobs.", "Only PROD.")
         answered = bool(before) and bool(said) and asks_back(said) and not question.strip().endswith("?") and \
             len(question.split()) <= REPLY_WORDS
-        adds = adds_to(question, before)               # "And on 22 September?": another day, value or period
+        earlier = [str(h["content"]) for h in history or [] if h.get("role") == "user" and h.get("content")]
+        adds = adds_to(question, before, earlier)      # "And on 22 September?": another day, value or period
         completes = bool(before) and bool(said) and not answered and not adds and \
             len(question.split()) <= FRAGMENT_WORDS and bool(FRAGMENT.match(question or ""))
+        # "And on the 23rd?", "And yesterday?": the previous question again, for another day (its own query)
+        another_day = bool(before) and adds and len(question.split()) <= FRAGMENT_WORDS and \
+            bool(FRAGMENT.match(question or ""))
         replied = answered or completes
-        follow = bool(before) and (refers_back(question) or replied)
+        # the subjects (knowledge.topics) found it goes on from the last exchange with no data of its own
+        from supagent.knowledge.topics import CONTINUES_LAST
+
+        sub = getattr(self, "subject", None)
+        goes_on_last = sub is not None and not getattr(sub, "back", False) and getattr(sub, "how", "") in CONTINUES_LAST
+        follow = bool(before) and (refers_back(question) or replied or another_day or goes_on_last)
         # the chat's results may answer it only when it asks nothing new (no other day, value or period)
         self.follow_up = answered or (follow and not adds)
         self.asks_new = bool(before) and adds
@@ -1557,6 +1595,10 @@ class Agent:
         # "what charts are in it?": the tools, instructions and checks of the question it refers to, too
         self.intent_text = f"{before}\n{question}" if follow else question
         self.question = self.intent_text                  # the checks of periods and rules read it
+        # the period checks: a follow-up's own day in place of the earlier question's ("shipped on ... at night")
+        from supagent.knowledge.period import follow_up_text
+
+        self.period_text = (follow_up_text(question, earlier) if follow else None) or self.intent_text
         self.raw_question, self.chat_history = question, list(history or [])     # a yes, as the user wrote it
         last = next((h for h in reversed(history or []) if h.get("role") == "assistant"), None)
         self.prev_queries = [str(q.get("query") or "") for q in (last or {}).get("queries") or [] if q.get("query")]
@@ -1717,9 +1759,13 @@ class Agent:
                     log.info("supagent: a note %s without %s again: the answer says it was not done", *again)
                     return NOTE_NOT_DONE[again[1]], trace     # said twice, not done: not shown as done
                 nudge = None if nudged or about_notes else unsupported_answer(answer, trace)
-                if nudge and self.follow_up and settings.get("agent.check_numbers") and \
-                        not self._ungrounded(answer, messages[:asked_at]):
-                    nudge = None                       # a follow-up restating the chat's results: all in them
+                # a follow-up restating the previous answer: all its numbers in that answer (not anywhere in a long
+                # subject: "10,000" from an older answer is no VaR of the book asked about)
+                previous = next(([m] for m in reversed(messages[:asked_at]) if m.get("role") == "assistant"
+                                 and m.get("content")), [])
+                if nudge in (NO_TOOL_NUDGE, NO_QUERY_NUDGE) and self.follow_up and \
+                        settings.get("agent.check_numbers") and previous and not self._ungrounded(answer, previous):
+                    nudge = None                       # (never a "no such field" or a query written, not run)
                 if nudge:                              # once: an answer from the tools, not from the summary
                     nudged = True
                     self.usage["nudges"] = self.usage.get("nudges", 0) + 1
@@ -2030,7 +2076,8 @@ class Agent:
 
                 return delete_refusal(getattr(self, "raw_question", ""), getattr(self, "chat_history", []), args)
             reasons = [refusal(self.scope, name, args) if self.scope is not None else None,
-                       period_refusal(question, name, args), self._counted_samples(name, args),
+                       period_refusal(getattr(self, "period_text", None) or question, name, args),
+                       self._counted_samples(name, args, question),
                        None if getattr(self, "open_question", False) else
                        condition_refusal(getattr(self, "support", None), name, args)]
             if name in ("generate_chart", "update_chart"):
@@ -2074,13 +2121,14 @@ class Agent:
             return ""
 
     @staticmethod
-    def _counted_samples(name: str, args: dict) -> str | None:
-        """COUNT over a counter of a metrics database (samples, not events)."""
+    def _counted_samples(name: str, args: dict, question: str = "") -> str | None:
+        """COUNT over a counter of a metrics database (samples, not events), or a "how many" answered with
+        per-second rates added up."""
         from superset.extensions import db
         from superset.models.core import Database
 
         from supagent.knowledge.excluded import query_texts
-        from supagent.knowledge.experience import count_of_counter
+        from supagent.knowledge.experience import count_of_counter, rate_as_count
         from supagent.knowledge.scope import call_target
 
         database_id, _tables = call_target(name, args)
@@ -2088,7 +2136,9 @@ class Agent:
         if database is None:
             return None
         sqls = [q for q in query_texts(args) if q]
-        return count_of_counter(database, sqls[-1]) if sqls and name != "promql_query" else None
+        if not sqls or name == "promql_query":
+            return None
+        return count_of_counter(database, sqls[-1], question) or rate_as_count(database, sqls[-1], question)
 
     @staticmethod
     def _chart_dataset(name: str, req: dict) -> Any:

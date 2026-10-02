@@ -6,7 +6,9 @@ dropped the label ("the label rule does not apply because the request did not me
 The previous answer's conditions on a table this answer queries again, that no query of this answer has
 (nor groups by), and that the message does not change (it names their column or value) or remove ("all",
 "without"...), are sent back once, then said under the answer. Time windows are not carried (a follow-up
-may move them); a window written with now() is no condition here anyway (sql_conditions reads literals).
+may move them); a window written with now() is no condition here anyway (sql_conditions reads literals). A message
+that goes back to an earlier question ("Back to the September returns: how many were refunded?") has that
+question's scope, not the last answer's: nothing is carried.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ from typing import Any
 REFINES = re.compile(r"\b(only|just|instead|also|same|again|except|as well|"
                      r"seulement|uniquement|aussi|m[êe]me|encore|sauf|plut[ôo]t)\b", re.I)
 REMOVES = re.compile(r"\b(all|any|every|without|remove|drop|ignore|regardless|whatever|no longer|not only|"
-                     r"tous|toutes|sans|enl[eè]ve|retire|ignore|quel que soit)\b", re.I)
+                     r"in total|overall|altogether|in all|tous|toutes|sans|enl[eè]ve|retire|ignore|quel que soit|"
+                     r"au total|en tout|globalement|dans l'ensemble)\b", re.I)
 DATED = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
@@ -31,8 +34,10 @@ def dropped(question: str, previous: list[str], current: list[str]) -> list[Any]
     from supagent.knowledge.conditions import sql_conditions
     from supagent.knowledge.rulecheck import _tables, grouped_by
 
-    if not previous or not current or REMOVES.search(question or ""):
-        return []
+    from supagent.knowledge.topics import BACK_TO
+
+    if not previous or not current or REMOVES.search(question or "") or BACK_TO.search(question or ""):
+        return []                                      # "Back to the failed jobs: ...": that question's scope
     tables = set().union(*(_tables(q) for q in current))
     used = {c.column.lower() for q in current for c in sql_conditions(q)}
     used |= {g.lower() for q in current for g in grouped_by(q)}

@@ -117,7 +117,7 @@ def test_an_admin_makes_a_catalog_entry_of_a_team_note(app, clean):
         from supagent.models import Entry
 
         e = db.session.get(Entry, r["entry_id"])
-        assert e.classification == "note" and e.category == "Team notes" and e.updated_by == "admin"
+        assert e.classification == "guide" and e.category == "Team notes" and e.updated_by == "admin"
         assert e.content.endswith("(From the note of alice Test of 2026-09-29.)")
         db.session.remove()
     d = bob.get(API + "?q=unexplained").get_json()

@@ -12,7 +12,7 @@
     "llm.middleware.renew_before": "Renew the token before expiry (s)", "llm.ca_bundle": "CA bundle (PEM file)",
     "llm.verify_tls": "Check TLS certificates", "llm.timeout": "Timeout (s)", "llm.temperature": "Temperature",
     "llm.thinking": "Reasoning (thinking) mode", "llm.extra_headers": "Extra HTTP headers (JSON)",
-    "agent.max_steps": "Tool calls per question", "agent.now": "Fixed “now”", "agent.extra_instructions": "Extra instructions",
+    "agent.max_steps": "Tool calls per question", "agent.subjects": "Follow the subjects of a chat", "agent.now": "Fixed “now”", "agent.extra_instructions": "Extra instructions",
     "agent.disabled_tools": "Disabled tools", "agent.check_numbers": "Check the numbers of the answers",
     "usage.keep_days": "Keep the LLM calls (days)", "agent.executor": "Where answers run", "agent.celery_queue": "Celery queue",
     "learn.enabled": "Learn once a day", "learn.hour": "Daily at (hour)", "learn.days": "On these days",
@@ -90,13 +90,16 @@
     return node;
   }
 
+  /* a setting: its name, an "i" with what it does (shown on demand), its box */
   function fieldRow(spec) {
     var inp = input(spec);
-    var label = el("label", { for: inp.id }, [document.createTextNode(LABELS[spec.key] || spec.key), el("span", { class: "key", text: spec.key })]);
+    var name = LABELS[spec.key] || spec.key;
+    var label = el("label", { for: inp.id }, [document.createTextNode(name), el("span", { class: "key", text: spec.key })]);
+    var head = el("span", { class: "field-head" }, [label, spec.help ? S.info(spec.help, name) : null]);
     if (spec.kind === "bool") {
-      return el("div", { class: "field check", "data-key": spec.key }, [inp, label, el("div", { class: "help", text: spec.help })]);
+      return el("div", { class: "field check", "data-key": spec.key }, [inp, head]);
     }
-    return el("div", { class: "field", "data-key": spec.key }, [label, inp, el("div", { class: "help", text: spec.help })]);
+    return el("div", { class: "field", "data-key": spec.key }, [head, inp]);
   }
 
   function renderSettings(list) {

@@ -3,13 +3,12 @@
 {% block content %}
 <div class="dict">
   <section class="dict-head">
-    <div>
-      <h1>Data dictionary</h1>
-      <p class="muted">Everything the agent knows and uses in its answers: what the team wrote (the catalog, the team
-        memory, the documents), the Context written from it, and what the agent learns every day from the data and the
-        chats. Texts marked <span class="badge llm">AI-written</span> are the LLM's until an admin approves or corrects
-        them.</p>
-    </div>
+    <div class="sec-head"><h1>Data dictionary</h1>
+      <button type="button" class="info" aria-controls="x-dict" aria-label="About the Data dictionary">i</button></div>
+    <div class="explain" id="x-dict">Everything the agent knows and uses in its answers: what the team wrote (the catalog,
+      the team memory, the documents and sites, the notes), the Context written from it, and what the agent learns
+      every day from the data and the chats. Texts marked <span class="badge llm">AI-written</span> are the LLM's until
+      an admin approves or corrects them.</div>
     <details id="sources-box" class="sources-box">
       <summary id="sources-line">Databases</summary>
       <div id="sources" class="sources"></div>
@@ -20,7 +19,6 @@
     <button type="button" role="tab" data-tab="review" class="admin-only">To review <span class="count" id="review-count" hidden></span></button>
     <button type="button" role="tab" data-tab="knowledge">Knowledge</button>
     <button type="button" role="tab" data-tab="data">Data</button>
-    <button type="button" role="tab" data-tab="learned">Learned by the agent</button>
     <button type="button" role="tab" data-tab="search">Search</button>
     <span class="grow"></span>
     <span id="apply-state" class="apply-state" role="status" aria-live="polite" hidden></span>
@@ -32,22 +30,27 @@
     <div id="review"></div>
   </section>
 
-  <!-- Knowledge: what the team gives the agent, where it is edited -->
+  <!-- Knowledge: what the team gives the agent, what the agent learned, the system as a picture -->
   <section id="tab-knowledge" class="tab" hidden>
     <nav class="subnav" aria-label="Knowledge">
       <button type="button" data-sub="catalog">Catalog</button>
       <button type="button" data-sub="memory">Team memory</button>
-      <button type="button" data-sub="context">Context</button>
       <button type="button" data-sub="docs">Documents and sites</button>
       <button type="button" data-sub="notes">Notes</button>
+      <button type="button" data-sub="context">Context</button>
+      <button type="button" data-sub="learned">Learned by the agent</button>
       <button type="button" data-sub="categories" class="admin-only">Categories</button>
+      <button type="button" data-sub="map">System map</button>
     </nav>
 
     <div id="sub-catalog" class="sub" hidden>
-      <p class="lead">What people know about the data, one entry each: the glossary, one entry per index, groups of
-        metrics, relationships, health checks, the rules the agent always follows, notes and formulas. Each entry keeps
-        its history, so a mistaken change or deletion can be restored. Entries marked
-        <span class="badge agent">agent</span> were written by the agent from evidence it can check.</p>
+      <div class="sec-head"><h2>Catalog</h2>
+        <button type="button" class="info" aria-controls="x-catalog" aria-label="About the catalog">i</button></div>
+      <div class="explain" id="x-catalog">What people know about the data, one entry each: the glossary, one entry per
+        index, groups of metrics, relationships, health checks, the rules the agent always follows, guides
+        (documentation, runbooks, how-tos) and formulas. Each entry keeps its history, so a mistaken change or deletion
+        can be restored. Entries marked <span class="badge agent">agent</span> were written by the agent from evidence
+        it can check.</div>
       <div class="filters">
         <select id="cat-class" aria-label="Classification"><option value="">All classifications</option></select>
         <select id="cat-category" aria-label="Category"><option value="">All categories</option></select>
@@ -68,8 +71,10 @@
     </div>
 
     <div id="sub-memory" class="sub" hidden>
-      <p class="lead">Preferences, rules and facts for everyone, learned from the chats or written here. A memory
-        proposed from a chat is not used until an admin approves it.</p>
+      <div class="sec-head"><h2>Team memory</h2>
+        <button type="button" class="info" aria-controls="x-memory" aria-label="About the team memory">i</button></div>
+      <div class="explain" id="x-memory">Preferences, rules and facts for everyone, learned from the chats or written here.
+        A memory proposed from a chat is not used until an admin approves it.</div>
       <div class="add-row admin-only">
         <textarea id="mem-text" rows="2" placeholder="e.g. Yesterday means the previous business day." aria-label="New team memory"></textarea>
         <select id="mem-kind" aria-label="Kind"><option value="rule">rule</option><option value="fact">fact</option>
@@ -88,46 +93,58 @@
         <thead><tr><th>Memory</th><th>Kind</th><th>By</th><th>State</th><th></th></tr></thead><tbody></tbody></table></div>
     </div>
 
-    <div id="sub-context" class="sub" hidden>
-      <p class="lead">What the system is, functionally and technically, written every night from what the team shares
-        (documents, catalog, team memory, the dictionary, the answers marked Helpful). A page marked
-        <span class="badge llm">AI-written</span> is the LLM's, from the sources listed under it. A page an admin
-        corrected is theirs: the agent never writes over it. You see the pages of the databases you may query.</p>
-      <div id="ctx-actions" class="agent-summary"></div>
-      <div class="context-cols">
-        <div><h2 class="section-title">Functional</h2><ul id="ctx-functional" class="plain-list"></ul></div>
-        <div><h2 class="section-title">Technical</h2><ul id="ctx-technical" class="plain-list"></ul></div>
-      </div>
-    </div>
-
     <div id="sub-docs" class="sub" hidden>
-      <p class="lead">Documents the agent may search: text, Markdown or HTML files, and web pages read again every few
-        days (a site: the pages under the same address). Only the allowed domains are read (setting
-        docs.allowed_domains).</p>
+      <div class="sec-head"><h2>Documents and sites</h2>
+        <button type="button" class="info" aria-controls="x-docs" aria-label="About the documents and sites">i</button></div>
+      <div class="explain" id="x-docs">Documents the agent searches: text, Markdown or HTML files, web pages and sites, wiki
+        spaces (Confluence) and repositories (Bitbucket), read again every few days. Each page is cut in pieces kept in
+        the knowledge search (words and meanings: PostgreSQL text search and pgvector when Superset's database has them),
+        so the agent finds the passage a question needs and names its page. A site behind a sign-in is read with its
+        token or password, kept encrypted and sent only to that site. Intranet addresses are read only when their
+        domain is in the setting docs.allowed_domains (Settings).</div>
       <div class="add-box admin-only">
         <div class="fields two">
-          <label class="field"><span>Address of a page or a site</span><input type="text" id="doc-url" placeholder="https://wiki.example.com/ops/runbooks/"></label>
+          <label class="field field-wide"><span>Address of a page, a site, a wiki space or a repository</span>
+            <input type="text" id="doc-url" placeholder="https://wiki.example.com/display/OPS/Runbooks"></label>
+          <label class="field"><span>Read as</span><select id="doc-reader">
+            <option value="">Detected from the address</option><option value="web">Web page or site</option>
+            <option value="confluence">Confluence wiki</option><option value="bitbucket">Bitbucket repository</option></select></label>
           <label class="field"><span>Category</span><input type="text" id="doc-category" placeholder="e.g. Runbooks"></label>
-          <label class="field"><span>Pages at most</span><input type="number" id="doc-pages" value="10" min="1" max="200"></label>
+          <label class="field"><span>Pages or files at most</span><input type="number" id="doc-pages" value="20" min="1" max="500"></label>
           <label class="field"><span>Read again every (days)</span><input type="number" id="doc-days" value="7" min="1"></label>
+          <label class="field"><span>Sign-in</span><select id="doc-auth">
+            <option value="">None (a public site)</option><option value="bearer">Token (Bearer)</option>
+            <option value="basic">User and password or app token (Basic)</option>
+            <option value="header">Token in a header of its own</option></select></label>
+          <label class="field" id="doc-user-box" hidden><span>User</span><input type="text" id="doc-user" autocomplete="off"></label>
+          <label class="field" id="doc-header-box" hidden><span>Header name</span>
+            <input type="text" id="doc-header" placeholder="e.g. Private-Token" autocomplete="off"></label>
+          <label class="field" id="doc-secret-box" hidden><span>Token or password</span>
+            <input type="password" id="doc-secret" autocomplete="new-password"></label>
         </div>
+        <p class="muted small-note" id="doc-auth-note" hidden>The token is kept encrypted and sent only to this site.
+          What it reads becomes searchable by everyone who can open the Data dictionary: use a token that only reads
+          what they may see.</p>
         <div class="actions">
-          <button type="button" class="btn primary" id="doc-add">Add the site</button>
+          <button type="button" class="btn primary" id="doc-add">Add</button>
           <label class="btn" for="doc-file">Upload a file</label>
-          <input type="file" id="doc-file" accept=".txt,.md,.markdown,.html,.htm,.csv,.json,.yaml,.yml" hidden>
+          <input type="file" id="doc-file" accept=".txt,.md,.markdown,.html,.htm,.csv,.json,.yaml,.yml,.rst,.adoc" hidden>
           <span id="doc-result" class="result"></span>
         </div>
       </div>
       <div class="table-wrap"><table class="grid" id="docs">
-        <thead><tr><th>Document</th><th>Category</th><th class="num">Pages</th><th class="num">Size</th><th>State</th><th>Read</th><th></th></tr></thead>
+        <thead><tr><th>Document</th><th>Category</th><th class="num">Pages</th><th class="num">Size</th>
+          <th class="num">In the search</th><th>State</th><th>Read</th><th></th></tr></thead>
         <tbody></tbody></table></div>
     </div>
 
     <div id="sub-notes" class="sub" hidden>
-      <p class="lead">What users write down in a few seconds (in the chat: Notes, or <code>/note</code> &hellip; in the
-        question box): what a meeting decided, a fact the team must not lose. The agent finds them, says whose note it
-        is and of which day, and never takes one as a rule. An admin may pin a note for everyone, or make a catalog
-        entry of it (then verified).</p>
+      <div class="sec-head"><h2>Notes</h2>
+        <button type="button" class="info" aria-controls="x-notes" aria-label="About the notes">i</button></div>
+      <div class="explain" id="x-notes">What users write down in a few seconds (in the chat: Notes, or <code>/note</code>
+        &hellip; in the question box): what a meeting decided, a fact the team must not lose. The agent finds them, says
+        whose note it is and of which day, and never takes one as a rule. An admin may pin a note for everyone, or make a
+        catalog guide of it (then verified).</div>
       <div class="filters">
         <input id="note-q" type="search" placeholder="Search the notes" aria-label="Search the notes">
         <select id="note-who" aria-label="Whose notes"><option value="">The team's and mine</option>
@@ -139,12 +156,100 @@
       <div class="pager" id="note-pager"></div>
     </div>
 
+    <div id="sub-context" class="sub" hidden>
+      <div class="sec-head"><h2>Context</h2>
+        <button type="button" class="info" aria-controls="x-context" aria-label="About the Context">i</button>
+        <span class="grow"></span>
+        <span class="ctx-tools">
+          <input id="ctx-q" type="search" placeholder="Find in the Context" aria-label="Find in the Context">
+          <span class="export-label">Export all:</span>
+          <a class="btn small" id="ctx-docx" href="#" title="The whole Context as a Word document">Word</a>
+          <a class="btn small" id="ctx-pdf" href="#" title="The whole Context as a PDF">PDF</a>
+        </span></div>
+      <div class="explain" id="x-context">What the system is, functionally and technically, written every night from what the
+        team shares (documents, catalog, team memory, the dictionary, the answers marked Helpful). A page marked
+        <span class="badge llm">AI-written</span> is the LLM's, from the sources listed under it. A page an admin corrected
+        is theirs: the agent never writes over it. You see the pages of the databases you may query.</div>
+      <div id="ctx-actions" class="agent-summary"></div>
+      <div class="ctx-reader">
+        <nav class="ctx-toc" id="ctx-toc" aria-label="Contents of the Context"></nav>
+        <article class="ctx-article" id="ctx-article" aria-live="polite"></article>
+      </div>
+    </div>
+
+    <div id="sub-learned" class="sub" hidden>
+      <div class="sec-head"><h2>Learned by the agent</h2>
+        <button type="button" class="info" aria-controls="x-learned" aria-label="About what the agent learned">i</button></div>
+      <div class="explain" id="x-learned">What the agent learned by itself, on the databases you may query: the answers
+        people marked Helpful, where the data of the questions was, the catalog entries it wrote from evidence, and how
+        long each kind of query takes.</div>
+      <div id="agent-summary" class="agent-summary"></div>
+
+      <div class="sec-head"><h3 class="section-title">Learned answers</h3>
+        <button type="button" class="info" aria-controls="x-recipes" aria-label="About the learned answers">i</button></div>
+      <div class="explain" id="x-recipes">Answers marked <strong>Helpful</strong> in the chat, under a short generic question,
+        with the way to the result; the most useful first: what people said of the answers each was given to, its query run
+        again and whether it worked. One that people keep saying is wrong is no longer proposed. <strong>helpful</strong>:
+        waiting for an admin, who may correct its question or its query before confirming it (Edit);
+        <strong>confirmed</strong>: approved and proposed first; <strong>rejected</strong>: never proposed.</div>
+      <div class="filters"><select id="r-status" aria-label="Status"><option value="">All</option>
+        <option value="helpful">Helpful, to review</option><option value="confirmed">Confirmed</option>
+        <option value="rejected">Rejected</option><option value="auto">Saved automatically (0.2.1 and before)</option>
+        </select></div>
+      <div class="table-wrap"><table class="grid" id="recipes">
+        <thead><tr><th>Question</th><th>Way</th><th class="num">Time</th><th class="num">Helpful / not</th><th>Status</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+
+      <div class="sec-head"><h3 class="section-title">Catalog entries the agent wrote</h3></div>
+      <div class="table-wrap"><table class="grid" id="agent-entries">
+        <thead><tr><th>Entry</th><th>Classification</th><th>From</th><th>Updated</th></tr></thead>
+        <tbody></tbody></table></div>
+
+      <div class="sec-head"><h3 class="section-title">Where the data of the questions was</h3>
+        <button type="button" class="info" aria-controls="x-where" aria-label="About where the data was">i</button></div>
+      <div class="explain" id="x-where">The tables the answers read, with the words of the questions that led there
+        (stems: "fail" for failed, failure...) and how many answers used each. A word in <strong>bold</strong> led only
+        there; the grey ones also led to other tables (point at one: which, and in which databases): alone, such a word
+        does not say where the data is. Learned from the answers; an answer marked Not helpful takes back what it taught.
+        Admins: &times; removes a word from a table, and Add puts words on a table by hand (a team's own words for its
+        data, before any answer used them): those never fade.</div>
+      <div class="filters">
+        <input id="w-q" type="search" placeholder="A word or a table" aria-label="Search the words and tables">
+        <select id="w-db" aria-label="Database"><option value="">Every database</option></select>
+      </div>
+      <div class="add-row admin-only" id="w-add" role="group" aria-label="Add words to a table">
+        <input id="w-add-words" type="text" placeholder="Words of the questions, e.g. rejects, failed runs" aria-label="Words">
+        <select id="w-add-db" aria-label="Database of the table"><option value="">Database…</option></select>
+        <input id="w-add-table" type="text" list="w-add-tables" placeholder="Index or metric" aria-label="Index or metric">
+        <datalist id="w-add-tables"></datalist>
+        <button type="button" class="btn primary" id="w-add-go">Add</button>
+        <span id="w-add-result" class="result" role="status" aria-live="polite"></span>
+      </div>
+      <div class="table-wrap"><table class="grid" id="associations">
+        <thead><tr><th>Where the data was</th><th>Database</th><th>Words of the questions that led there</th>
+          <th class="num">Answers</th><th>Last</th></tr></thead>
+        <tbody></tbody></table></div>
+      <div class="pager" id="w-pager"></div>
+
+      <div class="sec-head"><h3 class="section-title">Query timings</h3>
+        <button type="button" class="info" aria-controls="x-timings" aria-label="About the query timings">i</button></div>
+      <div class="explain" id="x-timings">How long each kind of query took (values replaced by ?), slowest first: the agent
+        sees them next to the metric or index it is about to query.</div>
+      <div class="table-wrap"><table class="grid" id="timings">
+        <thead><tr><th>On</th><th>Kind of query</th><th class="num">Calls</th><th class="num">Average</th>
+          <th class="num">Slowest</th><th class="num">Failed</th></tr></thead><tbody></tbody></table></div>
+      <div class="pager" id="t-pager" hidden></div>
+    </div>
+
     <div id="sub-categories" class="sub" hidden>
-      <p class="lead">Every piece of knowledge is classified, in this platform's own words: functional or technical,
-        its subjects, the applications and the components it is about. The LLM classifies what changes every day and
-        may propose new values; a new value is used once an admin approves it. An admin also adds a value here (used
-        at once) and, with Edit, moves a value to another category. The router and the search use them to find the
-        knowledge a question needs.</p>
+      <div class="sec-head"><h2>Categories</h2>
+        <button type="button" class="info" aria-controls="x-categories" aria-label="About the categories">i</button></div>
+      <div class="explain" id="x-categories">Every piece of knowledge is classified, in this platform's own words: functional
+        or technical, its subjects, the applications and the components it is about, and your own categories (server,
+        environment, team…). The LLM classifies what changes every day and may propose new values; a new value is used
+        once an admin approves it. An admin also adds a value here (used at once) and, with Edit, moves a value to
+        another category or says what it is part of. The router and the search use them to find the knowledge a question
+        needs; the System map draws them.</div>
       <div class="filters">
         <select id="fac-facet" aria-label="Category"><option value="">All categories</option>
           <option value="subject">Subjects</option><option value="application">Applications</option>
@@ -166,9 +271,12 @@
       </div>
       <details class="cat-own" id="cat-own">
         <summary>Categories and where their values come from</summary>
-        <p class="muted">Subject, application and component, and your own (server, environment, team…). A category
-          can read its values from the data: the fields whose names match its pattern (e.g. <code>^(host|node|server)$</code>);
-          two such fields of one index tell which values go together, proposed to you as "part of" in To review.</p>
+        <div class="sec-head"><span class="muted">Read from the data's fields</span>
+          <button type="button" class="info" aria-controls="x-cat-own" aria-label="About the categories of your own">i</button></div>
+        <div class="explain" id="x-cat-own">Subject, application and component, and your own (server, environment,
+          team…). A category can read its values from the data: the fields whose names match its pattern (e.g.
+          <code>^(host|node|server)$</code>); two such fields of one index tell which values go together, proposed to you
+          as "part of" in To review.</div>
         <ul id="cat-own-list" class="cat-own-list"></ul>
         <div class="filters" role="group" aria-label="Add a category">
           <input id="cat-own-name" type="text" maxlength="24" placeholder="New category, e.g. server" aria-label="New category">
@@ -177,14 +285,36 @@
           <span id="cat-own-result" class="result" role="status" aria-live="polite"></span>
         </div>
       </details>
-      <div class="viewswitch" role="group" aria-label="View">
-        <button type="button" class="btn small on" id="fac-view-list" aria-pressed="true">List</button>
-        <button type="button" class="btn small" id="fac-view-map" aria-pressed="false">System map</button>
-      </div>
       <div class="table-wrap" id="fac-list"><table class="grid" id="facets">
         <thead><tr><th>Value</th><th>Category</th><th class="num">Items</th><th>For example</th><th>State</th><th></th></tr></thead>
         <tbody></tbody></table></div>
-      <div id="fac-map" class="fac-map" hidden></div>
+    </div>
+
+    <div id="sub-map" class="sub" hidden>
+      <div class="sec-head"><h2>System map</h2>
+        <button type="button" class="info" aria-controls="x-map" aria-label="About the system map">i</button>
+        <span class="grow"></span>
+        <span class="map-tools">
+          <select id="map-focus" aria-label="Show"><option value="">Everything</option></select>
+          <button type="button" class="btn small" id="map-fit" title="Fit the map to the window">Fit</button>
+          <button type="button" class="btn small admin-only" id="map-edit" aria-pressed="false"
+            title="Move the boxes, add interactions, write what each part does">Edit</button>
+          <span class="export-label">Export:</span>
+          <button type="button" class="btn small" id="map-png">PNG</button>
+          <button type="button" class="btn small" id="map-svg">SVG</button>
+          <button type="button" class="btn small" id="map-pdf">PDF</button>
+        </span></div>
+      <div class="explain" id="x-map">The architecture of the system as the categories describe it: one column per
+        category (subjects, applications, components, servers…), each part in its box with what it does (its description,
+        else a sentence of the documents that name it), a grey line from a part to what it is part of, and the
+        interactions between parts (depends on, sends data to, calls…) as arrows. A big category is folded into one box:
+        click it to open it. It follows the data: a part whose items are gone says so. Admins: Edit to move the boxes,
+        draw an interaction (click a box, then another), and write what a part or an interaction is.</div>
+      <div id="map-legend" class="map-legend"></div>
+      <div class="map-wrap">
+        <div id="map-canvas" class="map-canvas" tabindex="0" aria-label="System map"></div>
+        <aside id="map-side" class="map-side" hidden aria-live="polite"></aside>
+      </div>
     </div>
   </section>
 
@@ -215,10 +345,12 @@
       <div class="pager"><button type="button" class="btn" id="prev">Previous</button><span id="page-info" class="muted"></span><button type="button" class="btn" id="next">Next</button></div>
     </div>
     <div id="sub-relations" class="sub" hidden>
-      <p class="lead">How metrics and index fields relate: written in the catalog, or measured on the data (the values
-        two columns have in common, measured again every day). A measured relation that is wrong: an admin marks it
-        <strong>Wrong</strong> and it is never given to the agent; the right one is a catalog entry of classification
-        <em>relationships</em>.</p>
+      <div class="sec-head"><h2>Relations</h2>
+        <button type="button" class="info" aria-controls="x-relations" aria-label="About the relations">i</button></div>
+      <div class="explain" id="x-relations">How metrics and index fields relate: written in the catalog, or measured on
+        the data (the values two columns have in common, measured again every day). A measured relation that is wrong: an
+        admin marks it <strong>Wrong</strong> and it is never given to the agent; the right one is a catalog entry of
+        classification <em>relationships</em>.</div>
       <div class="table-wrap"><table class="grid" id="relations">
         <thead><tr><th>Relation</th><th>Origin</th><th class="num">Confidence</th><th></th></tr></thead><tbody></tbody>
       </table></div>
@@ -233,63 +365,19 @@
     </div>
   </section>
 
-  <!-- Learned by the agent -->
-  <section id="tab-learned" class="tab" hidden>
-    <p class="lead">What the agent learned by itself, on the databases you may query: the answers people marked
-      Helpful, where the data of the questions was, the catalog entries it wrote from evidence, and how long each kind
-      of query takes.</p>
-    <div id="agent-summary" class="agent-summary"></div>
-    <h2 class="section-title">Learned answers</h2>
-    <p class="muted">Answers marked <strong>Helpful</strong> in the chat, under a short generic question, with the way
-      to the result; the most useful first: what people said of the answers each was given to, its query run again
-      and whether it worked. One that people keep saying is wrong is no longer proposed. <strong>helpful</strong>:
-      waiting for an admin; <strong>confirmed</strong>: approved and proposed first; <strong>rejected</strong>: never
-      proposed.</p>
-    <div class="filters"><select id="r-status" aria-label="Status"><option value="">All</option>
-      <option value="helpful">Helpful, to review</option><option value="confirmed">Confirmed</option>
-      <option value="rejected">Rejected</option><option value="auto">Saved automatically (0.2.1 and before)</option>
-      </select></div>
-    <div class="table-wrap"><table class="grid" id="recipes">
-      <thead><tr><th>Question</th><th>Way</th><th class="num">Time</th><th class="num">Helpful / not</th><th>Status</th><th></th></tr></thead>
-      <tbody></tbody></table></div>
-    <h2 class="section-title">Catalog entries the agent wrote</h2>
-    <div class="table-wrap"><table class="grid" id="agent-entries">
-      <thead><tr><th>Entry</th><th>Classification</th><th>From</th><th>Updated</th></tr></thead>
-      <tbody></tbody></table></div>
-    <h2 class="section-title">Where the data of the questions was</h2>
-    <p class="muted">The tables the answers read, with the words of the questions that led there (stems: "fail"
-      for failed, failure...) and how many answers used each. A word in <strong>bold</strong> led only there; the
-      grey ones also led to other tables (point at one: which, and in which databases): alone, such a word does not
-      say where the data is. Learned from the answers; an answer marked Not helpful takes back what it taught.
-      Admins: &times; removes a word from a table.</p>
-    <div class="filters">
-      <input id="w-q" type="search" placeholder="A word or a table" aria-label="Search the words and tables">
-      <select id="w-db" aria-label="Database"><option value="">Every database</option></select>
-    </div>
-    <div class="table-wrap"><table class="grid" id="associations">
-      <thead><tr><th>Where the data was</th><th>Database</th><th>Words of the questions that led there</th>
-        <th class="num">Answers</th><th>Last</th></tr></thead>
-      <tbody></tbody></table></div>
-    <div class="pager" id="w-pager"></div>
-    <h2 class="section-title">Query timings</h2>
-    <p class="muted">How long each kind of query took (values replaced by ?), slowest first: the agent sees them next
-      to the metric or index it is about to query.</p>
-    <div class="table-wrap"><table class="grid" id="timings">
-      <thead><tr><th>On</th><th>Kind of query</th><th class="num">Calls</th><th class="num">Average</th>
-        <th class="num">Slowest</th><th class="num">Failed</th></tr></thead><tbody></tbody></table></div>
-    <div class="pager" id="t-pager" hidden></div>
-  </section>
-
   <!-- Search: as the agent searches for each question -->
   <section id="tab-search" class="tab" hidden>
-    <p class="lead">Search everything the agent knows, as the agent does for each question.</p>
+    <div class="sec-head"><h2>Search</h2>
+      <button type="button" class="info" aria-controls="x-search" aria-label="About the search">i</button></div>
+    <div class="explain" id="x-search">Search everything the agent knows, as the agent does for each question: by words and,
+      with an embedding model, by meaning. Each result opens where it is read or edited.</div>
     <form id="k-form" class="filters" autocomplete="off">
       <input id="k-q" type="search" placeholder="e.g. why do jobs fail on a saturated server" aria-label="Search the knowledge">
       <select id="k-kind" aria-label="Kind"><option value="">Everything</option><option value="metric">Metrics</option>
-        <option value="index">Indices</option><option value="note">Notes</option><option value="rule">Rules</option>
-        <option value="glossary">Glossary</option><option value="formula">Formulas</option>
+        <option value="index">Indices</option><option value="guide">Guides</option><option value="teamnote">Notes</option>
+        <option value="rule">Rules</option><option value="glossary">Glossary</option><option value="formula">Formulas</option>
         <option value="recipe">Learned answers</option>
-        <option value="memory">Memory</option><option value="doc">Documents</option>
+        <option value="memory">Memory</option><option value="doc">Documents and sites</option>
         <option value="context">Context</option></select>
       <button type="submit" class="btn primary">Search</button>
     </form>
@@ -325,9 +413,6 @@
       <div class="actions">
         <button type="button" class="btn primary" id="e-save">Save</button>
         <button type="button" class="btn" id="e-delete">Delete</button>
-        <span id="e-confirm" hidden>Delete this entry? It can be restored from its history.
-          <button type="button" class="btn small stop" id="e-delete-yes">Delete</button>
-          <button type="button" class="btn small" id="e-delete-no">Cancel</button></span>
         <span id="e-result" class="result"></span>
       </div>
       <details id="e-history-box"><summary>History</summary><div id="e-history"></div></details>
@@ -337,9 +422,10 @@
 <div id="import-drawer" class="drawer" hidden>
   <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="import-h">
     <button type="button" class="close" id="import-close" aria-label="Close">&times;</button>
-    <h2 id="import-h">Import a catalog (YAML)</h2>
-    <p class="muted">The file is split into entries (glossary, one per index, metrics by name prefix,
-      relationships, checks). Entries with the same title are updated, the others added.</p>
+    <div class="sec-head"><h2 id="import-h">Import a catalog (YAML)</h2>
+      <button type="button" class="info" aria-controls="x-import" aria-label="About the import">i</button></div>
+    <div class="explain" id="x-import">The file is split into entries (glossary, one per index, metrics by name prefix,
+      relationships, checks). Entries with the same title are updated, the others added.</div>
     <textarea id="import-text" rows="18" spellcheck="false" aria-label="Catalog YAML"></textarea>
     <label class="field check"><input type="checkbox" id="import-replace"><span>Also delete the structured entries this
       file does not have</span></label>
@@ -349,4 +435,5 @@
 </div>
 {% endblock %}
 {% block scripts %}<script src="{{ supagent_static('dictionary.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
-<script src="{{ supagent_static('knowledge.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}
+<script src="{{ supagent_static('knowledge.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>
+<script src="{{ supagent_static('sysmap.js') }}"{% if csp_nonce is defined %} nonce="{{ csp_nonce() }}"{% endif %}></script>{% endblock %}

@@ -195,6 +195,32 @@ def test_a_count_over_a_counter_is_sent_back(world):
     assert count_of_counter(world["jobs"], sql) is None                                 # not a metrics database
 
 
+def test_how_many_answered_with_samples_or_rates_is_sent_back(world):
+    from superset.extensions import db
+
+    from supagent.knowledge.experience import count_of_counter, rate_as_count
+    from supagent.knowledge.store import upsert
+
+    upsert(world["run"], world["s_prom"], "metric", "", "node_vmstat_oom_kill", {"metric_type": "gauge",
+                                                                                "stats": {"series": 4}})
+    db.session.commit()
+    metrics = world["metrics"]
+    oom = ("SELECT node, COUNT(*) AS kills FROM \"node_vmstat_oom_kill\" WHERE ts >= TIMESTAMP '2026-09-24 00:00' "
+           "GROUP BY node")
+    text = count_of_counter(metrics, oom, "Which servers had OOM kills on 24 September, and how many?")
+    assert text and text.startswith("tool error (not run: samples)") and "SUM(INCREASE(value))" in text
+    assert count_of_counter(metrics, oom, "Which servers have data on 24 September?") is None    # no "how many"
+    assert count_of_counter(metrics, 'SELECT COUNT(DISTINCT node) FROM "node_vmstat_oom_kill" WHERE value > 0',
+                            "How many servers had OOM kills?") is None                          # series, not samples
+    rate = ("SELECT SUM(rate) FILTER (WHERE mode = 'user') FROM \"node_cpu_seconds_total\" "
+            "WHERE ts >= TIMESTAMP '2026-09-24 00:00'")
+    text = rate_as_count(metrics, rate, "How many CPU seconds were spent in user mode on 24 September?")
+    assert text and text.startswith("tool error (not run: rate)") and "SUM(increase)" in text
+    assert rate_as_count(metrics, rate, "What was the user CPU rate per second on 24 September?") is None
+    assert rate_as_count(metrics, rate.replace("SUM(rate)", "SUM(increase)"), "How many CPU seconds in user mode?") is None
+    assert rate_as_count(world["jobs"], rate, "How many CPU seconds in user mode?") is None     # not a metrics database
+
+
 VAR_RULE = ("The VaR of a desk is its record with BOOK = 'ALL'. Never add up the VaR of the books of a desk "
             "(VaR is not additive).")
 
@@ -416,6 +442,8 @@ def test_a_follow_up_keeps_the_previous_questions_conditions(ruled, monkeypatch)
     assert dropped(q, [prev], [billing + " AND \"LABEL\" = 'D'"]) == []
     assert dropped("Now all labels, only billing", [prev], [billing]) == []           # removed on purpose
     assert dropped("Only billing, label D-1 instead", [prev], [billing]) == []        # the message changes it
+    assert dropped("Back to the failed jobs: how many were there the day before?", [prev], [base]) == []   # its scope
+    assert dropped("How many failed in total that day?", [prev], [base]) == []          # the whole, not the part
     assert dropped(q, [prev], ['SELECT COUNT(*) FROM "other" WHERE "APPLICATION" = \'BILLING\'']) == []
 
     plain = {"request": {"database_id": 1, "sql": billing}}

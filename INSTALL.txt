@@ -1,21 +1,29 @@
-supagent 0.7.1 - the AI agent inside Apache Superset
+supagent 0.8.0 - the AI agent inside Apache Superset
 ====================================================
 
 What is in this folder
-  supagent-0.7.1-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
+  supagent-0.8.0-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
 
-Upgrading? From 0.7.0: pip install --upgrade this wheel on every host, then restart the web servers, the Celery
-workers and beat (no table change; superset supagent init is not needed). From 0.6.0: "Upgrade from 0.6.0 to
-0.7.0" below; from 0.5.4: the steps of "Upgrade from 0.5.4 to 0.6.0" with this wheel (init then goes from schema 7
-to 13). Steps 1-8 are for a new install.
+Upgrading? From 0.7.0 or 0.7.1: "Upgrade from 0.7 to 0.8.0" below. From 0.6.0: the same steps (init then goes
+from schema 9 to 14). From 0.5.4: the steps of "Upgrade from 0.5.4 to 0.6.0" with this wheel (schema 7 to 14).
+Steps 1-8 are for a new install.
+
+A new Superset 6.1.0 installed from PyPI (tested 2 Oct 2026, on an empty PostgreSQL database owned by an ordinary
+role): three packages must be pinned, or Superset itself does not start (none is about supagent):
+   $PY -m pip install "apache-superset==6.1.0" "flask-caching==2.3.1" "flask-limiter<4" cachetools
+   - Flask-Caching 2.5: SupersetMetastoreCache.__init__() got an unexpected keyword argument ...
+   - Flask-Limiter 4 no longer brings "rich", which Superset's command line imports (superset db upgrade fails)
+   - "cachetools" is imported by Superset (db_engine_specs/aws_iam.py) and no longer comes with its dependencies
+     (the login page shows an error)
+   Then Superset's own steps (superset db upgrade, superset fab create-admin, superset init), then step 1 below.
 
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.7.1-py3-none-any.whl
+   $PY -m pip install supagent-0.8.0-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
 
 2. Register it: one line in superset_config.py (no logic)
@@ -111,6 +119,44 @@ to 13). Steps 1-8 are for a new install.
    supagent_store). Then:
      superset supagent init          builds it (the first time it finds the extensions)
      superset supagent store status  extensions, versions, size, warnings
+
+Upgrade from 0.7 to 0.8.0
+========================
+
+What changes:
+  - The pages: the explanations behind an "i" (a click shows them); bigger tabs; Learned by the agent in Knowledge;
+    To review's panels close with their button; every delete asks in a small card; the chat panel on Superset's
+    pages floats (moved, resized) or stays docked.
+  - The catalog's classification "note" is "guide": init renames the entries, their history and their search
+    pieces (the knowledge store too). A YAML with "note" still imports as guide.
+  - Learned answers corrected before they are confirmed (a changed query runs first); words put on a table by hand
+    (Where the data of the questions was).
+  - The Context read as documentation, exported as Word or PDF; the System map (Knowledge -> System map).
+  - Documents and sites: a sign-in (token, user and password, or a header), kept encrypted with Superset's
+    SECRET_KEY: keep the same SECRET_KEY on every host (as Superset itself needs). Confluence and Bitbucket read
+    through their APIs. An intranet address needs its domain in docs.allowed_domains, as before.
+  - The subjects of a chat: each question gets the messages of its subject only (agent.subjects, on). Off: the last
+    exchanges, as before.
+  - Superset's database: new nullable columns (supagent_message.topic, supagent_recipe.edited_by, .edited_at,
+    .previous, supagent_association.source, .added_by, supagent_doc.reader, .auth, .secret, supagent_link.note),
+    schema 14; the guides renamed; no table added, nothing deleted. superset_config.py does not change.
+
+Steps (Superset stopped for a few minutes):
+ 1. Stop the web servers, the Celery workers and beat, on every host.
+ 2. Back up: pg_dump -Fc -f superset-before-0.8.0.dump "<Superset's database>"; $PY -m pip freeze > pip-before-0.8.0.txt
+ 3. On every host: $PY -m pip install supagent-0.8.0-py3-none-any.whl     ($PY -m pip show supagent: 0.8.0)
+ 4. Once, on one host: superset supagent init
+      tables: schema version 13 -> 14
+      knowledge store: N pieces of the catalog's notes are guides now      (when the store is used and had some)
+ 5. Start everything. Checks: Settings -> Chat settings shows "supagent 0.8.0 (tables v14)"; Data dictionary ->
+    Knowledge -> Catalog: the former notes are guides; a question in the chat answers.
+
+Back to 0.7.1: stop, pip install the 0.7.1 wheel, then in Superset's database:
+      UPDATE supagent_entry SET classification = 'note' WHERE classification = 'guide';
+      UPDATE supagent_entry_version SET classification = 'note' WHERE classification = 'guide';
+      UPDATE supagent_chunk SET kind = 'note' WHERE kind = 'guide';
+   superset supagent init (schema back to 13: the new columns stay, unused), superset supagent store rebuild, start.
+   A site's saved sign-in is unknown to 0.7 (it reads the site without it).
 
 Upgrade from 0.6.0 to 0.7.0
 ===========================

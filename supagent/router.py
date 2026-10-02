@@ -75,8 +75,8 @@ ROUTE_NOTES = {
               "chart tools; figures come from the data as usual.)",
 }
 # knowledge kinds given first for a route (found that many places higher in the search: lower = negative)
-ROUTE_KINDS = {"technical": {"context": -4, "doc": -3, "note": -3}, "functional": {"glossary": -3, "rule": -2},
-               "incident": {"note": -2, "doc": -2, "context": -2}, "infrastructure": {"metric": -2, "note": -1}}
+ROUTE_KINDS = {"technical": {"context": -4, "doc": -3, "guide": -3}, "functional": {"glossary": -3, "rule": -2},
+               "incident": {"guide": -2, "doc": -2, "context": -2}, "infrastructure": {"metric": -2, "guide": -1}}
 CONFIDENCE = ("low", "medium", "high")
 STRONG = 0.8            # a confirmed example this close (cosine; words: 0.55) is the same question: it only votes
 STRONG_WORDS = 0.55

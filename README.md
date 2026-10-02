@@ -5,7 +5,10 @@ It adds:
 
 * **a chat** (the **Chat** tab of Superset's top bar opens it as a panel on the right of the page:
   the dashboard, chart, dataset or SQL Lab page stays beside it, and a link in an answer opens
-  there while the chat stays open; Ctrl+click on the tab, or the panel's ⤢ button, opens the full page).
+  there while the chat stays open; docked, it leaves the page 900 pixels at least so a dashboard
+  keeps all its charts; the panel can also float over the page, moved and resized freely (0.8),
+  as it does by itself in a window under 1,220 pixels; Ctrl+click on the tab, or the panel's ⤢
+  button, opens the full page).
   A user asks a question in plain words; the agent
   works with **that user's Superset permissions**, runs the queries, and answers with the key
   figures. Every query result is shown under the answer as a **table and a chart** (bars for
@@ -28,11 +31,11 @@ It adds:
     * **what changed** since the day before: new, gone or back objects, changed types or units,
       big changes in series counts.
 
-    Its tabs (0.6): *To review* (what waits for an admin), *Knowledge* (the catalog, the team
-    memory, the Context, the documents and sites, the categories: edited there by admins, read
-    only for the others), *Data* (browse, relations, changes), *Learned by the agent* and
-    *Search* (see *The Data dictionary* below). Everyone sees only what concerns the databases
-    they may query.
+    Its tabs: *To review* (what waits for an admin), *Knowledge* (the catalog, the team memory,
+    the documents and sites, the notes, the Context, what the agent learned, the categories and
+    the **System map**: edited there by admins, read only for the others), *Data* (browse,
+    relations, changes) and *Search* (see *The Data dictionary* below). Everyone sees only what
+    concerns the databases they may query. Each part's explanation is behind an **i** (0.8).
 
     Descriptions come from your catalog first, then from the source (the exporters' HELP
     texts), then from the LLM. LLM texts are marked *AI-written* until an admin approves or
@@ -72,6 +75,9 @@ Content-Security-Policy (Talisman nonces).
 * Apache Superset 6.1 in a Python 3.10–3.12 virtualenv. Tested with 6.1.0 on PostgreSQL
   (production-like, with Celery workers and beat) and on SQLite. supagent needs
   `pydantic>=2.8`, which Superset 6.1 already has: nothing else to install, offline too.
+  A **new** Superset 6.1.0 installed from PyPI today needs three pins to start at all (none is
+  about supagent; tested on 2 Oct 2026 on an empty PostgreSQL database):
+  `pip install "apache-superset==6.1.0" "flask-caching==2.3.1" "flask-limiter<4" cachetools`.
 * Saving Superset charts and dashboards from the chat uses Superset 6.1's own MCP service
   (package `fastmcp`, which Superset 6.1 installs with its `mcp` extra). Without it everything
   else works; the agent says that it cannot save charts.
@@ -96,7 +102,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.7.1-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.8.0-py3-none-any.whl          # Superset 6.1: nothing else to install
 ```
 
 One line in `superset_config.py` registers it. It holds no logic:
@@ -120,6 +126,12 @@ Restart the web server, the Celery workers and beat.
 The role **AI Agent** gives the chat and the data dictionary; the settings stay with the
 Admin role. `superset init` never gives these pages to Gamma or Alpha. What a user can query
 through the agent stays what Superset lets that user query.
+
+## Upgrade from 0.7 to 0.8.0
+
+`pip install` the new wheel on every host, `superset supagent init` once ("schema version 13 -> 14": new nullable
+columns, the catalog's notes renamed guides, in the knowledge store too), restart. Steps, checks and the way back
+(three SQL lines for the guides): INSTALL.txt, *Upgrade from 0.7 to 0.8.0*.
 
 ## Upgrade from 0.5.4 to 0.6.0
 
@@ -575,6 +587,9 @@ answers marked Helpful. Raw chats are not read: each was answered with its user'
   (the tab, and the agent's knowledge search, where it ranks below the catalog and the documents).
 * **Corrections**: an admin corrects a page in the tab; the agent then never writes over it (until
   *Give it back to the agent*).
+* **Read as documentation** (0.8): the contents on the left (functional, technical; a box finds the pages by their
+  words), the page on the right with its sources; **Word (.docx) and PDF** of a page or of the whole Context
+  (pure Python: a cover, the contents with their page numbers, bookmarks, tables and code kept).
 * Code read through MCP servers can become one more source of evidence later.
 
 ## Questions about an earlier answer
@@ -782,18 +797,26 @@ examples, 83% with a wrong confirmed example of the same question (31% before).
 
 ## The Data dictionary (0.6)
 
-One page for everything the agent knows, in five tabs (deep links: `#review`, `#catalog`, `#memory`,
-`#context`, `#docs`, `#categories`, `#browse`, `#relations`, `#changes`, `#learned`, `#search`):
+One page for everything the agent knows, in four tabs (deep links: `#review`, `#catalog`, `#memory`,
+`#docs`, `#notes`, `#context`, `#learned`, `#categories`, `#map`, `#browse`, `#relations`, `#changes`, `#search`).
+What each part is says itself behind its **i**; what cannot be undone (a delete) is confirmed in a small card that
+says what goes with it (0.8):
 
 * **To review** (admins; the page opens on it when something waits, the count is on the tab and in Settings): the
   team memory proposed from the chats, the answers marked Helpful, the categories and relations the LLM proposes,
   each a card with its actions (approve, correct, merge, reject; approve all shown); then, folded, what the agent
   already uses and an admin may check (AI-written descriptions, the kinds of work learned by the router);
-* **Knowledge**: the catalog, the team memory, the Context, the documents and sites, the categories, edited here
-  (they left the Settings page); read only for users who are not admins;
-* **Data**: browse the dictionary, the relations, the changes; **Learned by the agent**: the learned answers, most
-  useful first (below), the catalog entries the agent wrote, where the data of the questions was, query timings;
-  **Search**: the knowledge as the agent searches it.
+* **Knowledge**: the catalog, the team memory, the documents and sites, the notes, the Context, **Learned by the
+  agent** (the learned answers, most useful first, which an admin may correct before confirming them: Edit, then
+  *Check the query* runs it with the admin's permissions, and a changed query is confirmed only if it runs; the
+  catalog entries the agent wrote; where the data of the questions was, where an admin also puts words on a table
+  by hand, which never fade; query timings), the categories and the **System map**; edited here, read only for
+  users who are not admins;
+* **Data**: browse the dictionary, the relations, the changes; **Search**: the knowledge as the agent searches it.
+
+The catalog's classifications: glossary, index, metrics, relationships, checks, rule, **guide** (documentation,
+runbooks, how-tos: called "note" before 0.8, renamed so that it is not taken for the users' quick notes; a YAML
+with "note" still imports) and formula.
 
 A save answers at once; what follows (the catalog applied to the dictionary, the search pieces, their vectors,
 the knowledge store) runs in the background of the process that saved (`knowledge.apply_background`), and the line
@@ -812,7 +835,7 @@ changes a value's category (subject, application, component) as well as its text
 names; a value moved or renamed onto one that exists is merged with it, items included. A value can be **part of
 several others** (a jvm of two applications and four components): its items count as about each of them, the
 LLM proposes these relations for new values and for known ones (To review), and **Categories → System map**
-draws the whole system from them, with the items about each value that exist now. Categories of your own
+draws the whole system from them (see *The System map*), with the items about each value that exist now. Categories of your own
 (server, environment, team...) are added there too, each with the field names its values are read from in the
 data (`categories.fields`): their values are kept with where they come from, and two such fields of one index
 show which values go together, proposed as "part of" for an admin to approve. In To review every suggestion can
@@ -824,6 +847,46 @@ once (the 0.6 behaviour).
 (at most 500, 20 per page). Each name opens the item: charts and dashboards in Superset, everything else in the
 dictionary's side panel, at an address (`…/supagent/dictionary/#open/<item>`) that can be shared with someone
 who may read it.
+
+## The System map (0.8)
+
+*Data dictionary → Knowledge → System map*: the architecture of the system as the categories describe it, for every
+user of the dictionary (each sees the parts with an item of the databases they may query, and what those are part
+of). One column per category (subjects, applications, components, then your own: servers, environments...), each
+part in a box with what it does: its description, else the sentence of a document, a guide or a Context page that
+names it (the one that says what it is, from a document first), and how many items are about it now (a part whose
+items are gone says so). A grey line joins a part to what it is part of; the **interactions** an admin draws
+between parts (depends on, sends data to, reads from, calls, runs on, triggers, monitors, with a few words) are
+arrows. A category with more than 18 parts is folded into one box (click it to open it); *Focus on…* shows a part
+with what it is part of, what it is made of and what it interacts with. Click a part: its panel (part of, made of,
+interactions, its knowledge in the search). Admins: **Edit** to move the boxes (their places are kept for
+everyone), draw an interaction (a part, *Draw an interaction from here*, then another part), write what a part is
+(or take the sentence found), hide a part. Exports: **PNG, SVG, PDF** (the map as drawn, the focus too).
+
+## The subjects of a chat (0.8)
+
+A chat often follows one subject over several questions, then changes subject, then comes back. Each question now
+belongs to a subject (the chat shows a thin line where one starts or comes back), and its answer is given the
+messages of that subject only: from its start (the first exchange, what the follow-ups refer to; the exchanges in
+between shortened; the last three in full; 24,000 characters at most), never the other subjects' messages.
+
+* **The same subject**: a reply to the agent's question, a short completion ("Only PROD."), a question that starts
+  with *and*, *also*, *what about*, *same*..., one that refers to the answer (*that*, *those*, *it*), another day,
+  period or value for the same thing, or a question about the same data (its named values, the tables the resolver
+  says it needs and the tables the subject's answers read, its words).
+* **A new subject**: the question says so (*another question*, *autre sujet*), or it is about other data with
+  nothing in common with the chat.
+* **Back to an earlier subject**: the question is about that subject's data (or says *back to...*).
+* When the words cannot tell, one short LLM call (30 s at most) says which subject the question continues; not sure,
+  the same subject: more context costs tokens, less context costs right answers.
+
+Within a subject, a follow-up for another day ("And on the 23rd?", "Et le 23 ?", "And the day before?", "la
+veille") is the previous question for that day: the day is read from the one named before, the answer gets its own
+query with the previous question's conditions, and the period check reads the earlier question with the new day in
+place (its "shipped on", its "during the night" kept). "Back to …" takes the scope of the question it goes back to,
+not the last answer's conditions.
+
+`agent.subjects=false`: the last exchanges of the chat, as before 0.8.
 
 ## Notes (0.7)
 
@@ -1067,10 +1130,32 @@ and has the fix). `store status` warns about it.
 ## Documents and sites
 
 Admins add documents (text, Markdown or HTML files) and web pages or whole sites (the pages
-under the same address, up to a number of pages, read again every N days) on the settings page.
-Fetching is safe by default: http(s) only, `docs.max_kb` per page, 20 s per request, redirects
-checked; only `docs.allowed_domains` are read (with none set, only public addresses: no
+under the same address, up to a number of pages, read again every N days) in *Data dictionary →
+Knowledge → Documents and sites*. Fetching is safe by default: http(s) only, `docs.max_kb` per page, 20 s per
+request, redirects checked; only `docs.allowed_domains` are read (with none set, only public addresses: no
 intranet, no localhost). PDF is not read (it would need a package Superset does not have).
+
+**A site behind a sign-in** (0.8): a token (`Authorization: Bearer`), a user with a password or an app token
+(Basic), or a token in a header of its own (e.g. `Private-Token`). The secret is kept encrypted with Superset's
+SECRET_KEY, sent only to the document's own site (never after a redirect to another site), never shown on the page
+nor written in a log or an error; an empty secret in Edit keeps the saved one, an address moved to another site
+needs it again. A sign-in page or an HTTP 401/403 says "the site asked to sign in". What a sign-in reads becomes
+searchable by everyone who can open the Data dictionary: use a token that only reads what they may see.
+
+**Wikis and repositories** (0.8), detected from the address (or chosen: *Read as*):
+
+* **Confluence** (Data Center / Server: `/display/SPACE/...`, `/pages/viewpage.action?pageId=`, `/spaces/SPACE/...`;
+  Cloud: `/wiki/spaces/...`): the page and the pages under it, breadth first, or a whole space, through the REST
+  API (the page's storage format, code macros and tables kept), up to the number of pages asked.
+* **Bitbucket** (Data Center: `/projects/P/repos/R/browse/...`; Cloud: `bitbucket.org/ws/repo/src/...`): the text
+  files of a folder (Markdown, txt, rst, adoc, HTML, YAML, JSON, CSV, config, XML, SQL), README and docs first, each
+  at most `docs.max_kb`, through the REST API.
+* Other addresses: the web pages under the same address.
+
+**In the search** (0.8): each page is cut in its own pieces (a piece never mixes two pages), each with the page's
+address, so the agent finds the passage a question needs and names its page; they go in the knowledge store when
+Superset's PostgreSQL has pgvector, pg_textsearch or pg_trgm (words, near spellings, meaning), else in the search of
+0.5. The table says how many pieces each document has in the search.
 
 ## Where things are kept
 

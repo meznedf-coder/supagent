@@ -1099,18 +1099,21 @@ def describe_data(topic: str | None = None, index: str | None = None) -> str:
 @mcp.tool
 def search_knowledge(query: str, kind: str | None = None, limit: int = 8) -> dict:
     """Search what is known about the data and how the team works: metrics and indices (what
-    they mean, labels, fields), catalog notes and the users' notes (meetings, decisions), rules,
-    glossary and formulas (calculated fields), answers that worked before, team and personal
-    preferences, documents and sites. `kind`: metric, index, note (the catalog's notes and the
-    users' notes), rule, glossary, formula, recipe, memory or doc (empty: all)."""
+    they mean, labels, fields), the catalog's guides (documentation, runbooks) and the users' notes
+    (meetings, decisions), rules, glossary and formulas (calculated fields), answers that worked
+    before, team and personal preferences, documents and sites. `kind`: metric, index, guide, note
+    (the users' notes and the catalog's guides), rule, glossary, formula, recipe, memory or doc
+    (empty: all)."""
     try:
         with _as_user():
             from supagent.knowledge.notes import KIND as USERS_NOTES
             from supagent.knowledge.search import search
 
             kinds = (kind,) if kind else None
-            if kind in ("note", "notes", USERS_NOTES):      # "note": a meeting's note as well as the catalog's
-                kinds = ("note", USERS_NOTES)
+            if kind in ("note", "notes", USERS_NOTES):      # "note": a meeting's note as well as the catalog's guides
+                kinds = ("guide", USERS_NOTES)
+            elif kind in ("guide", "guides"):
+                kinds = ("guide",)
             found = search(query, k=max(1, min(int(limit or 8), 20)), kinds=kinds)
             return {"query": query, "results": [{**f, "text": (f["text"] or "")[:1200]} for f in found]}
     except Exception as ex:  # pylint: disable=broad-except

@@ -242,7 +242,7 @@ def test_a_saved_chart_request_is_recognised():
 def test_an_answer_without_the_tools_is_sent_back_once():
     """The knowledge given with a question is a summary: an answer with no tool call, or
     showing results that no query returned, is sent back to the model once."""
-    from supagent.agent import NO_QUERY_NUDGE, NO_TOOL_NUDGE, unsupported_answer
+    from supagent.agent import LOOKUP_NUDGE, NO_QUERY_NUDGE, NO_TOOL_NUDGE, WRITTEN_SQL_NUDGE, unsupported_answer
 
     made_up = '```json\n[{"application": "BILLING", "jobs": 215430}]\n```\n\nSQL run:\n```sql\nSELECT 1\n```'
     assert unsupported_answer(made_up, []) == NO_TOOL_NUDGE
@@ -255,6 +255,18 @@ def test_an_answer_without_the_tools_is_sent_back_once():
     fields = "| field | fill rate |\n|---|---|\n| STATUS_INFO | 100% |\n| ERROR_CATEGORY | 12% |"
     assert unsupported_answer(fields, looked) is None                       # the dictionary's own figures
     assert unsupported_answer("The index batch-jobs holds the job runs.", looked) is None
+    absent = ("The data does not contain a \"voice\" booking field in the trades index; its fields are TRADE_DATE, "
+              "DESK and BOOK. Could you clarify which field you mean?")
+    assert unsupported_answer(absent, []) == LOOKUP_NUDGE                     # said absent, nothing looked up
+    assert unsupported_answer(absent, looked) is None                         # looked up: a real question back
+    listed = ("The data does not contain a voice channel; its fields are DESK, BOOK and CHANNEL (WEB, APP, STORE) for "
+              "the 93 trades. Which field do you mean?")
+    assert unsupported_answer(listed, []) == LOOKUP_NUDGE                     # with the previous answer's figures too
+    assert unsupported_answer("Which channel do you mean, the web or the stores?", []) is None   # a plain question back
+    written = ("The average order value on 23 September was **101.78 EUR**.\n\n```sql\nSELECT SUM(\"AMOUNT_EUR\") / "
+               "COUNT(*) FROM \"orders\" WHERE \"ORDER_TIME\" >= '2026-09-23'\n```")
+    assert unsupported_answer(written, []) == WRITTEN_SQL_NUDGE                 # a query written out, not run
+    assert unsupported_answer(written, ran) is None                             # it ran
 
 
 def test_a_second_unsupported_answer_is_marked():
@@ -262,6 +274,7 @@ def test_a_second_unsupported_answer_is_marked():
 
     made_up = '```json\n[{"application": "BILLING", "jobs": 215430}]\n```'
     assert unsupported_note(made_up, []) == UNSUPPORTED_NOTE                 # still no query after the reminder
+    assert unsupported_note("Average: **101.78 EUR**.\n```sql\nSELECT 1\n```", []) == UNSUPPORTED_NOTE
     assert unsupported_note(made_up, [{"tool": "describe_data", "status": "done"}]) == UNSUPPORTED_NOTE
     assert unsupported_note(made_up, [{"tool": "execute_sql", "status": "done"}]) == ""
     assert unsupported_note("Hello! Ask me about your data.", []) == ""     # no data claimed: fine

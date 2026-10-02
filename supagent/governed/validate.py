@@ -573,7 +573,8 @@ def _check_cond(step: Step, c: Cond, t: TableInfo, cols: dict[str, str], earlier
 
 def _kind_label(kind: str) -> str:
     return {"rule": "the team's rule", "glossary": "the glossary's", "memory": "the memory", "recipe": "a learned answer",
-            "doc": "the document", "note": "the note", "context": "the Context"}.get(kind, kind)
+            "doc": "the document", "guide": "the guide", "note": "the guide", "teamnote": "the note",
+            "context": "the Context"}.get(kind, kind)
 
 
 def _quoted(quote: str, question: str, chat: str) -> bool:

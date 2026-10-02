@@ -1,5 +1,97 @@
 # Changes
 
+## 0.8.0 — 2 Oct 2026
+
+The pages:
+* **Explanations behind an "i"**: the paragraphs that explained each part of the Data dictionary, the chat's drawers,
+  the settings (each setting's text too) and the LLM usage page are behind an **i** next to the title: a click shows
+  the text in a small card (a second click, Escape or a click elsewhere closes it). The tabs are bigger.
+* **Learned by the agent** is a section of **Knowledge** (the old address `#learned` still opens it).
+* **The catalog's "note" is "guide"** (documentation, runbooks, how-tos), so that it is not taken for the users'
+  quick notes. The upgrade renames the entries, their history and their search pieces (the knowledge store too); a
+  YAML or a call with "note" still works. Search → Kind: Guides or Notes.
+* **Learned answers corrected before they are confirmed**: Edit (Learned by the agent, and To review) changes the
+  generic question and the query; *Check the query* runs it with the admin's permissions (a few rows); a changed
+  query is confirmed only if it runs. The former question and query are kept (Before the last change).
+* **Where the data of the questions was: words added by hand** (an index or a metric of a database): stemmed like
+  the questions' words, they never fade and a miss or a Not helpful never removes them (dashed chips).
+* **To review**: the groups' titles stand out from the text; *Part of…*, *Merge into…*, *Rename*, *Change…* and
+  *Edit* open a panel that their button closes again (one panel at a time on a card).
+* **The Context as documentation**: the contents (functional, technical) on the left, the page on the right, a box
+  that finds the pages by their words, the sources under each page; **Word (.docx) and PDF** of a page or of the
+  whole Context (pure Python: nothing to install).
+* **The System map** (Knowledge → System map, for every user of the dictionary, each seeing the parts that concern
+  the databases they may query): the architecture as the categories describe it, one column per category, each part
+  with what it does (its description, else the sentence of a document, a guide or a Context page that names it), a
+  grey line to what it is part of, and the **interactions** an admin draws (depends on, sends data to, calls,
+  reads from, runs on, triggers, monitors) as arrows; a big category folded into one box; focus on a part (what
+  touches it). Admins: Edit to move the boxes (kept), draw an interaction, write what a part is, hide a part.
+  Exports: PNG, SVG, PDF.
+* **Documents and sites behind a sign-in**: a token (Bearer), a user and a password or app token (Basic), or a
+  token in a header of its own, kept encrypted (Superset's SECRET_KEY), sent only to the document's own site (never
+  after a redirect elsewhere), never shown nor logged. **Confluence** (a page and the pages under it, or a space;
+  Data Center and Cloud) and **Bitbucket** (a repository's text files, documentation first; Data Center and Cloud)
+  are read through their APIs; other sites as web pages. Each page is cut in its own pieces for the agent's search
+  (words and meanings, in the knowledge store when PostgreSQL has pgvector, pg_textsearch, pg_trgm), with its
+  address: the agent names the page. The table says how many pieces each document has in the search.
+* **The chat panel on Superset's pages floats**: a button switches between docked (the page narrows beside it; the
+  left edge, or the arrow keys on it, set its width) and floating (moved by its title bar, resized from any edge or
+  corner, over the page: the charts do not move). Place and size are kept in the browser. Docked, it leaves the page
+  900 pixels at least (a dashboard's header needs about 850: below, its charts would go under the panel); dragged
+  further, it says to float it; in a window too small for both (under 1,220 pixels) it floats.
+* **What cannot be undone is confirmed**: every delete (a chat, a memory, a note, a document, a catalog entry, a
+  learned answer, a word of a table, a category, an interaction) asks in a small card next to the button what goes
+  with it; Cancel, Escape or a click elsewhere keeps everything.
+
+The agent:
+* **The subjects of a chat**: a follow-up ("and on the 23rd?", "which one had the most?", "in hours please", a reply
+  to the agent's question) is given its subject's messages from the start (the first exchange, the ones in between
+  shortened, the last ones in full); a question about other data starts a new subject without the earlier messages;
+  a question about an earlier subject's data goes back to it. Decided from the words, the named values, the tables
+  each subject read and the question needs; the LLM is asked in a short call only when that cannot tell; not sure:
+  the same subject. The chat shows a thin line where a subject starts or comes back. `agent.subjects=false`: the
+  last exchanges, as before.
+* **A follow-up for another day is answered for that day**: "And on the 23rd?", "Et le 23 ?", "And the day
+  before?", "la veille" are read from the day the questions before named. Such a follow-up gets its own query, with
+  the previous question's conditions, and the period check reads the earlier question with the new day in its place
+  (its "shipped", its "during the night" kept): the 23rd's query was refused as "not 22 September", and the 22nd's
+  figure came back. With no day before ("And the 2nd?" after a ranking), it is no day.
+* **A month is a month's name**: "the top 5 markets", "3 decisions", "10 junior" named a day (5 March, 3 December,
+  10 June) for the period checks of queries and charts and for the answer checks.
+* **A follow-up answered without a query restates the previous answer only**: its numbers must be in that answer;
+  one found only in an older answer of the subject ("10,000", a limit) no longer passes for a new figure ("What was
+  that book's VaR?" was answered with it): the answer is sent back for a query.
+* **The number check no longer takes 59 to 61, 24 or 1 for "found"**: the unit constants (3,600 seconds in an
+  hour, 86,400 in a day, 1,024 bytes) ground only themselves, as written; converted, they made such numbers of any
+  answer pass ("61 trades booked by voice", made up, was not sent back).
+* **A query written in the answer instead of run** (with figures no query gave) is sent back with that reason: "call
+  execute_sql with it"; still not run, the answer says no query ran.
+* **"No such field" is looked up first**: an answer that says the data has no such field or value while no tool was
+  called is sent back once to look it up (describe_data: the fields and their values; a value may be in a field with
+  another name), follow-up or not. A wrong "there is no such field" in a chat's earlier answer was repeated by the
+  next ones.
+* **Metrics: "how many" is a number of events**: a query that adds up `rate` (per-second rates) for a "how many"
+  question, or counts the samples of a gauge (a counter exported as a gauge, such as the kernel's OOM kills), is sent
+  back once with the right form (`SUM(increase)`, `SUM(INCREASE(value))`, `COUNT(DISTINCT label)`); sent again
+  unchanged, it runs.
+* **Follow-ups keep their context**: "What was *its* failure rate?", "their", "son", "leur" refer to the answer
+  before: a short question with such a word and no value of its own stays in the subject, whatever tables its other
+  words make the resolver guess (it was taken for a new subject and lost what "it" was); a question the subjects find
+  goes on from the last exchange with nothing of its own ("Which error code came up most often?") is read with the
+  previous question and keeps its conditions; "that day", "ce jour-là" are the day named before; a short question with such a day ("Compare with the day
+  before.") stays in its subject ("the ones delivered
+  that day": the period on the delivery time); "in total", "overall", "au total" take the whole, not the previous
+  answer's part.
+* **"Back to …" has the scope of the question it goes back to**: the last answer's conditions are no longer pushed
+  onto it ("Back to the September returns: how many were refunded?" after a question about one return reason was
+  counted for that reason only).
+* **The words of a subject**: words that start like a time word ("events", "declined", "market", "main",
+  "maintenance") are no longer left out when the subject of a question is decided.
+* A value the question names is kept when the query writes its table as a pattern (0.7.1).
+
+Upgrade: `pip install` and `superset supagent init` (schema 13 → 14: new nullable columns, the guides renamed);
+see INSTALL.txt. A fresh Superset 6.1.0 installed from PyPI today needs three pins (INSTALL.txt).
+
 ## 0.7.1 — 2 Oct 2026
 
 * **A value the question names is kept when the query writes its table as a pattern.** A production answer to

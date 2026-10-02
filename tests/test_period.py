@@ -211,6 +211,34 @@ def test_a_follow_up_restating_the_chats_results_needs_no_new_query(ctx, monkeyp
     assert b.usage.get("nudges") and "(Check:" in answer
 
 
+def test_a_follow_up_is_grounded_in_the_previous_answer_only(ctx, monkeypatch):
+    """A follow-up answered without a query passes when it restates the previous answer; a number found only in an
+    older answer of the subject (a limit, another book's figure) is no answer: sent back for a query."""
+    from test_agent_loop import agent_with, say
+
+    history = [{"role": "user", "content": "What is the VaR limit of the desk?"},
+               {"role": "assistant", "content": "The VaR limit of the desk is 10,000 EUR."},
+               {"role": "user", "content": "Which book lost the most on 22 September?"},
+               {"role": "assistant", "content": "EQ_BOOK_A lost the most on 22 September: -248,707 EUR."}]
+    a, _ran = agent_with(monkeypatch, [say("The VaR of that book was 10,000 EUR.")] * 3)
+    a.ask("What was that book's VaR?", history)
+    assert a.usage.get("nudges")                                         # a figure of an older answer: a query
+    b, _ran = agent_with(monkeypatch, [say("EQ_BOOK_A lost 248,707 EUR on 22 September.")])
+    b.ask("How much did it lose?", history)
+    assert not b.usage.get("nudges")                                     # the previous answer, restated
+
+
+def test_a_no_such_field_follow_up_is_sent_back_even_with_the_previous_figures(ctx, monkeypatch):
+    from test_agent_loop import agent_with, say
+
+    history = [{"role": "user", "content": "How many trades did the desk do on 23 September?"},
+               {"role": "assistant", "content": "The desk did 93 trades on 23 September."}]
+    a, _ran = agent_with(monkeypatch, [say("The data does not contain a voice field for the 93 trades. Which field "
+                                           "do you mean?")] * 3)
+    a.ask("How many of them were booked by voice?", history)
+    assert a.usage.get("nudges")                                         # looked up first, not waved through
+
+
 def test_a_follow_up_with_another_day_is_not_answered_from_the_chat(ctx, monkeypatch):
     from test_agent_loop import agent_with, say
 
@@ -373,3 +401,104 @@ def test_an_index_takes_its_datasets_main_time_column(world):
     finally:
         db.session.delete(ds)
         db.session.commit()
+
+
+def test_a_month_is_a_months_name():
+    from supagent.knowledge.period import days_named, has_period
+
+    def d(m, n):
+        return dt.date(2026, m, n)
+
+    assert days_named("Which are the top 5 markets by sales?", TODAY) == []          # not 5 March
+    assert days_named("We made 3 decisions and 10 junior hires; 2 augmented, 5 novices, 7 decimals", TODAY) == []
+    assert not has_period("Which are the top 5 markets by sales?", TODAY)
+    assert days_named("le 3 juin, le 4 sept., le 12 févr. et le 10 mars 2026", TODAY) == [d(6, 3), d(9, 4), d(2, 12),
+                                                                                         d(3, 10)]
+    assert days_named("on the 23rd of September", TODAY) == [d(9, 23)]
+    assert days_named("Sept 23 and Dec. 1", TODAY) == [d(9, 23), d(12, 1)]
+    assert days_named("le 1er août et le 15 août", TODAY) == [d(8, 1), d(8, 15)]
+
+
+def test_a_day_said_relative_to_another_needs_one():
+    from supagent.knowledge.period import anchor_of, days_named
+
+    d22, d23 = dt.date(2026, 9, 22), dt.date(2026, 9, 23)
+    assert days_named("And on the 23rd?", TODAY, anchor=d22) == [d23]
+    assert days_named("Et le 23 ?", TODAY, anchor=d22) == [d23]
+    assert days_named("And the day before?", TODAY, anchor=d23) == [d22]
+    assert days_named("Et la veille ?", TODAY, anchor=d23) == [d22]
+    assert days_named("And the next day?", TODAY, anchor=d22) == [d23]
+    assert days_named("And on the 23rd?", TODAY) == []                               # no day to be relative to
+    assert days_named("And the 2nd?", TODAY) == []
+    assert days_named("What is the 3rd largest order of 22 September?", TODAY) == [d22]      # a rank, not a day
+    assert days_named("How many failed the day before yesterday?", TODAY) == [d22]           # today - 2
+    assert days_named("Failed jobs on 23 September compared with the day before", TODAY) == [d23, d22]
+    assert days_named("the day before 23 September", TODAY) == [d22, d23]
+    assert anchor_of(["How many orders on 22 September?", "And on the 23rd?"], TODAY) == d23
+    assert anchor_of(["Which application failed most?"], TODAY) is None
+
+
+def test_a_follow_up_puts_its_own_day_in_the_earlier_question():
+    from supagent.knowledge.period import follow_up_text, named_among, whole_day
+
+    night = ["How many parcels were shipped on 22 September during the night?"]
+    t = follow_up_text("And on the 23rd?", night, TODAY)
+    assert t.startswith("How many parcels were shipped on 23 September 2026 during the night?")
+    assert whole_day(t, TODAY) is None                                  # the night stays: not the whole day
+    t = follow_up_text("And on the 23rd?", ["How many parcels were shipped on 22 September?"], TODAY)
+    assert whole_day(t, TODAY) == dt.date(2026, 9, 23)
+    assert named_among(t, ["ORDER_DATE", "SHIPPED_TIME"]) == {"SHIPPED_TIME"}        # the event next to the day
+    assert follow_up_text("And per carrier?", night, TODAY) is None                  # no day of its own
+    assert follow_up_text("And the day before?", night + ["And on the 23rd?"], TODAY).startswith(
+        "How many parcels were shipped on 22 September 2026 during the night?")
+    assert follow_up_text("And last week?", ["How many orders on 22 September?"], TODAY) == \
+        "How many orders on last week?\nAnd last week?"
+    assert follow_up_text("And on the 24th?", ["Orders from 22 to 23 September?"], TODAY) is None     # a span
+    assert follow_up_text("And the 2nd?", ["Which application failed most?"], TODAY) is None
+
+
+def test_a_follow_up_for_another_day_is_checked_on_that_day(ctx, monkeypatch):
+    from test_agent_loop import agent_with, say
+
+    history = [{"role": "user", "content": "How many parcels were shipped on 22 September?"},
+               {"role": "assistant", "content": "412 parcels were shipped on 22 September."}]
+    a, _ran = agent_with(monkeypatch, [say("412 parcels were shipped on 22 September.")] * 3)
+    answer, _trace = a.ask("And on the 23rd?", history)
+    assert a.asks_new and not a.follow_up and a.usage.get("nudges") and "(Check:" in answer   # its own query
+    assert a.intent_text.startswith("How many parcels were shipped on 22 September?")        # what it is about
+    assert a.period_text.startswith("How many parcels were shipped on 23 September 2026?")   # the day it asks
+    b, _ran = agent_with(monkeypatch, [say("ok")])
+    b.prompt("And per carrier?", history)
+    assert not b.asks_new and b.period_text == b.intent_text                          # the earlier day stays
+
+
+def test_that_day_is_the_day_named_before():
+    from supagent.knowledge.period import days_named, follow_up_text, named_among
+
+    d22 = dt.date(2026, 9, 22)
+    assert days_named("I meant the ones delivered that day.", TODAY, anchor=d22) == [d22]
+    assert days_named("Et ce jour-là ?", TODAY, anchor=d22) == [d22]
+    assert days_named("How many orders on the same day last week?", TODAY, anchor=d22) == []   # another day
+    t = follow_up_text("I meant the ones delivered that day.", ["How many late shipments were there on 22 September?"],
+                       TODAY)
+    assert t.endswith("I meant the ones delivered 22 September 2026.")
+    assert named_among(t, ["SHIPPED_TIME", "DELIVERED_TIME"]) == {"DELIVERED_TIME"}      # the follow-up's event
+
+
+def test_a_question_that_goes_on_from_the_last_exchange_is_a_follow_up(ctx, monkeypatch):
+    from test_agent_loop import agent_with, say
+
+    from supagent.agent import refers_back
+    from supagent.knowledge.topics import Decision
+
+    assert refers_back("What was its failure rate?") and refers_back("Quel est son taux d'échec ?")
+    history = [{"role": "user", "content": "How many pricing requests of pricer-eq failed on 22 September?"},
+               {"role": "assistant", "content": "37 requests failed."}]
+    a, _ran = agent_with(monkeypatch, [say("ok")])
+    a.subject = Decision(1, "no subject of its own")
+    a.prompt("Which error code came up most often?", history)
+    assert a.intent_text.startswith("How many pricing requests of pricer-eq failed")     # its context
+    b, _ran = agent_with(monkeypatch, [say("ok")])
+    b.subject = Decision(1, "the same data")                                            # a new question
+    b.prompt("Which error code came up most often?", history)
+    assert b.intent_text == "Which error code came up most often?"

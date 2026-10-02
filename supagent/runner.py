@@ -324,6 +324,35 @@ def _record_usage(message_id: int, user_id: int | None, seconds: float, llm: dic
         log.info("supagent: usage of answer %s not recorded", message_id)
 
 
+def _subject_history(earlier: list, asked: Any, answer_msg: Any, agent: Any) -> list[dict]:
+    """The subject of the question (knowledge.topics: its messages get it) and what the answer is given of the chat:
+    the messages of that subject, the queries behind its last answers ("that finding"). Never breaks an answer: on
+    an error, the last exchanges as before."""
+    from supagent.knowledge import topics
+
+    previous = [m for m in earlier if asked is None or m.id < asked.id]
+    try:
+        if asked is None:
+            raise ValueError("no question")
+        decision, hist = topics.assign(previous, asked, answer_msg, llm=getattr(agent, "llm", None))
+        db.session.query(Message).filter(Message.id.in_([asked.id, answer_msg.id])).update(
+            {"topic": decision.topic}, synchronize_session=False)
+        db.session.commit()
+        log.info("supagent: answer %s: subject %s (%s)", answer_msg.id, decision.topic, decision.how)
+        agent.subject = decision                         # the governed pipeline and the tests read it
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        log.warning("supagent: the subject of answer %s: not decided", getattr(answer_msg, "id", None), exc_info=True)
+        agent.subject = None
+        done = [m for m in previous if m.status == "done" and m.content][-topics.LEGACY_MESSAGES:]
+        hist = [{"role": m.role, "content": str(m.content or "")[:topics.HISTORY_CHARS], "message": m} for m in done]
+    out = [{"role": h["role"], "content": h["content"]} for h in hist]
+    with_rows = [(o, h["message"]) for o, h in zip(out, hist) if h["role"] == "assistant" and h["message"].results]
+    for o, m in with_rows[-QUERIES_ANSWERS:]:            # "that finding": the queries behind the last answers
+        o["queries"] = queries_of(m.results)
+    return out
+
+
 def run_answer(message_id: int, taking_over: bool = False) -> bool:
     """Compute the answer of an assistant message (status pending -> running -> done / error).
     The process that moves it from pending to running answers it, whatever the number of workers
@@ -349,12 +378,9 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
     username = user.username
     earlier = (db.session.query(Message).filter(Message.conversation_id == conv.id, Message.id < message_id)
                .order_by(Message.id).all())
-    question = next((m.content for m in reversed(earlier) if m.role == "user"), "")
-    done = [m for m in earlier[:-1] if m.status == "done" and m.content]
-    history = [{"role": m.role, "content": m.content} for m in done]
-    with_rows = [(h, m) for h, m in zip(history, done) if m.role == "assistant" and m.results]
-    for h, m in with_rows[-QUERIES_ANSWERS:]:            # "that finding": the queries behind the last answers
-        h["queries"] = queries_of(m.results)
+    asked = next((m for m in reversed(earlier) if m.role == "user"), None)
+    question = asked.content if asked is not None else ""
+    history: list[dict] = []
 
     def on_step(trace: list[dict]) -> None:
         if not _save(message_id, steps=_steps_for_page(trace)):
@@ -378,6 +404,7 @@ def run_answer(message_id: int, taking_over: bool = False) -> bool:
             agent = make_agent(username, on_step=on_step, rich_results=True, should_stop=should_stop)
             try:
                 with llm_task("answer", user_id=user_id, message_id=message_id):
+                    history = _subject_history(earlier, asked, msg, agent)
                     answer, trace = agent.ask(question, history)
             finally:
                 agent.close()

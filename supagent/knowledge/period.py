@@ -15,17 +15,39 @@ from typing import Any
 
 from superset import db
 
+from supagent.dates import MONTH_END, MONTH_WORDS
+
 MONTHS = {"jan": 1, "feb": 2, "fev": 2, "fév": 2, "mar": 3, "apr": 4, "avr": 4, "may": 5, "mai": 5, "jun": 6,
           "juin": 6, "jul": 7, "juil": 7, "aug": 8, "aou": 8, "aoû": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
           "déc": 12}
-MONTH = r"(jan|feb|f[ée]v|mar|apr|avr|may|mai|jun|juin|jul|juil|aug|ao[uû]|sep|oct|nov|d[ée]c)[a-zéû]*\.?"
-DAY_MONTH = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th|er)?\s+{MONTH}(?:\s+(\d{{4}}))?", re.I)
+MONTH = rf"({MONTH_WORDS}){MONTH_END}"            # a month's name (not "markets", "decisions"): one group
+DAY_MONTH = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th|er)?\s+(?:of\s+)?{MONTH}(?:\s+(\d{{4}}))?", re.I)
 MONTH_DAY = re.compile(rf"\b{MONTH}\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:,?\s+(\d{{4}}))?", re.I)
 ISO_DAY = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 DAY_RANGE = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th|er)?\s*(?:to|-|–|and|until|till|au|à|et)\s*(\d{{1,2}})"
                        rf"(?:st|nd|rd|th|er)?\s+{MONTH}(?:\s+(\d{{4}}))?", re.I)
 HOURS = re.compile(r"\b\d{1,2}[:h]\d{2}\b|\b\d{1,2}\s*(?:am|pm)\b|\b(night|morning|afternoon|evening|nuit|matin|soir|"
                    r"window|fen[êe]tre)\b", re.I)
+# a day said relative to another ("And on the 23rd?", "Et le 23 ?", "the day before", "la veille", "that day"): its
+# month, or its day, is the one of the day named just before it (in the same text, or else in the questions before)
+BARE_DAY = re.compile(
+    r"\b(?:the|on)\s+(?P<en>\d{1,2})(?:st|nd|rd|th)(?=\s*(?:[?.!,;:)]|$|(?:and|or|instead|too|also|then|please|at|"
+    r"as well)\b))|\ble\s+(?P<fr>\d{1,2})(?:er)?(?=\s*(?:[?.!,;:)]|$|(?:et|ou|aussi|alors|plut[ôo]t|[àa])\b))", re.I)
+TWO_DAYS_AGO = re.compile(r"\b(?:the\s+)?day\s+before\s+yesterday\b|\bavant[- ]hier\b", re.I)
+DAY_BEFORE = re.compile(r"\b(?:the\s+)?day\s+before\b(?!\s+yesterday)|\bthe\s+previous\s+day\b|\bla\s+veille\b|"
+                        r"\ble\s+jour\s+(?:d'avant|pr[ée]c[ée]dent)\b", re.I)
+DAY_AFTER = re.compile(r"\b(?:the\s+)?(?:next|following)\s+day\b|\b(?:the\s+)?day\s+after\b(?!\s+tomorrow)|"
+                       r"\ble\s+lendemain\b|\ble\s+jour\s+(?:d'apr[èe]s|suivant)\b", re.I)
+SAME_DAY = re.compile(r"\b(?:that|the same|this same) day\b(?!\s+(?:last|of last|the previous|previous|a week|one "
+                      r"week|the week|a month|of the previous|before|after)\b)|\bce jour[- ]l[àa]\b|"
+                      r"\ble m[êe]me jour\b(?!\s+(?:de la semaine|du mois|la semaine|le mois))", re.I)
+# a period that is not a day, as a follow-up gives it ("And last week?", "Et cette semaine ?")
+WINDOW = re.compile(
+    r"\b(?:last|past|previous|this|next)\s+(?:\d+\s+)?(?:weeks?|months?|years?|quarters?|days?|hours?)\b|"
+    r"\b(?:la\s+semaine|le\s+mois|l'ann[ée]e)\s+(?:derni[èe]re?|pass[ée]e?|prochaine?)\b|"
+    r"\b(?:cette|ce)\s+(?:semaine|mois|ann[ée]e|trimestre)\b|"
+    r"\b(?:les|ces)\s+\d+\s+derni[èe]r(?:e?s)\s+(?:jours|heures|semaines|mois)\b|"
+    r"\bdepuis\s+\d+\s+(?:jours|heures|semaines)\b", re.I)
 RELATIVE_DAY = {"yesterday": -1, "hier": -1, "today": 0, "aujourd'hui": 0, "aujourd hui": 0, "aujourd’hui": 0}
 PERIOD_WORDS = re.compile(
     r"\b(yesterday|today|tonight|hier|aujourd|now|right now|currently|at the moment|maintenant|en ce moment|"
@@ -53,24 +75,103 @@ def _now() -> dt.datetime:
     return now()
 
 
-def days_named(question: str, today: dt.date) -> list[dt.date]:
-    """The days the question names (23 September, September 23, 2026-09-23, yesterday, today)."""
-    out: list[dt.date] = []
-    text = question or ""
+def days_named(question: str, today: dt.date, anchor: dt.date | None = None) -> list[dt.date]:
+    """The days the question names, in order (23 September, September 23, 2026-09-23, yesterday, today; "the 23rd",
+    "the day before" from the day named before it, or from the anchor: the day of the questions before)."""
+    return list(dict.fromkeys(d for _s, _e, d, _full in _days_in(question or "", today, anchor)))
+
+
+def _explicit(text: str, today: dt.date) -> list[tuple[int, int, dt.date]]:
+    """The days written in full (23 September, September 23, 2026-09-23, yesterday, today), in order: (start, end,
+    day)."""
+    found: list[tuple[int, int, dt.date | None]] = []
     for m in DAY_MONTH.finditer(text):
-        out.append(_day(int(m.group(1)), m.group(2), m.group(3), today))
+        found.append((m.start(), m.end(), _day(int(m.group(1)), m.group(2), m.group(3), today)))
     for m in MONTH_DAY.finditer(text):
-        out.append(_day(int(m.group(2)), m.group(1), m.group(3), today))
+        found.append((m.start(), m.end(), _day(int(m.group(2)), m.group(1), m.group(3), today)))
     for m in ISO_DAY.finditer(text):
         try:
-            out.append(dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            found.append((m.start(), m.end(), dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))))
         except ValueError:
             pass
-    low = text.lower()
+    for m in TWO_DAYS_AGO.finditer(text):
+        found.append((m.start(), m.end(), today - dt.timedelta(days=2)))
+    low = TWO_DAYS_AGO.sub(lambda m: " " * len(m.group(0)), text.lower())
     for word, delta in RELATIVE_DAY.items():
-        if re.search(rf"(?<![\w']){re.escape(word)}(?![\w'])", low):
-            out.append(today + dt.timedelta(days=delta))
-    return list(dict.fromkeys(d for d in out if d is not None))
+        for m in re.finditer(rf"(?<![\w']){re.escape(word)}(?![\w'])", low):
+            found.append((m.start(), m.end(), today + dt.timedelta(days=delta)))
+    return sorted(((s, e, d) for s, e, d in found if d is not None), key=lambda x: x[0])
+
+
+def _days_in(text: str, today: dt.date, anchor: dt.date | None = None) -> list[tuple[int, int, dt.date, bool]]:
+    """Every day the text names, in order: (start, end, day, written in full). A day said relative to another
+    ("the 23rd", "le 23", "the day before", "la veille") is read from the day named just before it in the text, or
+    from one written right after it ("the day before 23 September"), or else from the anchor; with none it is no
+    day ("And the 2nd?" after "Which application failed most?")."""
+    items: list[tuple[int, int, Any, bool]] = [(s, e, d, True) for s, e, d in _explicit(text, today)]
+    for m in BARE_DAY.finditer(text):
+        items.append((m.start(), m.end(), ("day", int(m.group("en") or m.group("fr"))), False))
+    for rx, delta in ((DAY_BEFORE, -1), (DAY_AFTER, 1), (SAME_DAY, 0)):
+        for m in rx.finditer(text):
+            items.append((m.start(), m.end(), ("shift", delta), False))
+    items.sort(key=lambda x: x[0])
+    out: list[tuple[int, int, dt.date, bool]] = []
+    last = anchor
+    for i, (start, end, v, full) in enumerate(items):
+        if full:
+            out.append((start, end, v, True))
+            last = v
+            continue
+        right_after = next((x[2] for x in items[i + 1:] if x[3] and 0 <= x[0] - end <= 3), None)
+        base = right_after if v[0] == "shift" and right_after else last
+        if base is None:
+            continue
+        try:
+            day = base.replace(day=v[1]) if v[0] == "day" else base + dt.timedelta(days=v[1])
+        except ValueError:
+            continue
+        out.append((start, end, day, False))
+        last = day
+    return out
+
+
+def anchor_of(questions: list[str], today: dt.date) -> dt.date | None:
+    """The day a follow-up is relative to: the last day the questions before it named (oldest first, each one
+    read relative to the ones before)."""
+    anchor = None
+    for q in questions or []:
+        days = _days_in(q or "", today, anchor)
+        if days:
+            anchor = days[-1][2]
+    return anchor
+
+
+def follow_up_text(question: str, earlier: list[str], today: dt.date | None = None) -> str | None:
+    """The text whose period the checks read for a follow-up that names its own day or period ("And on the 23rd?",
+    "And the day before?", "Et le 23 ?", "And last week?"): the earlier question that wrote its day in full, with
+    the follow-up's day (or period) in place of it, so its other words stay ("parcels shipped on 22 September
+    during the night", then "And on the 23rd?": "parcels shipped on 23 September 2026 during the night"), then the
+    follow-up with its days written in full. None when the follow-up names no day nor period of its own (it keeps
+    the earlier one), or when one of the two names several days or a span (both are read together then)."""
+    today = today or _now().date()
+    text = question or ""
+    own = _days_in(text, today, anchor_of(earlier, today))
+    window = WINDOW.search(text)
+    if (not own and not window) or len(own) > 1 or ranges_named(text, today):
+        return None
+    base = next((q for q in reversed(earlier or []) if any(full for *_x, full in _days_in(q or "", today))), None)
+    if base is None or ranges_named(base, today):
+        return None
+    spans = [(s, e) for s, e, _d, full in _days_in(base, today) if full]
+    if len(spans) != 1:
+        return None
+    said = f"{own[0][2].day} {own[0][2]:%B %Y}" if own else window.group(0)
+    rewritten = text
+    for s, e, d, full in sorted(own, key=lambda x: -x[0]):
+        if not full:
+            rewritten = rewritten[:s] + f"{d.day} {d:%B %Y}" + rewritten[e:]
+    s, e = spans[0]
+    return f"{base[:s]}{said}{base[e:]}\n{rewritten}"
 
 
 def _day(day: int, month: str, year: str | None, today: dt.date) -> dt.date | None:

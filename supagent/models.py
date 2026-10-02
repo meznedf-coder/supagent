@@ -16,7 +16,7 @@ from superset.extensions import encrypted_field_factory
 
 from supagent.textsafe import SafeString, SafeText
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def _now() -> dt.datetime:
@@ -148,6 +148,9 @@ class Message(db.Model):  # type: ignore[name-defined]
     created_at = sa.Column(sa.DateTime, default=_now)
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)   # last progress (steps saved)
     finished_at = sa.Column(sa.DateTime)
+    # 14: the subject of the chat a question and its answer belong to (1, 2, ...): the answer is given the messages
+    # of its subject only (supagent.knowledge.topics); empty for the messages of older versions
+    topic = sa.Column(sa.Integer)
 
 
 class File(db.Model):  # type: ignore[name-defined]
@@ -248,6 +251,9 @@ class Recipe(db.Model):  # type: ignore[name-defined]
     message_id = sa.Column(sa.Integer, index=True)
     created_at = sa.Column(sa.DateTime, default=_now)
     last_used_at = sa.Column(sa.DateTime, default=_now)
+    edited_by = sa.Column(SafeString(255))       # 14: an admin changed its question or its query
+    edited_at = sa.Column(sa.DateTime)
+    previous = sa.Column(sa.JSON)                # 14: its question and query before the last change
 
 
 class Association(db.Model):  # type: ignore[name-defined]
@@ -265,6 +271,8 @@ class Association(db.Model):  # type: ignore[name-defined]
     uses = sa.Column(sa.Integer, default=1)
     messages = sa.Column(sa.JSON)                          # the answers it comes from (the last 50)
     updated_at = sa.Column(sa.DateTime, default=_now, onupdate=_now)
+    source = sa.Column(SafeString(16))                     # 14: empty (learned from the answers) | admin (by hand)
+    added_by = sa.Column(SafeString(255))                  # 14: the admin who added it
 
 
 class QueryStat(db.Model):  # type: ignore[name-defined]
@@ -376,6 +384,9 @@ class Doc(db.Model):  # type: ignore[name-defined]
     created_at = sa.Column(sa.DateTime, default=_now)
     created_by = sa.Column(SafeString(255))
     learned_hash = sa.Column(SafeString(64))                  # the content the agent read definitions from
+    reader = sa.Column(SafeString(16))                        # 14: web (empty) | confluence | bitbucket
+    auth = sa.Column(sa.JSON)                                 # 14: {"type": bearer | basic | header, "user", "header"}
+    secret = sa.Column(encrypted_field_factory.create(sa.Text))   # 14: its token or password (SECRET_KEY-encrypted)
 
 
 class Chunk(db.Model):  # type: ignore[name-defined]
@@ -555,6 +566,7 @@ class Link(db.Model):  # type: ignore[name-defined]
     status = sa.Column(SafeString(16), default="approved")
     created_at = sa.Column(sa.DateTime, default=_now)
     reviewed_by = sa.Column(SafeString(255))
+    note = sa.Column(SafeText)                  # 14: what the relation is, in a few words (the system map shows it)
 
 
 class Classified(db.Model):  # type: ignore[name-defined]
@@ -632,6 +644,35 @@ def _restem() -> None:
     db.session.flush()
 
 
+def _rename_classification(old: str, new: str) -> None:
+    """0.8: the catalog's "note" entries are "guide" entries (the users' quick notes are the notes): the entries,
+    their history and their search pieces (the knowledge store follows: store_kinds)."""
+    db.session.query(Entry).filter(Entry.classification == old).update({Entry.classification: new},
+                                                                       synchronize_session=False)
+    db.session.query(EntryVersion).filter(EntryVersion.classification == old).update(
+        {EntryVersion.classification: new}, synchronize_session=False)
+    db.session.query(Chunk).filter(Chunk.kind == old, Chunk.ref.like("entry:%")).update(
+        {Chunk.kind: new}, synchronize_session=False)
+    db.session.flush()
+    _RENAMED_KINDS.append((old, new))
+
+
+_RENAMED_KINDS: list[tuple[str, str]] = []     # done by this upgrade: the knowledge store follows after the commit
+
+
+def store_kinds() -> int:
+    """The knowledge store's pieces of the kinds renamed by this upgrade (rows changed; 0 without a store)."""
+    if not _RENAMED_KINDS:
+        return 0
+    from supagent.knowledge import pgstore
+
+    n = 0
+    for old, new in _RENAMED_KINDS:
+        n += pgstore.rename_kind(old, new, "entry:")
+    _RENAMED_KINDS.clear()
+    return n
+
+
 def create_or_upgrade() -> tuple[int, int]:
     """Create the missing tables and columns and record the schema version; (version before, after)."""
     engine = db.engine
@@ -650,6 +691,8 @@ def create_or_upgrade() -> tuple[int, int]:
                 r.status = "helpful"
     if 0 < before < 4:
         _restem()
+    if 0 < before < 14:
+        _rename_classification("note", "guide")
     if row is None:
         db.session.add(Meta(key="schema_version", value=str(SCHEMA_VERSION)))
     else:

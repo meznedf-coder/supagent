@@ -463,7 +463,7 @@ def _associations(q: list[str], found: dict[tuple, dict[str, Any]], databases: l
         d = ids.get(a.database_id)
         if d is None:
             continue
-        if a.updated_at is not None and a.updated_at < since:
+        if a.updated_at is not None and a.updated_at < since and a.source != "admin":   # an admin's never fades
             continue
         if a.kind == "metric" and live and a.database_id in live and a.name not in live[a.database_id]:
             continue

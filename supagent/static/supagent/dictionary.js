@@ -9,8 +9,9 @@
   var KIND = { metric: "metric", label: "label", family: "family", index: "index", field: "field" };
 
   // ------------------------------------------------------------------ tabs: one controller for the page
-  var MAIN = ["review", "knowledge", "data", "learned", "search"];
-  var SUBS = { knowledge: ["catalog", "memory", "context", "docs", "notes", "categories"], data: ["browse", "relations", "changes"] };
+  var MAIN = ["review", "knowledge", "data", "search"];
+  var SUBS = { knowledge: ["catalog", "memory", "docs", "notes", "context", "learned", "categories", "map"],
+               data: ["browse", "relations", "changes"] };
   var ADMIN_ONLY = ["review", "categories"];
   var loaders = {}, current = {}, active = null;
 
@@ -380,7 +381,10 @@
       st.total = d.total || 0;
       if (!whereDbs) {
         whereDbs = true;
-        (d.databases || []).forEach(function (x) { $("w-db").appendChild(el("option", { value: x.id, text: x.name })); });
+        (d.databases || []).forEach(function (x) {
+          $("w-db").appendChild(el("option", { value: x.id, text: x.name }));
+          $("w-add-db").appendChild(el("option", { value: x.id, text: x.name }));
+        });
       }
       (d.tables || []).forEach(function (t) {
         var words = el("td", { class: "where-words" });
@@ -394,11 +398,20 @@
           var chip = el("span", { class: "where-word" + (w.elsewhere ? " shared" : " own"), title: tip }, [
             el(w.elsewhere ? "span" : "strong", { class: "nm", text: w.word }),
             el("span", { class: "where-uses", text: S.num(w.uses) })]);
+          if (w.manual) {
+            chip.classList.add("manual");
+            chip.title = "Added by hand" + (w.added_by ? " by " + w.added_by : "") + ": never fades. " + tip;
+          }
           if (d.is_admin) chip.appendChild(el("button", { type: "button", class: "where-x", text: "\u00d7",
             title: "Wrong: \u201c" + w.word + "\u201d does not lead to " + t.name, "aria-label": "Wrong: " + w.word,
-            onclick: function () {
-              S.dict("POST", "where_data/forget", { word: w.word, database_id: t.database_id, kind: t.kind,
-                                                   parent: t.parent, name: t.name }).then(whereData);
+            onclick: function (ev) {
+              S.confirm(ev.currentTarget, "Remove \u201c" + w.word + "\u201d from " + t.name + "?", {
+                yes: "Remove", detail: "The agent no longer goes there for this word; new answers may teach it again." +
+                  (w.manual ? " It was added by hand." : "") }).then(function (ok) {
+                if (!ok) return;
+                S.dict("POST", "where_data/forget", { word: w.word, database_id: t.database_id, kind: t.kind,
+                                                     parent: t.parent, name: t.name }).then(whereData);
+              });
             } }));
           words.appendChild(chip);
         });
@@ -418,6 +431,90 @@
     whereTimer = setTimeout(function () { pages.where.page = 0; whereData(); }, 250);
   });
   $("w-db").addEventListener("change", function () { pages.where.page = 0; whereData(); });
+  /* an admin puts words on a table by hand: the indices and metrics of the database chosen, as suggestions */
+  var tablesOf = {};
+  $("w-add-db").addEventListener("change", function () {
+    var dbid = $("w-add-db").value, list = $("w-add-tables");
+    list.innerHTML = "";
+    if (!dbid) return;
+    var fill = function (names) { names.forEach(function (n) { list.appendChild(el("option", { value: n })); }); };
+    if (tablesOf[dbid]) { fill(tablesOf[dbid]); return; }
+    S.dict("GET", "where_data/tables?database=" + encodeURIComponent(dbid)).then(function (r) {
+      tablesOf[dbid] = (r.tables || []).map(function (x) { return x.name; });
+      fill(tablesOf[dbid]);
+    });
+  });
+  $("w-add-go").addEventListener("click", function () {
+    var res = $("w-add-result"), btn = $("w-add-go");
+    var body = { words: $("w-add-words").value, database_id: +$("w-add-db").value || null, name: $("w-add-table").value.trim() };
+    if (!body.words.trim() || !body.database_id || !body.name) {
+      res.textContent = "write the words, choose the database and the index or metric"; res.className = "result bad"; return;
+    }
+    btn.disabled = true;
+    S.dict("POST", "where_data/add", body).then(function (r) {
+      btn.disabled = false;
+      res.textContent = r.error || ("added: " + (r.words || []).join(", ") + " \u2192 " + r.name);
+      res.className = "result " + (r.error ? "bad" : "good");
+      if (!r.error) { $("w-add-words").value = ""; pages.where.page = 0; whereData(); }
+    });
+  });
+
+  /* a learned answer in edit (admins): its generic question and its query, checked on the data before it is
+     confirmed; `after`: called once saved */
+  function recipeEditor(r, box, after) {
+    var q = el("textarea", { rows: "2", class: "recipe-q", "aria-label": "The generic question", maxlength: "2000" });
+    q.value = r.question || "";
+    var code = el("textarea", { rows: Math.min(14, Math.max(4, (r.query || "").split("\n").length + 1)), class: "recipe-query",
+                                spellcheck: "false", "aria-label": "The query" });
+    code.value = r.query || "";
+    var res = el("div", { class: "result", role: "status", "aria-live": "polite" });
+    var checked = null;                                    // the query text that passed the check
+    var show = function (x) {
+      res.innerHTML = "";
+      if (x.error) { res.className = "result bad"; res.textContent = x.error; return; }
+      res.className = "result good";
+      res.appendChild(document.createTextNode(x.ok ? "The query runs: " + S.num(x.rows) + " row" + (x.rows === 1 ? "" : "s") +
+        (x.seconds !== undefined ? " in " + S.num(x.seconds) + " s" : "") + (x.columns && x.columns.length ? " (" + x.columns.join(", ") + ")" : "") :
+        (x.note || "checked")));
+      if (x.sample && x.sample.length) res.appendChild(el("pre", { class: "recipe-sample", text: x.sample.map(function (row) {
+        return row.map(function (v) { return v === null ? "" : String(v); }).join(" | "); }).join("\n") }));
+    };
+    var check = el("button", { type: "button", class: "btn small", text: "Check the query", onclick: function () {
+      check.disabled = true;
+      res.className = "result"; res.textContent = "running it with your permissions…";
+      S.dict("POST", "recipes/" + r.id + "/check", { query: code.value }).then(function (x) {
+        check.disabled = false;
+        if (!x.error) checked = code.value;
+        show(x);
+      });
+    } });
+    var save = function (confirmIt) {
+      var body = { question: q.value, query: code.value };
+      if (confirmIt) body.status = "confirmed";
+      res.className = "result"; res.textContent = "saving…";
+      return S.dict("POST", "recipes/" + r.id, body).then(function (x) {
+        if (x.error) { show(x); return; }
+        if (D.saved) D.saved();
+        after();
+      });
+    };
+    box.innerHTML = "";
+    box.appendChild(el("div", { class: "recipe-edit" }, [
+      el("label", { class: "field" }, [el("span", { text: "Question (generic: no one-off date, id or number)" }), q]),
+      el("label", { class: "field" }, [el("span", { text: (r.tool === "promql_query" ? "PromQL" : r.tool === "execute_sql" ||
+        r.tool === "export_excel" ? "SQL" : "Chart settings (JSON)") + (r.target ? " · on " + r.target : "") }), code]),
+      el("div", { class: "actions" }, [check,
+        el("button", { type: "button", class: "btn small primary", text: r.status === "confirmed" ? "Save" : "Save and confirm",
+          title: "A changed query is run first: it is confirmed only if it works", onclick: function () { save(true); } }),
+        r.status === "confirmed" ? null : el("button", { type: "button", class: "btn small", text: "Save only",
+          onclick: function () { save(false); } }),
+        el("button", { type: "button", class: "btn small", text: "Cancel", onclick: after })]),
+      res,
+      r.previous ? el("details", { class: "recipe-prev" }, [el("summary", { text: "Before the last change (" +
+        (r.edited_by || "?") + ", " + S.when(r.edited_at) + ")" }), el("div", { text: r.previous.question || "" }),
+        el("pre", { text: r.previous.query || "" })]) : null]));
+    q.focus();
+  }
 
   function recipes() {
     var st = $("r-status").value;
@@ -428,28 +525,38 @@
         var way = el("td", { class: "nm" }, [el("div", { class: "muted", text: r.tool + (r.target ? " · " + r.target : "") }),
                                              el("details", {}, [el("summary", { text: (r.query || "").slice(0, 90) + ((r.query || "").length > 90 ? "…" : "") }),
                                                                 el("pre", { text: r.query || "" })])]);
-        var actions = el("td", {});
-        if (data.is_admin) {
-          [["confirmed", "Confirm"], ["rejected", "Reject"]].forEach(function (a) {
-            if (r.status !== a[0] && r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: a[1], onclick: function () {
-              S.dict("POST", "recipes/" + r.id, { status: a[0] }).then(function () { if (D.saved) D.saved(); recipes(); });
-            } }));
-          });
-          actions.appendChild(el("button", { type: "button", class: "linkish", text: "Delete", onclick: function () {
-            if (this.dataset.sure) { S.dict("DELETE", "recipes/" + r.id).then(recipes); }
-            else { this.dataset.sure = "1"; this.textContent = "Delete: sure?"; }
-          } }));
-        }
+        var actions = el("td", { class: "row-actions" });
         var u = r.use || {};
         var q = el("td", {}, [el("div", { text: r.question }), el("div", { class: "use-why" + (r.demoted ? " bad" : r.rank > 0.2 ? " good" : ""),
-          text: r.why || "" })]);
-        tb.appendChild(el("tr", { class: r.demoted ? "demoted" : "" }, [q, way,
+          text: r.why || "" }), r.edited_by ? el("div", { class: "muted small-note", text: "edited by " + r.edited_by + ", " + S.when(r.edited_at) }) : null]);
+        var tr = el("tr", { class: r.demoted ? "demoted" : "" }, [q, way,
           el("td", { class: "num", text: r.seconds !== null && r.seconds !== undefined ? S.num(r.seconds) + " s" : "" }),
           el("td", { class: "num", title: "answers it was given to: helpful / not helpful",
                      text: u.given ? S.num(u.helpful || 0) + " / " + S.num(u.not_helpful || 0) : S.num(r.helpful || r.uses) }),
           el("td", { html: '<span class="badge ' + (r.status === "confirmed" ? "ok" : r.status === "rejected" ? "bad" : r.status === "helpful" ? "warn" : "") + '">' +
                            S.esc(r.status === "helpful" ? "helpful, to review" : r.status === "auto" ? "automatic (old)" : r.status) + "</span>" }),
-          actions]));
+          actions]);
+        if (data.is_admin) {
+          if (r.status !== "confirmed" && r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: "Confirm",
+            onclick: function () { S.dict("POST", "recipes/" + r.id, { status: "confirmed" }).then(function (x) {
+              if (x.error) { actions.appendChild(el("span", { class: "result bad", text: x.error })); return; }
+              if (D.saved) D.saved(); recipes(); }); } }));
+          if (r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: "Edit",
+            title: "Correct its question or its query (then confirm it)", onclick: function () {
+              if (tr.classList.contains("edited-row")) return;     // its editor is open below it
+              var cell = el("td", { colspan: "6" });
+              var row = el("tr", { class: "editing" }, [cell]);
+              tr.classList.add("edited-row");                       // the row stays: the editor is under it
+              tr.after(row);
+              recipeEditor(r, cell, recipes);
+            } }));
+          if (r.status !== "rejected" && r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: "Reject",
+            onclick: function () { S.dict("POST", "recipes/" + r.id, { status: "rejected" }).then(function () { if (D.saved) D.saved(); recipes(); }); } }));
+          actions.appendChild(S.sureButton("Delete", function () { S.dict("DELETE", "recipes/" + r.id).then(recipes); },
+            { ask: "Delete this learned answer?", detail: "It is no longer proposed; a new Helpful answer may teach it again. " +
+              "Reject keeps it without using it." }));
+        }
+        tb.appendChild(tr);
       });
       if (!(data.recipes || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted",
         text: "Nothing learned yet: an answer marked Helpful in the chat is learned here, for an admin to confirm or reject." })]));
@@ -478,71 +585,26 @@
     });
   }
 
-  // ------------------------------------------------------------------ Knowledge: the Context
-  function contextPage(id) {
-    S.dict("GET", "context/" + id).then(function (p) {
-      if (p.error) return;
-      var b = $("d-body");
-      b.innerHTML = "";
-      b.appendChild(el("div", { class: "muted", text: p.section + " · version " + p.version + " · " + S.when(p.updated_at) +
-        (p.author !== "agent" ? " · edited by " + p.author : "") }));
-      b.appendChild(el("h2", { id: "d-title", text: p.title }));
-      if (p.ai) b.appendChild(el("p", {}, [el("span", { class: "badge llm", text: "AI-written" }),
-        el("span", { class: "muted", text: " from the sources below; check before relying on it" })]));
-      b.appendChild(el("div", { class: "answer context-page", html: p.html }));   // Markdown made safe on the server
-      if ((p.sources || []).length) {
-        b.appendChild(el("h3", { text: "Sources" }));
-        var ol = el("ol", { class: "context-sources" });
-        p.sources.forEach(function (x) { ol.appendChild(el("li", { text: x.title + " (" + x.ref + ")" })); });
-        b.appendChild(ol);
-      }
-      if (state.admin) {
-        var area = el("textarea", { class: "context-edit", rows: "14", "aria-label": "Page" });
-        area.value = p.content;
-        var result = el("span", { class: "result" });
-        var save = el("button", { type: "button", class: "btn primary", text: "Save my version", onclick: function () {
-          save.disabled = true;
-          S.dict("POST", "context/" + p.id, { content: area.value }).then(function (r) {
-            save.disabled = false;
-            result.textContent = r.error || "saved: the agent will not write over it";
-            result.className = "result " + (r.error ? "bad" : "good");
-            if (!r.error) { if (D.saved) D.saved(); contextTab(); }
-          });
-        } });
-        var back = el("button", { type: "button", class: "btn", text: "Give it back to the agent", onclick: function () {
-          S.dict("POST", "context/" + p.id, { reset: true }).then(function (r) {
-            result.textContent = r.error || "the agent writes it again at the next build";
-            if (!r.error) { if (D.saved) D.saved(); contextTab(); }
-          });
-        } });
-        b.appendChild(el("details", { class: "context-editor" }, [el("summary", { text: "Correct this page" }), area,
-          el("div", { class: "actions" }, [save, p.author !== "agent" ? back : null, result])]));
-      }
-      openDrawer();
-    });
+  // ------------------------------------------------------------------ Knowledge: the Context, read as documentation
+  /* a reader: the contents on the left (functional, technical; a box finds the pages with some words), the page on
+     the right with what it comes from; Word or PDF of a page or of everything; admins correct a page in place */
+  var ctx = { pages: [], current: null, want: null };
+  function ctxExport(fmt, pageId) {
+    return document.body.dataset.dictionaryApi + "context/export." + fmt + (pageId ? "?page=" + pageId : "");
   }
+  $("ctx-docx").href = ctxExport("docx");
+  $("ctx-pdf").href = ctxExport("pdf");
 
   function contextTab() {
-    return S.dict("GET", "context").then(function (d) {
-      ["functional", "technical"].forEach(function (sec) {
-        var ul = $("ctx-" + sec);
-        ul.innerHTML = "";
-        (d.pages || []).filter(function (p) { return p.section === sec; }).forEach(function (p) {
-          var badge = p.ai ? el("span", { class: "badge llm", text: "AI-written" }) :
-            (p.author !== "agent" ? el("span", { class: "badge curated", text: "edited by " + p.author }) :
-              el("span", { class: "badge backend", text: "facts" }));
-          ul.appendChild(el("li", {}, [el("button", { type: "button", class: "linkish", text: p.title,
-            onclick: function () { contextPage(p.id); } }), " ", badge,
-            el("span", { class: "muted", text: " · " + S.when(p.updated_at) })]));
-        });
-        if (!ul.children.length) ul.appendChild(el("li", { class: "muted", text: "No page yet." }));
-      });
+    return S.dict("GET", "context?full=1").then(function (d) {
+      ctx.pages = d.pages || [];
       var box = $("ctx-actions");
       box.innerHTML = "";
       var last = d.last_build;
-      box.appendChild(el("span", { class: "muted", text: (d.enabled ? "Built every night from " + d.hour + ":00" :
+      box.appendChild(el("span", { class: "muted", text: (d.enabled ? "Written every night from " + d.hour + ":00" :
         "The nightly build is off (context.enabled)") + (last ? " · last build #" + last.id + ": " + last.status + ", " +
-        S.when(last.finished_at || last.started_at) : " · no build yet") }));
+        S.when(last.finished_at || last.started_at) : " · no build yet") + " · " + S.num(ctx.pages.length) + " page" +
+        (ctx.pages.length === 1 ? "" : "s") }));
       if (state.admin) {
         var res = el("span", { class: "result" });
         box.appendChild(document.createTextNode(" "));
@@ -553,7 +615,107 @@
         } }));
         box.appendChild(res);
       }
+      ["ctx-docx", "ctx-pdf"].forEach(function (id) { $(id).hidden = !ctx.pages.length; });
+      ctxToc();
+      var want = ctx.want || ctx.current;
+      ctx.want = null;
+      if (!ctx.pages.some(function (p) { return p.id === want; })) want = ctx.pages.length ? ctx.pages[0].id : null;
+      if (want) ctxShow(want);
+      else {
+        var art = $("ctx-article");
+        art.innerHTML = "";
+        art.appendChild(el("div", { class: "ctx-empty" }, [el("h3", { text: "No Context yet" }),
+          el("p", { class: "muted", text: "The Context is written every night from the documents, the catalog, the team " +
+            "memory and the dictionary of the databases you may query." + (state.admin ? " Build now writes it at once." : "") })]));
+      }
     });
+  }
+
+  function ctxMatches(p, q) {
+    return !q || (p.title + "\n" + (p.text || "")).toLowerCase().indexOf(q) >= 0;
+  }
+  function ctxToc() {
+    var toc = $("ctx-toc"), q = $("ctx-q").value.trim().toLowerCase();
+    toc.innerHTML = "";
+    [["functional", "Functional"], ["technical", "Technical"]].forEach(function (sec) {
+      var pages = ctx.pages.filter(function (p) { return p.section === sec[0] && ctxMatches(p, q); });
+      var all = ctx.pages.filter(function (p) { return p.section === sec[0]; }).length;
+      toc.appendChild(el("div", { class: "toc-head" }, [el("span", { text: sec[1] }),
+        el("span", { class: "muted", text: q ? S.num(pages.length) + " of " + S.num(all) : S.num(all) })]));
+      var ul = el("ul", { class: "toc-list" });
+      pages.forEach(function (p) {
+        var on = p.id === ctx.current;
+        ul.appendChild(el("li", {}, [el("button", { type: "button", class: "toc-item" + (on ? " on" : ""),
+          "aria-current": on ? "page" : null, onclick: function () { ctxShow(p.id); } }, [
+            el("span", { class: "toc-title", text: p.title }),
+            p.ai ? el("span", { class: "badge llm", text: "AI", title: "AI-written" }) :
+              p.author !== "agent" ? el("span", { class: "badge curated", text: "edited", title: "Edited by " + p.author }) : null])]));
+      });
+      if (!pages.length) ul.appendChild(el("li", { class: "muted toc-none", text: q ? "No page with these words." : "No page yet." }));
+      toc.appendChild(ul);
+    });
+  }
+  $("ctx-q").addEventListener("input", function () { ctxToc(); });
+
+  function ctxShow(id) {
+    var p = ctx.pages.filter(function (x) { return x.id === id; })[0];
+    if (!p) return;
+    ctx.current = id;
+    ctxToc();
+    var art = $("ctx-article");
+    art.innerHTML = "";
+    var meta = [p.section === "functional" ? "Functional" : "Technical", p.author !== "agent" ? "edited by " + p.author : null,
+                "updated " + S.when(p.updated_at), "version " + p.version].filter(Boolean).join(" · ");
+    art.appendChild(el("header", { class: "ctx-head" }, [
+      el("h2", { id: "ctx-title", text: p.title }),
+      el("div", { class: "ctx-meta" }, [p.ai ? el("span", { class: "badge llm", text: "AI-written",
+        title: "Written by the LLM from the sources below: check before relying on it" }) : null,
+        el("span", { class: "muted", text: (p.ai ? " " : "") + meta }),
+        el("span", { class: "grow" }),
+        el("span", { class: "export-label", text: "This page:" }),
+        el("a", { class: "btn small", href: ctxExport("docx", p.id), text: "Word" }),
+        el("a", { class: "btn small", href: ctxExport("pdf", p.id), text: "PDF" })])]));
+    var body = el("div", { class: "answer context-page", html: p.html || "" });   // Markdown made safe on the server
+    var first = body.firstElementChild;                  // its first heading only repeats the page's title: left out
+    if (first && /^H[1-3]$/.test(first.tagName) && first.textContent.trim().toLowerCase() === (p.title || "").trim().toLowerCase()) {
+      first.remove();
+    }
+    art.appendChild(body);
+    if ((p.sources || []).length) {
+      art.appendChild(el("details", { class: "ctx-sources" }, [el("summary", { text: "Written from " + p.sources.length + " source" +
+        (p.sources.length === 1 ? "" : "s") }), el("ol", {}, p.sources.map(function (x) {
+          return el("li", { text: x.title + " (" + x.ref + ")" }); }))]));
+    }
+    if (state.admin) {
+      var area = el("textarea", { class: "context-edit", rows: "16", "aria-label": "The page (Markdown)" });
+      area.value = p.content || "";
+      var result = el("span", { class: "result" });
+      var save = el("button", { type: "button", class: "btn primary", text: "Save my version", onclick: function () {
+        save.disabled = true;
+        S.dict("POST", "context/" + p.id, { content: area.value }).then(function (r) {
+          save.disabled = false;
+          result.textContent = r.error || "saved: the agent will not write over it";
+          result.className = "result " + (r.error ? "bad" : "good");
+          if (!r.error) { if (D.saved) D.saved(); ctx.want = p.id; contextTab(); }
+        });
+      } });
+      var back = S.sureButton("Give it back to the agent", function () {
+        S.dict("POST", "context/" + p.id, { reset: true }).then(function (r) {
+          result.textContent = r.error || "the agent writes it again at the next build";
+          if (!r.error) { if (D.saved) D.saved(); ctx.want = p.id; contextTab(); }
+        });
+      }, { cls: "btn", ask: "Give this page back to the agent?", yes: "Give it back",
+           detail: "Your version stays until the next build, which writes the page again from its sources." });
+      art.appendChild(el("details", { class: "context-editor" }, [el("summary", { text: "Correct this page" }), area,
+        el("div", { class: "actions" }, [save, p.author !== "agent" ? back : null, result])]));
+    }
+    var top = art.getBoundingClientRect().top;
+    if (top < 0) art.scrollIntoView({ block: "start" });
+  }
+
+  function contextPage(id) {                       // #open/context:<id> and the search's links: the page in the reader
+    ctx.want = id;
+    if (active === "context") contextTab(); else show("context", true);
   }
 
   // ------------------------------------------------------------------ Search: every piece found, page by page
@@ -611,7 +773,7 @@
     var m = /^([a-z]+):(\d+)$/.exec(ref || "");
     if (!m) return;
     var kind = m[1], id = +m[2];
-    var tab = { object: "browse", context: "context", entry: "catalog", memory: "memory", doc: "docs", note: "notes",
+    var tab = { object: "browse", entry: "catalog", memory: "memory", doc: "docs", note: "notes",
                 recipe: "learned" }[kind];
     if (!stay && tab) show(tab, true);
     if (kind === "object") { detail(id); return; }

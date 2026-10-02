@@ -692,6 +692,21 @@ def sync(prefixes: tuple[str, ...] | None = None, chats: bool = True, names: boo
     return out
 
 
+def rename_kind(old: str, new: str, ref_prefix: str) -> int:
+    """The pieces of a kind renamed by an upgrade (0.8: the catalog's notes are guides): their kind in the store
+    (sync compares contents, not kinds). 0 without a store."""
+    st = state(fresh=True)
+    e = engine()
+    if not st or e is None:
+        return 0
+    doc = _q(f"doc_{int(st['version'])}")
+    with e.connect() as con:
+        n = con.execute(text(f"UPDATE {doc} SET kind = :new WHERE kind = :old AND ref LIKE :prefix"),
+                        {"new": new, "old": old, "prefix": ref_prefix.replace("%", "") + "%"}).rowcount
+    forget_state()
+    return int(n or 0)
+
+
 def maintain() -> dict[str, Any]:
     """Hourly: everything in step (pieces, chats, routes, names), the vectors of the new chats; built again
     when a third of it changed (pg_textsearch before 0.6.1 keeps the words of deleted rows until then)."""

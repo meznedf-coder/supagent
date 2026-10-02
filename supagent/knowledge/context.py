@@ -227,7 +227,7 @@ def fact_pages(ev: dict[str, Any]) -> list[dict[str, Any]]:
             lines += ["", f"## {e['title']}", "", e["content"]]
         pages.append({"section": "functional", "slug": "glossary", "title": "Glossary", "content": "\n".join(lines),
                       "database_ids": [], "sources": [{"ref": f"entry:{e['id']}", "title": e["title"]} for e in glossary]})
-    rules = [e for e in ev["entries"] if e["classification"] in ("rule", "note")]
+    rules = [e for e in ev["entries"] if e["classification"] in ("rule", "guide")]
     if rules or ev["memory"]:
         lines = ["# Rules and facts of the team", ""]
         for e in rules:

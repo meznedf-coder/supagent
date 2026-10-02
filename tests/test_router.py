@@ -70,9 +70,9 @@ def test_confirmed_examples_override_only_when_several_agree_or_an_admin_set_one
     messages = ScriptedLLM([route_call("incident")])
     similar = [{"question": "what made the payroll run late", "route": "incident", "similarity": 0.7}]
     router.decide("why did the batch fail", llm=messages, shown=two + similar,
-                  found=[{"kind": "note", "title": "Batch chain", "facets": "aspect: technical"}])
+                  found=[{"kind": "guide", "title": "Batch chain", "facets": "aspect: technical"}])
     prompt = messages.seen[0][-1]["content"]
-    assert "incident: what made the payroll run late" in prompt and "note: Batch chain [aspect: technical]" in prompt
+    assert "incident: what made the payroll run late" in prompt and "guide: Batch chain [aspect: technical]" in prompt
     assert "why did the batch fail\n" not in prompt.split("Question:")[0]       # the same question only votes
 
 

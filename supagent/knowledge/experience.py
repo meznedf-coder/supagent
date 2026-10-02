@@ -418,7 +418,9 @@ def record_associations(message_id: int, question: str, trace: list[dict]) -> in
                                                       Association.database_id == database_id,
                                                       Association.kind == kind, Association.name == name[:512]):
             a.uses = (a.uses or 1) - 1
-            if a.uses <= 0:
+            if a.source == "admin":                     # put there by an admin: it stays (an admin removes it)
+                a.uses = max(a.uses, 1)
+            elif a.uses <= 0:
                 db.session.delete(a)
     n = 0
     for database_id, kind, name in tables:
@@ -446,11 +448,148 @@ def forget_associations(message_id: int) -> int:
             continue
         a.messages = [i for i in a.messages if i != message_id]
         a.uses = (a.uses or 1) - 1
-        if a.uses <= 0:
+        if a.source == "admin":
+            a.uses = max(a.uses, 1)
+        elif a.uses <= 0:
             db.session.delete(a)
         n += 1
     db.session.commit()
     return n
+
+
+MANUAL_USES = 2          # a word an admin put on a table weighs like two answers (learned ones go up to 3)
+
+
+def add_associations(text: str, database_id: int, name: str, by: str) -> dict[str, Any]:
+    """An admin puts words on a table by hand (the team's own words for its data): stemmed like the words of the
+    questions, on an index or a metric the dictionary knows in that database; they never fade (resolve) and a miss
+    or a Not helpful never removes them."""
+    from supagent.knowledge.resolve import terms
+    from supagent.models import Association, KObject, Source
+
+    name = (name or "").strip()
+    words = list(dict.fromkeys(terms(text or "")))[:20]
+    if not words:
+        raise RecipeError("write one or more words of the questions (the common words like 'the' or 'how' do not count)")
+    src = db.session.query(Source).filter(Source.database_id == int(database_id or 0)).first()
+    obj = None if src is None else (db.session.query(KObject).filter(
+        KObject.source_id == src.id, KObject.kind.in_(("index", "metric")), KObject.name == name,
+        KObject.gone_at.is_(None)).first())
+    if obj is None:
+        raise RecipeError(f"{name!r} is not an index or a metric the dictionary knows in that database")
+    for w in words:
+        a = (db.session.query(Association).filter_by(word=w[:64], database_id=src.database_id, kind=obj.kind, parent="",
+                                                     name=obj.name[:512]).one_or_none())
+        if a is None:
+            a = Association(word=w[:64], database_id=src.database_id, kind=obj.kind, parent="", name=obj.name[:512],
+                            uses=0, messages=[])
+            db.session.add(a)
+        a.uses = max(a.uses or 0, MANUAL_USES)
+        a.source, a.added_by = "admin", by
+        a.updated_at = dt.datetime.utcnow()
+    db.session.commit()
+    return {"words": words, "name": obj.name, "kind": obj.kind, "database_id": src.database_id}
+
+
+# --------------------------------------------------------------------------- #
+# an admin's correction of a learned answer
+# --------------------------------------------------------------------------- #
+class RecipeError(ValueError):
+    """A learned answer's correction refused (said to the admin)."""
+
+
+CHECK_ROWS = 5
+
+
+def check_recipe_query(r: Recipe, query: str) -> dict[str, Any]:
+    """Run a learned answer's query (its own or the admin's correction) as the user of the request, a few rows only:
+    {ok, rows, columns, sample, seconds}; RecipeError says why it does not run."""
+    import time
+
+    query = (query or "").strip()
+    if not query:
+        raise RecipeError("the query is empty")
+    t0 = time.time()
+    if r.tool in ("generate_chart", "update_chart"):
+        try:
+            json.loads(query)
+        except ValueError as ex:
+            raise RecipeError(f"the chart settings are not JSON: {ex}") from ex
+        return {"ok": True, "rows": 0, "columns": [], "sample": [], "note": "the chart settings are valid JSON"}
+    from superset.models.core import Database
+
+    from supagent import tools as T
+    from supagent.security import can_use_database
+
+    database = db.session.get(Database, int(r.database_id or 0)) if r.database_id else None
+    if database is None or not can_use_database(database):
+        raise RecipeError("its database is unknown or not one you may query")
+    if r.tool == "promql_query":
+        out = T.promql_query(query, database=database.id, max_series=CHECK_ROWS)
+        if out.get("error"):
+            raise RecipeError(str(out["error"])[:600])
+        series = out.get("series") or []
+        return {"ok": True, "rows": int(out.get("series_count") or len(series)), "columns": ["series"],
+                "sample": [[json.dumps(x.get("labels") or x.get("metric") or {}, default=str)[:200]] for x in series[:CHECK_ROWS]],
+                "seconds": round(time.time() - t0, 2)}
+    refused = guard_sql(database, query)
+    if refused:
+        raise RecipeError(refused)
+    try:
+        columns, rows, _cut = T._run(database, query, CHECK_ROWS, extract=False)
+    except Exception as ex:  # pylint: disable=broad-except   (said to the admin)
+        db.session.rollback()
+        hint = T.unknown_tables(database, query)
+        raise RecipeError((hint + " " if hint else "") + f"{type(ex).__name__}: {str(ex)[:600]}") from ex
+    return {"ok": True, "rows": len(rows), "columns": [str(c) for c in columns],
+            "sample": [[v if isinstance(v, (int, float, str, type(None))) else str(v) for v in row] for row in rows[:CHECK_ROWS]],
+            "seconds": round(time.time() - t0, 2)}
+
+
+def edit_recipe(r: Recipe, question: str | None, query: str | None, by: str) -> Recipe:
+    """An admin corrects a learned answer: its generic question (its words follow) and/or its query (its signature,
+    its tables and its call follow); the former ones are kept (previous)."""
+    import datetime as _dt
+
+    before = {"question": r.question, "query": r.query, "at": _dt.datetime.utcnow().isoformat(timespec="seconds")}
+    changed = False
+    if question is not None:
+        question = " ".join(str(question).split())[:2000]
+        if not question:
+            raise RecipeError("the question is empty")
+        if question != (r.question or ""):
+            r.question, r.words, r.generic = question, " ".join(sorted(words(question)))[:2000], True
+            changed = True
+    if query is not None:
+        query = str(query).strip()
+        if not query:
+            raise RecipeError("the query is empty")
+        if query != (r.query or "").strip():
+            tool = r.tool or "execute_sql"
+            if tool in ("generate_chart", "update_chart"):
+                try:
+                    json.loads(query)
+                except ValueError as ex:
+                    raise RecipeError(f"the chart settings are not JSON: {ex}") from ex
+                pattern = query
+            else:
+                pattern, targets = sql_pattern(query) if tool != "promql_query" else promql_pattern(query)
+                r.target = ",".join(targets)[:512]
+                args = dict(r.args or {})
+                req = dict(args["request"]) if isinstance(args.get("request"), dict) else None
+                key = "expr" if tool == "promql_query" else "sql"
+                if req is not None:
+                    req[key] = query
+                    args["request"] = req
+                else:
+                    args[key] = query
+                r.args = args
+            r.query, r.signature = query, signature(f"{tool}:{pattern}")
+            changed = True
+    if changed:
+        r.previous = before
+        r.edited_by, r.edited_at = by, _dt.datetime.utcnow()
+    return r
 
 
 def learn_from_answer(message_id: int, user_id: int, question: str, trace: list[dict]) -> dict[str, Any]:
@@ -653,9 +792,15 @@ def _counter_misuse(tree: Any, names: set[str], src: Any) -> str | None:
             + (f". The catalog's formulas for it: {hint}" if hint else "") + ".")
 
 
-def count_of_counter(database: Any, sql: str) -> str | None:
+COUNT_ASKED = re.compile(r"\b(how many|number of|count of|combien|nombre d)", re.I)
+RATE_ASKED = re.compile(r"\b(per\s+(?:second|sec|minute|min|hour)|rps|qps|throughput|rates?|par\s+(?:seconde|minute|"
+                        r"heure)|d[ée]bit|taux)\b|/\s*s\b", re.I)
+
+
+def count_of_counter(database: Any, sql: str, question: str = "") -> str | None:
     """COUNT(...) over a counter, histogram or summary of a metrics database counts samples (one per series
-    and scrape), not the requests, jobs or errors the question counts: the reason, or None."""
+    and scrape), not the requests, jobs or errors the question counts: the reason, or None. For a "how many"
+    question, COUNT(*) of a gauge's samples too (a counter exported as a gauge: node_vmstat_oom_kill)."""
     if getattr(database, "backend", None) != "promagg" or not sql or "count" not in sql.lower():
         return None
     try:
@@ -665,7 +810,8 @@ def count_of_counter(database: Any, sql: str) -> str | None:
         tree = sqlglot.parse_one(sql, read="duckdb")
     except Exception:  # pylint: disable=broad-except
         return None
-    if tree.find(exp.Count) is None:
+    counts = list(tree.find_all(exp.Count))
+    if not counts:
         return None
     ctes = {c.alias_or_name for c in tree.find_all(exp.CTE)}
     names = {t.name for t in tree.find_all(exp.Table) if t.name and t.name not in ctes}
@@ -678,14 +824,45 @@ def count_of_counter(database: Any, sql: str) -> str | None:
         KObject.source_id == src.id, KObject.kind == "metric", KObject.name.in_(names))}
     counters = sorted(n for n in names if kinds.get(n) in ("counter", "histogram", "summary")
                       or (kinds.get(n) in (None, "unknown") and n.endswith(COUNTER_SUFFIXES)))
-    if not counters:
+    if counters:
+        return (f"tool error (not run: counter): COUNT on {counters[0]} counts samples (one per series and scrape "
+                "interval), not the requests, jobs or errors it counts. For a number of events over the period use "
+                "SUM(increase) (with FILTER (WHERE ...) for a part, e.g. the 5xx codes), for a rate SUM(rate); a "
+                "histogram's events are its _count metric's increase. If you do want the number of samples (which "
+                "series have data), send this same call again.")
+    samples = [c for c in counts if isinstance(c.this, exp.Star) or (isinstance(c.this, exp.Column) and
+                                                                      c.this.name.lower() == "value")]
+    gauges = sorted(n for n in names if n in kinds)
+    if samples and gauges and COUNT_ASKED.search(question or ""):
+        return (f"tool error (not run: samples): COUNT(*) on {gauges[0]} counts its samples (one per series and "
+                "scrape interval), not what the question counts. Its samples are values: for how many series "
+                "(servers, applications) use COUNT(DISTINCT a label) with a condition on value; if its value counts "
+                "events (a counter exported as a gauge, e.g. node_vmstat_*), the events of the period are "
+                "SUM(INCREASE(value)) (per series: GROUP BY the label). If you do want the number of samples, send "
+                "this same call again.")
+    return None
+
+
+def rate_as_count(database: Any, sql: str, question: str) -> str | None:
+    """A "how many" answered with SUM(rate): per-second rates added up (one per series and time bucket), not a
+    number of requests, jobs or errors: the reason, or None (a question about a rate or a throughput: None)."""
+    if getattr(database, "backend", None) != "promagg" or not sql or "rate" not in sql.lower() \
+            or not COUNT_ASKED.search(question or "") or RATE_ASKED.search(question or ""):
         return None
-    name = counters[0]
-    return (f"tool error (not run: counter): COUNT on {name} counts samples (one per series and scrape interval), "
-            "not the requests, jobs or errors it counts. For a number of events over the period use SUM(increase) "
-            "(with FILTER (WHERE ...) for a part, e.g. the 5xx codes), for a rate SUM(rate); a histogram's events "
-            "are its _count metric's increase. If you do want the number of samples (which series have data), "
-            "send this same call again.")
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        tree = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:  # pylint: disable=broad-except
+        return None
+    for agg in tree.find_all(exp.Sum, exp.Avg):
+        if isinstance(agg.this, exp.Column) and agg.this.name.lower() == "rate":
+            return ("tool error (not run: rate): the question asks how many, and this query adds up rate, the "
+                    "per-second rate of each series in each time bucket: not a number of requests, jobs or errors. "
+                    "For the number over the period use SUM(increase) (with FILTER (WHERE ...) for a part, e.g. "
+                    "code = '500'). If a per-second rate is meant, send this same call again unchanged.")
+    return None
 
 
 def guard_sql(database: Any, sql: str) -> str | None:

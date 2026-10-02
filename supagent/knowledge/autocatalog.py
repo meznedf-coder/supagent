@@ -4,7 +4,7 @@ judgement:
   formulas        a calculated field (name = expression, on a table) of the answers users
                   confirmed: the same expression in two answers marked Helpful (or one, used
                   three times), never another expression under that name, never Not helpful
-  team memory     a rule or a fact of the team an admin approved -> a "rule" or "note" entry
+  team memory     a rule or a fact of the team an admin approved -> a "rule" or "guide" entry
                   (the memory then leaves the prompt: the entry replaces it)
   documents       definitions the LLM points at in a document an admin added, kept only when
                   the sentence is word for word in the document and reads as a definition
@@ -308,7 +308,7 @@ def team_memory() -> dict[str, list[str]]:
         e = _entry_of(origin)
         if _state(e) == "theirs" and e.deleted_at is not None:
             continue                               # a person deleted the entry, then approved the memory again
-        done = _put(origin, _short(m.text)[:255], "rule" if m.kind == "rule" else "note",
+        done = _put(origin, _short(m.text)[:255], "rule" if m.kind == "rule" else "guide",
                     m.category or "Team memory", m.text, proof)
         if done:
             out[done].append(origin)

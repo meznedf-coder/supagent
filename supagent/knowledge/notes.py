@@ -20,7 +20,7 @@ TITLE_CHARS = 120
 MAX_TAGS = 10
 MAX_VERSIONS = 20             # a note's states before its last changes: one can be put back
 SAME_SECONDS = 600            # the same text by the same author again within 10 minutes: the same note
-KIND = "teamnote"             # the pieces' kind ("note" is the catalog's)
+KIND = "teamnote"             # the pieces' kind ("guide" is the catalog's, named "note" before 0.8)
 COMMAND = re.compile(r"^\s*/(note|mynote)\b[ \t]*:?\s*", re.I)
 
 
@@ -267,7 +267,7 @@ def catalog_notes(q: str = "", limit: int = 5) -> list[dict[str, Any]]:
     from supagent.models import Entry
 
     query = db.session.query(Entry).filter(Entry.deleted_at.is_(None), Entry.enabled.is_(True),
-                                           Entry.classification == "note")
+                                           Entry.classification == "guide")
     for w in re.findall(r"\w+", (q or "").lower())[:8]:
         query = query.filter((func.lower(Entry.title).like(f"%{w}%")) | (func.lower(Entry.content).like(f"%{w}%")))
     return [{"id": e.id, "title": e.title, "text": (e.content or "")[:4000], "category": e.category,
@@ -276,13 +276,13 @@ def catalog_notes(q: str = "", limit: int = 5) -> list[dict[str, Any]]:
 
 
 def promote(n: Note, by: str) -> Any:
-    """A team note made a catalog entry (classification note) by an admin: verified from then on."""
+    """A team note made a catalog entry (classification guide) by an admin: verified from then on."""
     from supagent.knowledge.catalog import save_entry
 
     if n.scope != "team":
         raise NoteError("only a team note can become a catalog entry")
     author = authors({n.user_id}).get(n.user_id, "?")
-    e = save_entry({"title": n.title or _title_of(n.text), "classification": "note", "category": "Team notes",
+    e = save_entry({"title": n.title or _title_of(n.text), "classification": "guide", "category": "Team notes",
                     "content": f"{n.text}\n\n(From the note of {author} of {day_of(n).isoformat()}.)"}, by,
                    entry_id=n.entry_id if n.entry_id else None)
     n.entry_id = e.id

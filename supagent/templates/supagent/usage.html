@@ -3,11 +3,11 @@
 {% block content %}
 <div class="usage">
   <section class="usage-head">
-    <div>
-      <h1>LLM usage</h1>
-      <p class="muted">Every call to the LLM: what it was for (the answers in the chat, the daily learning, the
+    <div class="sec-head">
+      <h1>LLM usage</h1><button type="button" class="info" aria-controls="x-usage" aria-label="About the LLM usage">i</button>
+      <div class="explain" id="x-usage">Every call to the LLM: what it was for (the answers in the chat, the daily learning, the
         Context, the memory...), for whom, how big its context was, how much came from the LLM server's prompt
-        cache, how long it took. Admins only.</p>
+        cache, how long it took. Admins only.</div>
     </div>
     <form id="range" class="usage-range" autocomplete="off">
       <label>Period

@@ -59,6 +59,10 @@ SPECS: list[Spec] = [
     Spec("mcp.servers", [], "json", "Other MCP servers whose tools the agent may use (JSON list of {name, transport: "
          "streamable_http | sse | stdio | websocket, url or command/args, headers, description, tools, write, "
          "allow_write, roles}); needs pip install \"supagent[graph]\""),
+    Spec("agent.subjects", True, "bool", "Each question of a chat goes with the messages of its subject only: a "
+         "follow-up gets its subject from its start, a question about other data starts a new subject without the "
+         "earlier ones, a question about an earlier subject's data goes back to it (the LLM decides when the words "
+         "cannot tell). Off: the last exchanges of the chat, as before 0.8"),
     Spec("agent.router", True, "bool", "Route each question (the MOA router: functional, technical, incident, "
          "charts, observability, infrastructure) by its meaning, the knowledge it touches and the routes people "
          "confirmed: the route chooses the knowledge given first, the tools and a short instruction; not sure: "

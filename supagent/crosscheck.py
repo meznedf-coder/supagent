@@ -15,8 +15,10 @@ import logging
 import re
 from typing import Any
 
+from supagent.dates import MONTH
+
 log = logging.getLogger(__name__)
-MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|févr|mars|avr|mai|juin|juil|août|sept|déc)[a-zéû]*\.?"
+MONTHS = MONTH                                         # a month's name: "5 markets" stays a figure
 YEAR = r"(?:19|20)\d{2}"
 NOT_FIGURES = re.compile(                              # dates (with their year), times, codes and ids: not figures
     rf"\b\d{{4}}-\d{{2}}-\d{{2}}(?:[ T]\d{{2}}:\d{{2}}(?::\d{{2}})?)?\b"

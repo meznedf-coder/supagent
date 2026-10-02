@@ -48,6 +48,15 @@ def init() -> None:
 
     before, after = create_or_upgrade()
     click.echo(f"tables: schema version {before} -> {after}")
+    from supagent.models import store_kinds
+
+    try:
+        renamed = store_kinds()
+        if renamed:
+            click.echo(f"knowledge store: {renamed} pieces of the catalog's notes are guides now")
+    except Exception as ex:  # pylint: disable=broad-except   (the hourly sync and a rebuild fix the store too)
+        click.echo(f"knowledge store: the guides' kind not changed ({type(ex).__name__}: {str(ex)[:200]}); "
+                   "superset supagent store rebuild does it")
     from supagent.knowledge.memory import merge_duplicates
 
     merged = merge_duplicates()

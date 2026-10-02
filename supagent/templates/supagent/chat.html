@@ -25,9 +25,11 @@
 <div id="memory-drawer" class="drawer" hidden>
   <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="memory-h">
     <button type="button" class="close" id="memory-close" aria-label="Close">&times;</button>
-    <h2 id="memory-h">Memory</h2>
-    <p class="muted">What the agent keeps in mind in your answers: your preferences, and the team's rules. It also
-      learns them when you mark an answer Helpful, or when you say "always", "from now on", "remember"...</p>
+    <div class="sec-head"><h2 id="memory-h">Memory</h2>
+      <button type="button" class="info" aria-controls="x-memory" aria-label="About the memory">i</button></div>
+    <div class="explain" id="x-memory">What the agent keeps in mind in your answers: your preferences, and the team's
+      rules. It also learns them when you mark an answer Helpful, or when you say "always", "from now on",
+      "remember"...</div>
     <div class="edit">
       <textarea id="memory-text" rows="3" placeholder="e.g. Show durations in minutes. Yesterday means the business date D-1."
         aria-label="Something to remember"></textarea>
@@ -47,12 +49,13 @@
 <div id="notes-drawer" class="drawer" hidden>
   <div class="drawer-panel notes-panel" role="dialog" aria-modal="true" aria-labelledby="notes-h">
     <button type="button" class="close" id="notes-close" aria-label="Close">&times;</button>
-    <h2 id="notes-h">Notes</h2>
-    <p class="muted">What a meeting decided, a fact the team must not lose: write it in a few seconds. The agent finds
-      the notes when they matter, says whose note it is and of which day, and never takes one as a rule. In the question
-      box: <code>/note</code> &hellip; (for the team) or <code>/mynote</code> &hellip; (for you). Or ask the agent:
-      &ldquo;add to my note about &hellip;&rdquo;, &ldquo;undo the last change to that note&rdquo;, &ldquo;delete my note
-      about &hellip;&rdquo; (it asks first).</p>
+    <div class="sec-head"><h2 id="notes-h">Notes</h2>
+      <button type="button" class="info" aria-controls="x-notes" aria-label="About the notes">i</button></div>
+    <div class="explain" id="x-notes">What a meeting decided, a fact the team must not lose: write it in a few seconds.
+      The agent finds the notes when they matter, says whose note it is and of which day, and never takes one as a rule.
+      In the question box: <code>/note</code> &hellip; (for the team) or <code>/mynote</code> &hellip; (for you). Or ask
+      the agent: &ldquo;add to my note about &hellip;&rdquo;, &ldquo;undo the last change to that note&rdquo;,
+      &ldquo;delete my note about &hellip;&rdquo; (it asks first).</div>
     <div class="edit">
       <textarea id="note-text" rows="4" maxlength="50000" aria-label="The note"
         placeholder="e.g. Pricing weekly, 1 Oct: the FX volatility surface is rebuilt at 07:00 from now on; Anna checks the HESTON timeouts."></textarea>

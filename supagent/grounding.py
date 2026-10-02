@@ -12,13 +12,14 @@ import math
 import re
 from typing import Any, Iterable
 
+from supagent.dates import MONTH
+
 SKIP = [re.compile(p, re.S | re.I) for p in (
     r"```.*?```", r"`[^`\n]*`", r"\]\([^)]*\)", r"https?://\S+", r"/[\w./?=&%#-]+",   # code, links, paths
     r"\b\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\b", r"\b\d{1,2}[:h]\d{2}(?::\d{2})?\b",   # dates, times
     r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b", r"\b\d{1,2}\.\d{1,2}\.\d{2,4}\b",
-    r"\b\d{1,2}(?:st|nd|rd|th|er)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|f[ée]v|mars|avr|mai|"
-    r"juin|juil|ao[uû]|sept|oct|nov|d[ée]c)\w*\b",
-    r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\.?\s+\d{1,2}\b",
+    rf"\b\d{{1,2}}(?:st|nd|rd|th|er)?\s+(?:of\s+)?{MONTH}",                        # 23 September, not 5 markets
+    rf"\b{MONTH}\s+\d{{1,2}}\b",
     r"\b(?:19|20)\d{2}\b",                                                          # years
     r"\b[A-Za-z]+[-_][A-Za-z0-9_-]*\d[\w-]*\b", r"\b[A-Za-z]+\d+[\w-]*\b",          # names: srv-amer-002, p95, W-1
     r"\b[DWMY][-+]\d+\b", r"\bid\s*[:#]?\s*\d+\b", r"#\d+\b",
@@ -214,7 +215,7 @@ def derived(rows: list[list[Any]]) -> set[float]:
 def seen_numbers(messages: list[dict]) -> list[float]:
     """Every number the LLM was given before its answer (tools, question, chat, knowledge) and
     what the tools' tables give by totals and rates."""
-    values: set[float] = set(UNIT_CONSTANTS)
+    values: set[float] = set()
     for m in messages:
         content = m.get("content")
         if not isinstance(content, str) or m.get("role") == "system":
@@ -260,7 +261,9 @@ def ungrounded(answer: str, messages: list[dict]) -> list[str]:
     if candidates:
         seen = seen_numbers(messages)
         kept = [(text, readings) for text, readings in candidates
-                if not any(_close(v, tol, seen) for v, tol in readings)]
+                if not any(_close(v, tol, seen) for v, tol in readings)
+                and not any(abs(v - c) <= tol for v, tol in readings for c in UNIT_CONSTANTS)]   # as written only:
+        # a constant converted is no figure (3600 s as 60 min would make 59 to 61 of anything "found")
         # the rest of a share the answer shows too (99.00% available next to 1.00% of errors): shares only,
         # written with a % or decimals (12 jobs and 88 servers are not a share and its rest)
         share = re.compile(r"%|\d[.,]\d")

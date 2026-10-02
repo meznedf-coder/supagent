@@ -5,7 +5,7 @@
   rule / note / glossary / formula   the catalog's text entries (notes cut into parts)
   recipe           the learned answers (marked Helpful or confirmed by an admin)
   memory           the preferences, rules and facts of a user or of the team (active ones)
-  doc              the parts of the documents and sites
+  doc              the parts of the documents and sites (page by page, each with its address)
 
 `sync()` writes the pieces whose text changed (and removes the ones whose origin is gone):
 cheap, done after a learning run, a catalog change, an answer. `embed_pending()` gives the new
@@ -114,7 +114,7 @@ def _entry_pieces() -> Iterator[dict[str, Any]]:
     from supagent.knowledge.glossary import entry_terms
 
     for e in db.session.query(Entry).filter(Entry.deleted_at.is_(None), Entry.enabled.is_(True),
-                                            Entry.classification.in_(("rule", "note", "glossary", "formula"))):
+                                            Entry.classification.in_(("rule", "guide", "glossary", "formula"))):
         # a formula the agent learned on a database: found only by the users who may query it
         database_id = (e.evidence or {}).get("database_id") if e.origin and e.classification == "formula" else None
         terms = entry_terms(e) if e.classification == "glossary" else []
@@ -145,11 +145,40 @@ def _memory_pieces() -> Iterator[dict[str, Any]]:
                + (f", {m.category}" if m.category else ""), "text": m.text}
 
 
+def _doc_pages(d: Doc) -> list[tuple[str, str, str]] | None:
+    """(address, title, text) of each page of a document read page by page (doc.pages with where each page's
+    text starts in its content); None for an upload or a document read by an older version (one text)."""
+    content, pages = d.content or "", d.pages or []
+    if not pages or not all(isinstance(p, dict) and isinstance(p.get("at"), int) and isinstance(p.get("chars"), int)
+                            for p in pages):
+        return None
+    out = []
+    for p in pages:
+        if p["at"] < 0 or p["at"] + p["chars"] > len(content):
+            return None                               # the text changed without its pages: one text
+        out.append((str(p.get("url") or ""), str(p.get("title") or ""), content[p["at"]:p["at"] + p["chars"]]))
+    return out
+
+
 def _doc_pieces() -> Iterator[dict[str, Any]]:
+    """The parts of the documents: page by page (a part never mixes two pages), each named after its document
+    and its page and starting with the page's address, for the agent to say where it read it."""
     for d in db.session.query(Doc).filter(Doc.enabled.is_(True), Doc.content.isnot(None)):
-        for i, part in enumerate(split_text(d.content or "")):
-            yield {"ref": f"doc:{d.id}#{i}", "kind": "doc", "title": (d.title or d.url or f"document {d.id}")
-                   + (f" ({d.category})" if d.category else ""), "text": part}
+        name = d.title or d.url or f"document {d.id}"
+        category = f" ({d.category})" if d.category else ""
+        pages = _doc_pages(d)
+        if pages is None:
+            for i, part in enumerate(split_text(d.content or "")):
+                yield {"ref": f"doc:{d.id}#{i}", "kind": "doc", "title": name + category, "text": part}
+            continue
+        i = 0
+        for url, title, text in pages:
+            named = f"{name} \u203a {title}" if title and title != name else name
+            named = named[:480 - len(category)] + category     # the piece's title column holds 512 characters
+            for part in split_text(text):
+                yield {"ref": f"doc:{d.id}#{i}", "kind": "doc", "title": named,
+                       "text": f"Source: {url}\n{part}" if url else part}
+                i += 1
 
 
 CATALOG_COPIES = ("glossary", "rules-and-facts")       # Context pages that gather catalog entries and memories

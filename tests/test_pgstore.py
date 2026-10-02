@@ -404,3 +404,26 @@ def test_the_store_lists_a_personal_memory_to_its_author_only(store):
         db.session.query(Memory).filter(Memory.text.like("%(store privacy)%")).delete(synchronize_session=False)
         db.session.commit()
         sync(("memory:",))
+
+
+def test_the_upgrade_to_guides_follows_in_the_store(store):
+    """0.8: the catalog's notes are guides; the store's pieces follow (sync compares contents, not kinds)."""
+    import sqlalchemy as sa
+    from superset.extensions import db
+
+    from supagent.knowledge import pgstore
+    from supagent.models import Chunk
+
+    st = pgstore.state(fresh=True)
+    doc = pgstore._q(f"doc_{int(st['version'])}")
+    insert = sa.text(f"INSERT INTO {doc} (ref, kind, scope, title, body, terms, hash) "
+                     "VALUES (:ref, :kind, 'team', :title, 'text', 'words', 'h')")
+    with pgstore.engine().connect() as con:
+        con.execute(insert, {"ref": "entry:9999#0", "kind": "note", "title": "Restart the batch"})
+        con.execute(insert, {"ref": "note:9999#0", "kind": "teamnote", "title": "A user note"})
+    assert pgstore.rename_kind("note", "guide", "entry:") == 1
+    with pgstore.engine().connect() as con:
+        kinds = dict(con.execute(sa.text(f"SELECT ref, kind FROM {doc} WHERE ref = ANY(:refs)"),
+                                 {"refs": ["entry:9999#0", "note:9999#0"]}).all())
+    assert kinds == {"entry:9999#0": "guide", "note:9999#0": "teamnote"}
+    assert db.session.query(Chunk).count() >= 0                  # the session still answers

@@ -3,7 +3,7 @@ learner guesses.
 
 It is kept as separate **entries**, each edited on its own (title, classification, category,
 content), so that one edit never touches the rest: the glossary, one entry per index, groups
-of metrics, relationships, health checks, rules for the agent, notes. Every change is kept
+of metrics, relationships, health checks, rules for the agent, guides. Every change is kept
 (supagent_entry_version) and can be restored; deleting is soft.
 
 The structured entries (YAML) are merged into one catalog, the shape the tools read:
@@ -42,11 +42,13 @@ CLASSIFICATIONS = {
     "relationships": "How metric labels match index fields: YAML list of {label, index, field, description}",
     "checks": "Health checks (check_health): YAML  name: {expr, op, threshold, ...}",
     "rule": "A rule the agent always follows (text), e.g. 'Exclude UAT unless the user asks for it'",
-    "note": "Documentation, runbooks, explanations (text or Markdown), found by the agent when relevant",
+    "guide": "Guides: documentation, runbooks, how-tos, explanations (text or Markdown), found by the agent when "
+             "relevant (named \"note\" before 0.8: the users' quick notes are another thing, in Notes)",
     "formula": "A calculated field (text): name = expression, and the table it applies to, e.g. "
                "'failure_rate = 100.0 * COUNT(*) FILTER (WHERE status = 'failed') / COUNT(*)'",
 }
 STRUCTURED = ("glossary", "index", "metrics", "relationships", "checks")
+ALIASES = {"note": "guide", "notes": "guide", "guides": "guide"}     # the names of older versions and files
 AGENT = "(agent)"          # the author of the entries the agent writes (no user name has parentheses)
 
 
@@ -117,8 +119,8 @@ def rules() -> list[dict[str, str]]:
     return _entries_of("rule")
 
 
-def notes() -> list[dict[str, str]]:
-    return _entries_of("note")
+def guides() -> list[dict[str, str]]:
+    return _entries_of("guide")
 
 
 def formulas() -> list[dict[str, Any]]:
@@ -266,7 +268,7 @@ def _prefix(metric: str) -> str:
 
 def split_catalog(data: dict[str, Any]) -> list[dict[str, Any]]:
     """A whole catalog -> entries: glossary, one per index, metrics grouped by name prefix
-    (node_*, batch_*...), relationships, checks, the rest as a note."""
+    (node_*, batch_*...), relationships, checks, the rest as a guide."""
     out: list[dict[str, Any]] = []
     if data.get("glossary"):
         out.append({"title": "Glossary", "classification": "glossary", "category": "Business",
@@ -295,7 +297,7 @@ def split_catalog(data: dict[str, Any]) -> list[dict[str, Any]]:
                     "content": _dump(data["checks"])})
     rest = {k: v for k, v in data.items() if k not in ("glossary", "indices", "metrics", "checks")}
     if rest:
-        out.append({"title": "Other catalog keys", "classification": "note", "category": "Other",
+        out.append({"title": "Other catalog keys", "classification": "guide", "category": "Other",
                     "fmt": "yaml", "content": _dump(rest)})
     return out
 
@@ -321,6 +323,7 @@ def save_entry(values: dict[str, Any], by: str, entry_id: int | None = None,
 
     title = str(values.get("title") or "").strip()
     classification = str(values.get("classification") or "").strip()
+    classification = ALIASES.get(classification.lower(), classification)
     if not title:
         raise CatalogError("a title is required")
     if classification not in CLASSIFICATIONS:

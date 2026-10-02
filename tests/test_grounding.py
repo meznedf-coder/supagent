@@ -59,6 +59,13 @@ def test_conversions_and_the_question_and_the_knowledge():
     assert ungrounded("The SLA allows 250 failures a night.", msgs) == []
 
 
+def test_a_unit_constant_grounds_only_itself():
+    """3600 (seconds in an hour) said as such is fine; it does not make 59 to 61 of anything "found" in minutes."""
+    prev = [{"role": "assistant", "content": "The two most-traded products were IRS and SWAPTION, 19 trades each."}]
+    assert ungrounded("The desk had 61 trades booked by voice.", prev) == ["61"]
+    assert ungrounded("An hour is 3,600 seconds and a GiB 1,073,741,824 bytes.", []) == []
+
+
 def test_small_counts_and_years_are_not_checked():
     assert answer_numbers("The 5 busiest servers in 2026, rank 3.") == []
     assert [t for t, _r in answer_numbers("12.5% and 1,234")] == ["12.5%", "1,234"]

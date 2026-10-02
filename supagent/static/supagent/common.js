@@ -94,12 +94,117 @@
       onclick: function () { st.page++; reload(); } }));
   }
 
+  /* ---------------------------------------------------------------- a small card next to a button: the
+     explanations (the "i" buttons) and the confirmations. One at a time; Escape or a click outside closes it. */
+  var popped = null;
+  function unpop(answer) {
+    if (!popped) return;
+    var p = popped;
+    popped = null;
+    p.node.remove();
+    p.anchor.setAttribute("aria-expanded", "false");
+    document.removeEventListener("keydown", p.onKey, true);
+    document.removeEventListener("pointerdown", p.onDown, true);
+    window.removeEventListener("resize", p.place);
+    window.removeEventListener("scroll", p.place, true);
+    if (p.done) p.done(answer);
+    if (answer !== "keep" && p.anchor.isConnected) p.anchor.focus({ preventScroll: true });
+  }
+  function pop(anchor, content, opts) {
+    opts = opts || {};
+    var again = popped && popped.anchor === anchor;
+    unpop(false);
+    if (again && !opts.force) return null;          // the same button again: closed (a toggle)
+    var node = el("div", { class: "pop " + (opts.cls || ""), role: opts.role || "dialog",
+                           "aria-label": opts.label || null }, [content]);
+    document.body.appendChild(node);
+    var place = function () {
+      if (!anchor.isConnected) { unpop(false); return; }
+      var r = anchor.getBoundingClientRect(), w = node.offsetWidth, h = node.offsetHeight;
+      var vw = document.documentElement.clientWidth, vh = document.documentElement.clientHeight;
+      var left = Math.max(8, Math.min(r.left, vw - w - 8));
+      var top = r.bottom + 6;
+      if (top + h > vh - 8 && r.top - h - 6 > 8) top = r.top - h - 6;     // no room below: above
+      node.style.left = left + "px";
+      node.style.top = Math.max(8, top) + "px";
+    };
+    var onKey = function (ev) { if (ev.key === "Escape") { ev.stopPropagation(); unpop(false); } };
+    var onDown = function (ev) { if (!node.contains(ev.target) && !anchor.contains(ev.target)) unpop("keep"); };
+    popped = { node: node, anchor: anchor, done: opts.done, onKey: onKey, onDown: onDown, place: place };
+    anchor.setAttribute("aria-expanded", "true");
+    place();
+    document.addEventListener("keydown", onKey, true);
+    document.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return node;
+  }
+
+  /* an "i" button: its explanation in a small card (a second click, Escape or a click outside closes it).
+     `text`: a string, or the id of a hidden element of the page whose content is shown */
+  function info(text, label) {
+    var b = el("button", { type: "button", class: "info", "aria-expanded": "false",
+                           "aria-label": label ? "About " + label : "What is this?", title: "What is this?", text: "i" });
+    wireInfo(b, text);
+    return b;
+  }
+  function wireInfo(b, text) {
+    if (b._wired) return;
+    b._wired = true;
+    b.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var src = typeof text === "string" && text ? null : document.getElementById(b.getAttribute("aria-controls") || "");
+      var body = el("div", { class: "pop-text" });
+      if (src) body.innerHTML = src.innerHTML; else body.textContent = text || "";
+      pop(b, body, { cls: "pop-info", label: b.getAttribute("aria-label") });
+    });
+  }
+  function wireInfos(root) {
+    (root || document).querySelectorAll("button.info[aria-controls]").forEach(function (b) { wireInfo(b, null); });
+  }
+
+  /* what cannot be undone is asked twice: the first click opens a small card that says what goes, the second
+     (its red button) does it; Cancel, Escape or a click elsewhere keeps everything. No browser dialog (blocked in
+     some places, and Superset's pages hide them). `ask`: the question (a string or a function returning one),
+     `detail`: what goes with it, `yes`: the red button's word. Resolves true when confirmed. */
+  function confirm(anchor, ask, opts) {
+    opts = opts || {};
+    return new Promise(function (resolve) {
+      var yes = el("button", { type: "button", class: "btn small danger", text: opts.yes || "Delete" });
+      var no = el("button", { type: "button", class: "btn small", text: opts.no || "Cancel" });
+      var card = el("div", { class: "pop-confirm" }, [
+        el("div", { class: "pop-ask", text: typeof ask === "function" ? ask() : ask }),
+        opts.detail ? el("div", { class: "pop-detail", text: opts.detail }) : null,
+        el("div", { class: "pop-actions" }, [yes, no])]);
+      var node = pop(anchor, card, { cls: "pop-danger", role: "alertdialog", label: typeof ask === "string" ? ask : "Confirm",
+                                     force: true, done: function (a) { resolve(a === true); } });
+      if (!node) { resolve(false); return; }
+      yes.addEventListener("click", function () { unpop(true); });
+      no.addEventListener("click", function () { unpop(false); });
+      no.focus({ preventScroll: true });            // the safe choice has the focus: Enter twice deletes nothing
+    });
+  }
+  /* a button whose action is confirmed first (label: its text; run: what it does once confirmed) */
+  function sureButton(label, run, opts) {
+    opts = opts || {};
+    return el("button", { type: "button", class: opts.cls || "linkish", text: label, title: opts.title || null,
+      "aria-label": opts.aria || null, onclick: function (ev) {
+        ev.stopPropagation();
+        var b = ev.currentTarget;
+        confirm(b, opts.ask || (label + "?"), opts).then(function (ok) { if (ok) run(b); });
+      } });
+  }
+
   var body = document.body.dataset;
   window.supagent = {
     chat: function (m, p, b) { return api(body.chatApi, m, p, b); },
     dict: function (m, p, b) { return api(body.dictionaryApi, m, p, b); },
     admin: function (m, p, b) { return api(body.adminApi, m, p, b); },
     isAdmin: body.admin === "yes",
-    esc: esc, el: el, when: when, whenFull: whenFull, num: num, bytes: bytes, sourceBadge: sourceBadge, pager: pager
+    esc: esc, el: el, when: when, whenFull: whenFull, num: num, bytes: bytes, sourceBadge: sourceBadge, pager: pager,
+    pop: pop, unpop: unpop, info: info, wireInfos: wireInfos, confirm: confirm, sureButton: sureButton
   };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { wireInfos(); });
+  else wireInfos();
 })();
