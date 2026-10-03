@@ -3426,6 +3426,9 @@ def compare_logs(table: str, start: str, end: str, where: str = "", days: int = 
                     exact, edges = [], None
                     try:
                         for back in every:
+                            if time.time() - began > LOG_SECONDS:    # (checked before each query: a big table)
+                                stopped = True
+                                break
                             first = ', MIN("{0}") AS a, MAX("{0}") AS b'.format(tf) if back == windows[0] else ""
                             got = run(f'SELECT COUNT(*) AS n{first} FROM "{table}" WHERE {window(back)}{levels_on} '
                                       f'AND "{msg}" LIKE {quote("%" + piece + "%")}')
@@ -3434,6 +3437,8 @@ def compare_logs(table: str, start: str, end: str, where: str = "", days: int = 
                                 edges = got[0][1:]
                     except Exception as ex:  # pylint: disable=broad-except   (a text field the database cannot filter so)
                         uncounted = f"{type(ex).__name__}: {str(ex)[:160]}"
+                        break
+                    if stopped:                              # a pattern counted on part of its windows: not used
                         break
                     if exact[0] or any(exact[1:]):
                         p["counts"] = exact

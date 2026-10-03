@@ -1,13 +1,14 @@
-supagent 0.9.0 - the AI agent inside Apache Superset
+supagent 0.9.1 - the AI agent inside Apache Superset
 ====================================================
 
 What is in this folder
-  supagent-0.9.0-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
+  supagent-0.9.1-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
 
-Upgrading? From 0.8.x: pip install this wheel on every host, superset supagent init once (schema 14 to 15: three
+Upgrading? From 0.9.0: pip install this wheel on every host and restart (no schema change). From 0.8.x:
+pip install this wheel on every host, superset supagent init once (schema 14 to 15: three
 new nullable columns), restart ("From 0.8 to 0.9.0" below says what starts by itself and how to go back). From
 0.7.0 or 0.7.1: "Upgrade from 0.7 to 0.8.0" below (with this wheel: schema 13 to 15). From 0.6.0: the same steps
 (init then goes from schema 9 to 15). From 0.5.4: the steps of "Upgrade from 0.5.4 to 0.6.0" with this wheel
@@ -25,7 +26,7 @@ role): three packages must be pinned, or Superset itself does not start (none is
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.9.0-py3-none-any.whl
+   $PY -m pip install supagent-0.9.1-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
 
 2. Register it: one line in superset_config.py (no logic)
@@ -125,12 +126,12 @@ role): three packages must be pinned, or Superset itself does not start (none is
 From 0.8 to 0.9.0
 =================
 
-On every host  $PY -m pip install supagent-0.9.0-py3-none-any.whl, then once, on one host:
+On every host  $PY -m pip install supagent-0.9.1-py3-none-any.whl, then once, on one host:
       superset supagent init          tables: schema version 14 -> 15
 (three new nullable columns on supagent_link: detail, evidence, explained_by: the long explanation of an
 interaction, where it was found, who explained it; the sentence an older proposed interaction kept as its note
 moves to its evidence). Then restart the web servers, the Celery workers and beat. Settings -> Chat settings
-shows "supagent 0.9.0 (tables v15)".
+shows "supagent 0.9.1 (tables v15)".
 
 What starts by itself:
   - A question that asks what is wrong and why gets the system around it, two more tools (compare_groups,
@@ -211,11 +212,11 @@ What changes:
 Steps (Superset stopped for a few minutes):
  1. Stop the web servers, the Celery workers and beat, on every host.
  2. Back up: pg_dump -Fc -f superset-before-0.8.0.dump "<Superset's database>"; $PY -m pip freeze > pip-before-0.8.0.txt
- 3. On every host: $PY -m pip install supagent-0.9.0-py3-none-any.whl     ($PY -m pip show supagent: 0.9.0)
+ 3. On every host: $PY -m pip install supagent-0.9.1-py3-none-any.whl     ($PY -m pip show supagent: 0.9.1)
  4. Once, on one host: superset supagent init
       tables: schema version 13 -> 15
       knowledge store: N pieces of the catalog's notes are guides now      (when the store is used and had some)
- 5. Start everything. Checks: Settings -> Chat settings shows "supagent 0.9.0 (tables v15)"; Data dictionary ->
+ 5. Start everything. Checks: Settings -> Chat settings shows "supagent 0.9.1 (tables v15)"; Data dictionary ->
     Knowledge -> Catalog: the former notes are guides; a question in the chat answers.
 
 Back to 0.7.1: stop, pip install the 0.7.1 wheel, then in Superset's database:

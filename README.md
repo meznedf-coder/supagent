@@ -102,7 +102,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.9.0-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.9.1-py3-none-any.whl          # Superset 6.1: nothing else to install
 ```
 
 One line in `superset_config.py` registers it. It holds no logic:
@@ -1185,6 +1185,10 @@ no free slot) proposes nothing; a kind the map already has ties only the categor
 calls services: a pool named in the same line is not something it calls). A pair seen on 5 lines and 2 days at
 least waits in *To review* with its evidence ("18 lines of app_logs on 3 of the last 14 days, such as ..."), never
 drawn nor followed before an admin approves it; one drawn, proposed or rejected already is never proposed again.
+The step keeps to its time (`learn.interactions_logs_seconds`, 120 s), checked before each of its queries: up to
+about 900 small queries per log table (729 for the simulated platform's 14 days; some search a piece of text in the
+messages), the ones left over not sent (what was read is used; the next night goes on). Not timed on a large
+index: on a big or shared cluster, lower it or switch the step off.
 On a simulated batch platform, from 14 days of its logs, it found the 18 real dependencies between its applications
 and none that was not (16 of the 18 from 7 days).
 

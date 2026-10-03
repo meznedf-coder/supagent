@@ -48,6 +48,21 @@ KINDS = (
 )
 
 
+class Budget:
+    """The time the step may take, checked before each query (a table of a big cluster: the queries left are not
+    sent), and the queries sent."""
+
+    def __init__(self, seconds: float) -> None:
+        self.until, self.queries, self.cut = time.time() + max(0.0, seconds), 0, False
+
+    def left(self) -> bool:
+        if time.time() >= self.until:
+            self.cut = True
+            return False
+        self.queries += 1
+        return True
+
+
 def kind_of(pattern: str) -> str | None:
     """The kind of interaction a pattern's words state (its names, numbers and values left out), or None."""
     words = re.sub(r"<name>|'<value>'|#", " ", pattern or "")
@@ -97,7 +112,7 @@ def log_tables() -> list[dict[str, Any]]:
     return out
 
 
-def _lines(t: dict[str, Any], days: int, per_day: int) -> list[dict[str, Any]]:
+def _lines(t: dict[str, Any], days: int, per_day: int, budget: "Budget") -> list[dict[str, Any]]:
     """The latest lines of each hour of each of the last days (of any level, then of the levels that are not
     quiet): the owners' fields, the message, the day."""
     from superset.models.core import Database
@@ -118,7 +133,7 @@ def _lines(t: dict[str, Any], days: int, per_day: int) -> list[dict[str, Any]]:
         today = tools._local_now(conn).replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(days=1)
         cur = conn.cursor()
         loud: list[str] = []
-        if lvl:                                          # the levels that are not quiet (WARN, ERROR...)
+        if lvl and budget.left():                        # the levels that are not quiet (WARN, ERROR...)
             cur.execute(f'SELECT "{G.name(lvl)}", COUNT(*) AS n FROM "{table}" WHERE "{tf}" >= '
                         f'{G.lit(today - dt.timedelta(days=days))} GROUP BY "{G.name(lvl)}"')
             loud = [str(r[0]) for r in cur.fetchall() if r[0] is not None and str(r[0]).lower() not in tools.LOG_LEVELS_QUIET]
@@ -131,6 +146,8 @@ def _lines(t: dict[str, Any], days: int, per_day: int) -> list[dict[str, Any]]:
             for i in range(SLICES):
                 a, b = day + step * i, day + step * (i + 1)
                 for on in ons:
+                    if not budget.left():
+                        return out
                     cur.execute(f'SELECT {cols} FROM "{table}" WHERE "{tf}" >= {G.lit(a)} AND "{tf}" < {G.lit(b)} '
                                 f'AND "{msg}" IS NOT NULL{on} ORDER BY "{tf}" DESC LIMIT {each}')
                     for row in cur.fetchall():
@@ -148,7 +165,7 @@ PER_PATTERN = 300         # ... this many of their first and as many of their la
 #                           first runs of a night, and of the last ones)
 
 
-def _pattern_lines(t: dict[str, Any], pieces: list[str], days: int) -> list[dict[str, Any]]:
+def _pattern_lines(t: dict[str, Any], pieces: list[str], days: int, budget: "Budget") -> list[dict[str, Any]]:
     """The lines of the patterns that state an interaction, read through a piece of their text (a sample of a
     whole table misses a pattern a burst of other lines crowds out): the first and the last of each day."""
     from superset.models.core import Database
@@ -172,6 +189,8 @@ def _pattern_lines(t: dict[str, Any], pieces: list[str], days: int) -> list[dict
                 like = "'%" + piece.replace("'", "''") + "%'"
                 got: dict[tuple[Any, ...], Any] = {}
                 for order in ("ASC", "DESC"):
+                    if not budget.left():
+                        return out
                     cur.execute(f'SELECT {cols}, "{tf}" FROM "{table}" WHERE "{tf}" >= {G.lit(a)} AND "{tf}" < {G.lit(b)} '
                                 f'AND "{msg}" LIKE {like} ORDER BY "{tf}" {order} LIMIT {PER_PATTERN}')
                     for row in cur.fetchall():
@@ -273,6 +292,7 @@ def run(seconds: float = 300.0, days: int = DAYS, per_day: int = PER_DAY, propos
     from supagent.models import Link
 
     t0 = time.time()
+    budget = Budget(seconds)
     out: dict[str, Any] = {"tables": 0, "lines": 0, "proposed": 0}
     g = _graph()
     if len(g["values"]) < 2:
@@ -280,12 +300,13 @@ def run(seconds: float = 300.0, days: int = DAYS, per_day: int = PER_DAY, propos
     every: dict[tuple[int, str, int], dict[str, Any]] = {}
     where: dict[tuple[int, str, int], str] = {}
     for t in log_tables():
-        if time.time() - t0 > seconds:
+        if budget.cut or time.time() >= budget.until:
+            budget.cut = True
             out["left"] = True
             break
         check()
         try:
-            lines = _lines(t, days, per_day)
+            lines = _lines(t, days, per_day, budget)
         except Exception as ex:  # pylint: disable=broad-except   (one table not read: the others are)
             db.session.rollback()
             log.info("supagent linkfinder: %s not read (%s)", t["table"], str(ex)[:200])
@@ -293,7 +314,8 @@ def run(seconds: float = 300.0, days: int = DAYS, per_day: int = PER_DAY, propos
             continue
         try:                                     # the patterns that state an interaction, read whole
             seen = {(r.get("at"), str(r.get("message"))) for r in lines}
-            lines += [r for r in _pattern_lines(t, stating(lines), days) if (r.get("at"), str(r.get("message"))) not in seen]
+            lines += [r for r in _pattern_lines(t, stating(lines), days, budget)
+                      if (r.get("at"), str(r.get("message"))) not in seen]
         except Exception as ex:  # pylint: disable=broad-except   (the sample alone)
             db.session.rollback()
             log.info("supagent linkfinder: %s: the patterns not read whole (%s)", t["table"], str(ex)[:200])
@@ -304,6 +326,9 @@ def run(seconds: float = 300.0, days: int = DAYS, per_day: int = PER_DAY, propos
             have = every.get(key)
             if have is None or f["lines"] > have["lines"]:
                 every[key], where[key] = f, t["table"]
+    out["queries"] = budget.queries
+    if budget.cut:                                   # (what was read is used; the rest at the next run)
+        out["cut"] = f"the step's time ({seconds:g} s) ran out: the queries left were not sent"
     V = g["values"]
     if not propose:
         out["seen"] = [{"from": V[a]["name"], "kind": kind, "to": V[b]["name"], "lines": f["lines"],

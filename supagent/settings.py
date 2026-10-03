@@ -195,6 +195,9 @@ SPECS: list[Spec] = [
     Spec("learn.classify_per_run", 400, "int", "Knowledge items the daily learning classifies at most (their "
          "categories: aspect, subjects, applications, components, and the relations their texts state); the next "
          "run continues"),
+    Spec("learn.interactions_logs_seconds", 120, "int", "learn.interactions_logs: the time the step may take (checked "
+         "before each query: on a big or shared cluster the queries left are not sent, the next night goes on); "
+         "about 900 small queries a log table read whole, some of them a piece of text searched in the messages"),
     Spec("learn.interactions_logs", True, "bool", "With the classification, the recent lines of the log tables (a time "
          "field, a text field, a field of a category's values) are read for the interactions they show (\"still "
          "waiting for its inputs: A, B\", \"request to X\"): each pair seen on enough lines and days waits in To review "

@@ -1,5 +1,22 @@
 # Changes
 
+## 0.9.1 — 3 Oct 2026
+
+* **The interactions the logs show keep to their time, query by query** (`learn.interactions_logs_seconds`, 120): the
+  step sends up to about 900 small queries per log table (an hourly sample of 14 days, then the patterns that
+  state an interaction searched by a piece of their text); the time was only checked between two tables, so one
+  table of a big or shared cluster could run every one of its queries. It is now checked before each query: the
+  queries left are not sent, what was read is used, and the step's result says so with the number of queries sent
+  (the simulated platform's log table: 729 queries for 14 days, the 18 dependencies between its applications found,
+  none wrong; not timed on a large index). On a big or shared cluster, lower the time or switch the step off
+  (`learn.interactions_logs`).
+* **`compare_logs` counts line by line within its time, query by query** (40 s): the budget was checked between two
+  patterns, each of a dozen queries.
+
+Neither path is exercised by the end-to-end suite nor by the investigation suite: unit tests only (a budget that
+runs out before the first query, and in the middle of a table).
+From 0.9.0: `pip install` on every host and restart (no schema change).
+
 ## 0.9.0 — 3 Oct 2026
 
 Investigations: a question that asks what is wrong and why ("today the night batch of the billing applications is

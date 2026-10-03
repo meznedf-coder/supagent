@@ -121,3 +121,31 @@ def test_the_lines_of_a_table_that_cannot_be_read_leave_the_others(logs, app, mo
     with app.app_context():
         out = F.run()
     assert out["tables"] == 0 and out["not_read"] == ["app_logs"] and out["proposed"] == 0
+
+
+def test_the_step_keeps_to_its_time_query_by_query(logs, app, monkeypatch):
+    """0.9.1: the time of the step (learn.interactions_logs_seconds) is checked before each query: on a big or
+    shared cluster the queries left are not sent (the next night goes on), and the result says so, with the
+    queries it sent."""
+    import time as clock
+
+    b = F.Budget(0)
+    assert not b.left() and b.cut and b.queries == 0
+    b = F.Budget(60)
+    assert b.left() and b.left() and b.queries == 2 and not b.cut
+    with app.app_context():
+        nothing = F.run(seconds=0)
+        full = F.run(propose=False)
+    assert nothing["cut"].startswith("the step's time (0 s) ran out") and nothing["queries"] == 0 and nothing["proposed"] == 0
+    assert "cut" not in full and full["queries"] > 24 and full["seen"]
+    # cut in the middle of a table: what was read is used, the rest not sent
+    real, calls = clock.time, {"n": 0}
+
+    def later():
+        calls["n"] += 1
+        return real() + (3600 if calls["n"] > 40 else 0)
+    monkeypatch.setattr(F.time, "time", later)
+    with app.app_context():
+        part = F.run(seconds=60, propose=False)
+    monkeypatch.setattr(F.time, "time", real)
+    assert part["cut"] and 0 < part["queries"] < full["queries"]

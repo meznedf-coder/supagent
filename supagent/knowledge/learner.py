@@ -524,7 +524,8 @@ def _categories(run_id: int, steps: Steps, seconds: float, limit: int) -> dict[s
 
         steps.begin("interactions the logs show")
         try:
-            out["from_logs"] = logs_interactions(seconds=max(60.0, min(600.0, seconds - (time.time() - t0))))
+            budget = float(settings.get("learn.interactions_logs_seconds") or 120)
+            out["from_logs"] = logs_interactions(seconds=max(0.0, min(budget, seconds - (time.time() - t0))))
         except LearningStopped:
             raise
         except Exception as ex:  # pylint: disable=broad-except
