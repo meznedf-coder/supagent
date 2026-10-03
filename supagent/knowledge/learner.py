@@ -195,7 +195,8 @@ def changes_by_type(run_id: int, source_id: int) -> dict[str, int]:
 
 
 SCHEDULED_TRIES = 3          # a scheduled run stopped by a restart or an error is tried again, 3 times a day
-KINDS = ("learn", "context")  # runs that read the databases and use the LLM: never two at a time
+# runs that read the databases, use the LLM or rewrite the knowledge (a backup, a restore): never two at a time
+KINDS = ("learn", "context", "classify", "backup", "restore")
 
 
 def running_run() -> Run | None:
@@ -267,6 +268,7 @@ def run_learning(reason: str = "manual", databases: list[str] | None = None, llm
 
 
 def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minutes: int | None) -> dict[str, Any]:
+    from supagent.knowledge.context import classify_follows
     from supagent.knowledge.curated import apply_catalog
     from supagent.knowledge.enrich import enrich, infer_categories
     from supagent.knowledge.learn_indices import learn_indices
@@ -423,22 +425,11 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
                         db.session.rollback()
                         stats["generic_questions"] = {"error": str(ex)[:300]}
                     steps.end(**_flat(stats["generic_questions"]))
-                if llm:                               # the categories of what changed (the router's evidence)
-                    from supagent.knowledge.facets import classify
-
-                    steps.begin("categories of the knowledge")
-                    try:
-                        from supagent.llm import LLM, llm_task
-
-                        with llm_task("classify"):
-                            stats["classified"] = classify(LLM(), seconds=max(60.0, llm_deadline - time.time()),
-                                                           limit=int(settings.get("learn.classify_per_run") or 400))
-                    except LearningStopped:
-                        raise
-                    except Exception as ex:  # pylint: disable=broad-except
-                        db.session.rollback()
-                        stats["classified"] = {"error": str(ex)[:300]}
-                    steps.end(**_flat(stats["classified"]))
+                if llm and reason == "schedule" and classify_follows():
+                    stats["categories"] = "after tonight's Context build"       # (it reads what the Context says)
+                elif llm:                             # the categories of what changed (the router's evidence)
+                    stats.update(_categories(run_id, steps, max(60.0, llm_deadline - time.time()),
+                                             int(settings.get("learn.classify_per_run") or 400)))
                 check(force=True)
                 steps.begin("search index and embeddings")
                 stats["index"] = index_knowledge()
@@ -470,11 +461,179 @@ def _run_learning(reason: str, databases: list[str] | None, llm: bool, max_minut
     stats["seconds"] = round(time.time() - t0, 1)
     stats.pop("now", None)
     stats.pop("during", None)
+    use = llm_use(run_id)
+    if use:
+        stats["llm_use"] = use
     run = db.session.get(Run, run_id)
     run.status = status
     run.error = error
     run.stats = stats
     run.finished_at = dt.datetime.utcnow()
+    db.session.commit()
+    return {"run": run_id, "status": status, "error": error, **stats}
+
+
+def _categories(run_id: int, steps: Steps, seconds: float, limit: int) -> dict[str, Any]:
+    """The categories' part of a run, each piece a step with its time and counts (the daily learning's end, and
+    the classify run): the values read in the data's fields, what waits settled, the items that changed given
+    their categories by the LLM, then the interactions the documents state (learn.interactions). Returns
+    {"classified": ..., "interactions": ...}; an error of one piece is kept in its step and does not stop the
+    others."""
+    from supagent.knowledge.facets import classify
+    from supagent.knowledge.stopping import LearningStopped
+    from supagent.llm import LLM, llm_task
+
+    out: dict[str, Any] = {}
+    t0 = time.time()
+    try:
+        with llm_task("classify", run_id=run_id):
+            out["classified"] = classify(LLM(), seconds=seconds, limit=limit, steps=steps)
+    except LearningStopped:
+        raise
+    except Exception as ex:  # pylint: disable=broad-except
+        db.session.rollback()
+        log.warning("supagent learn: run %s: the categories: %s", run_id, str(ex)[:300])
+        out["classified"] = {"error": str(ex)[:300]}
+        steps.interrupted(str(ex)[:300])
+    steps.begin("categories: parts that look retired")   # proposed to an admin, never retired here
+    try:
+        from supagent.knowledge.retire import check as look_retired
+
+        out["retired"] = look_retired(seconds=min(120.0, max(20.0, seconds - (time.time() - t0))))
+    except LearningStopped:
+        raise
+    except Exception as ex:  # pylint: disable=broad-except
+        db.session.rollback()
+        out["retired"] = {"error": str(ex)[:300]}
+    steps.end(**_flat(out["retired"]))
+    if settings.get("learn.interactions"):               # what the texts say of how the parts interact
+        from supagent.knowledge.interactions import run as read_interactions
+
+        steps.begin("interactions the documents state")
+        try:
+            with llm_task("interactions", run_id=run_id):
+                out["interactions"] = read_interactions(LLM(), seconds=max(60.0, seconds - (time.time() - t0)))
+        except LearningStopped:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            db.session.rollback()
+            out["interactions"] = {"error": str(ex)[:300]}
+        steps.end(**_flat(out["interactions"]))
+    if settings.get("learn.interactions_logs"):          # what the logs say of how the parts interact (no LLM)
+        from supagent.knowledge.linkfinder import run as logs_interactions
+
+        steps.begin("interactions the logs show")
+        try:
+            out["from_logs"] = logs_interactions(seconds=max(60.0, min(600.0, seconds - (time.time() - t0))))
+        except LearningStopped:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            db.session.rollback()
+            out["from_logs"] = {"error": str(ex)[:300]}
+        steps.end(**_flat(out["from_logs"]))
+    if settings.get("learn.interactions"):
+        from supagent.knowledge.interactions import explain
+
+        steps.begin("interactions explained (short and long)")    # what to do when an investigation follows one
+        try:
+            with llm_task("interactions", run_id=run_id):
+                out["explained"] = explain(LLM(), seconds=max(60.0, seconds - (time.time() - t0)))
+        except LearningStopped:
+            raise
+        except Exception as ex:  # pylint: disable=broad-except
+            db.session.rollback()
+            out["explained"] = {"error": str(ex)[:300]}
+        steps.end(**_flat(out["explained"]))
+    return out
+
+
+def llm_use(run_id: int) -> dict[str, Any]:
+    """What a run asked of the LLM, from the calls recorded for it: calls, tokens, seconds."""
+    from sqlalchemy import func
+
+    from supagent.models import LLMCall
+
+    try:
+        n, p, c, secs, bad = db.session.query(
+            func.count(LLMCall.id), func.coalesce(func.sum(LLMCall.prompt_tokens), 0),
+            func.coalesce(func.sum(LLMCall.completion_tokens), 0), func.coalesce(func.sum(LLMCall.seconds), 0.0),
+            func.coalesce(func.sum(sa_case_not_ok()), 0)).filter(LLMCall.run_id == run_id).one()
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        return {}
+    if not n:
+        return {}
+    out = {"calls": int(n), "prompt_tokens": int(p), "completion_tokens": int(c), "seconds": round(float(secs), 1)}
+    if bad:
+        out["failed"] = int(bad)
+    return out
+
+
+def sa_case_not_ok() -> Any:
+    from sqlalchemy import case
+
+    from supagent.models import LLMCall
+
+    return case((LLMCall.ok.is_(False), 1), else_=0)
+
+
+def run_classification(reason: str = "manual", minutes: int | None = None, limit: int | None = None) -> dict[str, Any]:
+    """Classify now, as a run of its own (the settings page lists it with its steps, like a learning run): the
+    values of the categories read in the data, what waits settled, the items that changed classified by the LLM,
+    the interactions the documents state. Never while a learning run or a Context build is running; its LLM
+    calls wait while answers are being computed."""
+    from supagent.llm import background
+
+    with background():
+        return _run_classification(reason, minutes, limit)
+
+
+def _run_classification(reason: str, minutes: int | None, limit: int | None) -> dict[str, Any]:
+    from supagent.knowledge.stopping import LearningStopped, watching
+    from supagent.security import acting_as
+
+    busy = running_run()
+    run_id = _start_run(reason, kind="classify") if busy is None else None
+    if run_id is None:
+        busy = busy or running_run()
+        return {"run": busy.id if busy else None, "status": "skipped",
+                "reason": f"run {busy.id} is still {busy.status}" if busy else "another run started at the same time"}
+    stats: dict[str, Any] = {}
+    status, error = "done", None
+    t0 = time.time()
+    steps = Steps(run_id, stats)
+    seconds = 60.0 * int(minutes or 15)
+    try:
+        with watching(run_id):
+            username = learning_username()
+            stats["user"] = username
+            with acting_as(username):
+                stats.update(_categories(run_id, steps, seconds, int(limit or settings.get("learn.classify_per_run") or 400)))
+                if (stats.get("classified") or {}).get("error") or (stats.get("interactions") or {}).get("error"):
+                    status = "partial"
+                from supagent.knowledge.index import sync
+
+                steps.begin("update the search")          # the items' categories are words of the search
+                try:
+                    steps.end(**_flat(sync()))
+                except Exception as ex:  # pylint: disable=broad-except
+                    db.session.rollback()
+                    steps.end(error=str(ex)[:300])
+    except LearningStopped:
+        db.session.rollback()
+        status, error = "stopped", "stopped by an admin"
+        steps.interrupted("stopped by an admin")
+    except Exception as ex:  # pylint: disable=broad-except
+        db.session.rollback()
+        log.exception("supagent classify: run %s failed", run_id)
+        status, error = "error", "".join(traceback.format_exception_only(type(ex), ex))[-2000:]
+        steps.interrupted(error)
+    stats["seconds"] = round(time.time() - t0, 1)
+    use = llm_use(run_id)
+    if use:
+        stats["llm_use"] = use
+    run = db.session.get(Run, run_id)
+    run.status, run.error, run.stats, run.finished_at = status, error, stats, dt.datetime.utcnow()
     db.session.commit()
     return {"run": run_id, "status": status, "error": error, **stats}
 

@@ -102,7 +102,7 @@ Content-Security-Policy (Talisman nonces).
 ```bash
 # the Python of Superset's virtualenv
 PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-$PY -m pip install supagent-0.8.2-py3-none-any.whl          # Superset 6.1: nothing else to install
+$PY -m pip install supagent-0.9.0-py3-none-any.whl          # Superset 6.1: nothing else to install
 ```
 
 One line in `superset_config.py` registers it. It holds no logic:
@@ -127,9 +127,16 @@ The role **AI Agent** gives the chat and the data dictionary; the settings stay 
 Admin role. `superset init` never gives these pages to Gamma or Alpha. What a user can query
 through the agent stays what Superset lets that user query.
 
+## Upgrade from 0.8 to 0.9.0
+
+`pip install` the new wheel on every host, `superset supagent init` once ("schema version 14 -> 15": three nullable
+columns of `supagent_link`, the long explanation of an interaction, where it was found and who explained it),
+restart. What starts by itself (the investigations, `compare_logs`, the interactions explained, the classification
+after the Context) and the way back to 0.8.2 (three SQL lines): INSTALL.txt, *From 0.8 to 0.9.0*.
+
 ## Upgrade from 0.7 to 0.8.0
 
-`pip install` the new wheel on every host, `superset supagent init` once ("schema version 13 -> 14": new nullable
+`pip install` the new wheel on every host, `superset supagent init` once ("schema version 13 -> 15": new nullable
 columns, the catalog's notes renamed guides, in the knowledge store too), restart. Steps, checks and the way back
 (three SQL lines for the guides): INSTALL.txt, *Upgrade from 0.7 to 0.8.0*.
 
@@ -780,7 +787,7 @@ With `pip install "supagent[graph]"` the pipeline runs as a LangGraph graph and 
 
 Before each answer, one short LLM call reads what the question asks and chooses the kind of work it needs:
 *functional* (the business meaning or figures of the data), *technical* (how the systems work), *incident*
-(what went wrong and why over a past period), *charts* (Superset charts and dashboards themselves),
+(what went wrong and why, now or over a past period: see *Investigations*), *charts* (Superset charts and dashboards themselves),
 *observability* (is it normal, anomalies, health) or *infrastructure* (servers and services: CPU, memory,
 latency, errors, availability). Nothing in it is about one business: what is specific to a deployment comes from
 its own knowledge (shown to the router with its categories) and its own confirmed examples. The route gives the
@@ -831,9 +838,14 @@ up to date about 2 s later; a process that stops meanwhile loses nothing: the ho
 (catalog entries, memories, documents, Context pages, learned answers, indices, metric families) is classified by
 the LLM: functional or technical, its subjects, the applications and the components it is about, and its
 relations to other items and tables (about, depends on, part of, explains, runs on). The values come first from
-what people wrote (the catalog's categories, the values of application-like fields); the LLM may propose new ones.
-Tags the LLM is fairly sure of, on approved values, are used at once; an admin reviews the new values, the unsure
-tags and the relations that say two items are the same. The router and the search read the approved ones. In
+what people wrote (the categories written on catalog entries and documents); the learning reads others in the
+data (the values of the fields each category is read from, `categories.fields`) and the LLM may propose new ones.
+**Nothing the learning finds changes the categories before an admin approves it** (0.9, `categories.review_all`,
+on): the values read in the data, the categories the learning gave to the data's objects, the LLM's values, tags
+and relations all wait in *To review* (each value says whether the LLM proposed it or which field it was read
+from; a category's values found in the data are approved together in one click); no value in use is merged,
+retired or changed by the learning: a proposed value that has the name of an approved value of another category
+says so, and one click merges it. The router and the search read the approved ones. In
 *Data dictionary → Knowledge → Categories* an admin also adds a value by hand (used at once) and, with Edit,
 changes a value's category (subject, application, component) as well as its text, its description and its other
 names; a value moved or renamed onto one that exists is merged with it, items included. A value can be **part of
@@ -846,9 +858,51 @@ show which values go together, proposed as "part of" for an admin to approve. In
 changes the name of one of yours (its values follow) and the field names of any, and **Remove** takes one of yours
 away with its values and everything that names them (the items they were given to, the "part of", the interactions
 of the map), after asking and saying what goes. In To review every suggestion can
-be approved, rejected or changed first (Change…); `categories.review_all` (on by default) makes every category
-and relation the LLM finds wait for an admin, even the ones it is sure of; off, what it is sure of is used at
-once (the 0.6 behaviour).
+be approved, rejected or changed first (Change…). With `categories.review_all` off, what the LLM is sure of is
+used at once and the values of the data are approved at once (the behaviour before 0.9); the values the LLM
+proposes, the "part of" relations and the removals always wait.
+
+More about the categories in 0.9:
+
+* **What each category is**: a sentence an admin writes in *Categories → Categories and where their values come
+  from → Edit*, or on the System map (the **i** in the category's name). It is shown with the category (under its
+  name on the map) and given to the agent with the system picture and to the router with the parts a question
+  names (`categories.about`).
+* **Where each value comes from**: a value read in the data says which field of which indices and which label of
+  which metrics it was read from ("field NODE of 12 indices such as jobs, steps, alerts (Platform)", "label host
+  of 2,314 metrics such as node_cpu_seconds_total, node_load1, up (Metrics)"), in Categories, in To review and on
+  the map's panel: the tables and the fields a query about that part needs.
+* **A category read from the data is not the LLM's**: its values (hundreds of servers, hosts, environments) are
+  read once each from the fields and labels you configured, whatever the number of metrics that carry the label
+  (this is what made `superset supagent classify` take more than half an hour on a platform: every value was
+  looked up again for every metric, one query each; now a second for thousands of metrics). The LLM is neither
+  given their list nor asked to add to it; it still classifies the knowledge items into subjects, applications,
+  components and the categories you fill by hand.
+* **"Part of" is chosen in a box where you type**: the matching values are listed (the server searches the names
+  and the other names of every value, the wider categories first), several are chosen one after the other and
+  shown as chips; nothing typed lists the first values and says how many more there are. No list of thousands is
+  loaded. It is the same box in a proposed value's *Edit…* and *Part of…*, a relation's *Change…*, a new value
+  and a value's *Edit*.
+* **Parts that look retired are proposed, never retired by the learning** (*To review → Parts that look
+  retired*). Two signs: a value the learning read in the data that none of its category's fields and labels has
+  shown for `categories.retire_days` days (14; asked of the data itself over that period, and seen so by two
+  checks on two days; nothing is concluded from a list that may be cut, a query that failed, an index with no
+  time field, or data that stopped as a whole); and any value, **the ones you put by hand too**, that a document,
+  a catalog entry, a Context page or a team note says was retired or decommissioned (the sentence is shown). A
+  value put by hand with no base in the data is only ever proposed by the second sign. *Retire* keeps the value,
+  marked retired (no longer used nor drawn; adding it again by hand brings it back); *Keep* declines that reason
+  for good. A value seen again in the data loses its proposal.
+* **The classification is a run of its own**: *Settings → Daily learning → Classify now* (or `superset supagent
+  classify`) is listed with the learning runs, with its steps (the values read in the data's fields, what waits,
+  the items that changed, the categories given by the LLM, the parts that look retired, the interactions the
+  documents state, the interactions explained), their time and counts, and what it asked of the LLM (calls,
+  tokens, seconds). Never two runs at a time.
+* **Right after the Context** (0.9, `context.classify_after`, on): each Context build (the nightly one, one asked
+  in the page or with `superset supagent context --build`) is followed by the classification, which then reads
+  what the Context wrote that night with the documents, the metrics and the data: the categories of the items,
+  the part-of of the values, the interactions the texts state. The nightly learning leaves the categories to it
+  (its step says *after tonight's Context build*) unless a Context was already built that day; a learning run an
+  admin starts, or one with the Context off, does them at its end as before.
 
 **Search** (*Data dictionary → Search*, 0.7): everything the search finds for the words, as the agent searches
 (at most 500, 20 per page). Each name opens the item: charts and dashboards in Superset, everything else in the
@@ -863,12 +917,38 @@ of). One column per category (subjects, applications, components, then your own:
 part in a box with what it does: its description, else the sentence of a document, a guide or a Context page that
 names it (the one that says what it is, from a document first), and how many items are about it now (a part whose
 items are gone says so). A grey line joins a part to what it is part of; the **interactions** an admin draws
-between parts (depends on, sends data to, reads from, calls, runs on, triggers, monitors, with a few words) are
-arrows. A category with more than 18 parts is folded into one box (click it to open it); *Focus on…* shows a part
-with what it is part of, what it is made of and what it interacts with. Click a part: its panel (part of, made of,
-interactions, its knowledge in the search). Admins: **Edit** to move the boxes (their places are kept for
-everyone), draw an interaction (a part, *Draw an interaction from here*, then another part), write what a part is
-(or take the sentence found), hide a part. Exports: **PNG, SVG, PDF** (the map as drawn, the focus too).
+between parts (depends on, sends data to, reads from, calls, runs on, triggers, monitors) are arrows, with no
+text on them: a click on one shows what it is and what to do when following it (see *Every interaction
+explained*). *Focus on…* shows a part with what it is part of, what it is made of and what it interacts with. Click a
+part: its panel (part of, made of, interactions, its knowledge in the search). Admins: **Edit** to move the boxes
+(their places are kept for everyone), draw an interaction (a part, *Draw an interaction from here*, then another
+part), write what a part is (or take the sentence found), hide a part. Exports: **PNG, SVG, PDF** (the map as
+drawn, the focus too).
+
+What is shown (0.9):
+
+* **Fold and open with a click on a category's name**: its parts become one box (its name, how many, the first
+  ones) and come back with a second click, or a click on the box. Any category folds; one read from the data with
+  more than 18 parts (60 for the others) starts folded. There is no Open / Fold button any more. What a viewer
+  folds is theirs for the time of the page; in *Edit*, an admin's fold is kept as the view everyone starts from.
+* **What you see, chosen in the box above the map**: type to find categories and parts, choose several (chips);
+  nothing chosen shows everything. A category shows its parts; a part shows itself with what it is part of, what
+  it is made of (a part with parts says how many) and what it interacts with; categories and parts together show
+  the parts chosen and, around them, only those categories. Each category of the legend is also a switch, and the
+  cross in a category's name on the map hides it; *Show the hidden categories* brings them back. Only the lines
+  between what is shown are drawn, so the map of "applications, pools and services" is three clicks away. The
+  categories chosen are each viewer's own (kept in the browser, not for the others); the columns close up, and a
+  box an admin placed by hand stays next to its column.
+* **What a category is**: its description under its name, and in its panel (the **i** in its name) with how many
+  parts it has and the fields its values are read from; an admin writes it there.
+* **Full screen**: the map with its tools, its legend and its side panel on the whole screen (the browser's full
+  screen, else the whole window); *Escape* or the button comes back.
+* **Move a category** (admins, *Edit*): drag its name; its boxes follow, the ones placed by hand too. Kept for
+  everyone.
+* **Groups of categories** (admins, *Edit* → *Group categories…*): a name and the categories it holds (servers,
+  resources and network under "Infrastructure"); their columns are put side by side inside a frame with the
+  group's name. Display only: nothing changes for the categories, their values or the agent. A category is in one
+  group; a renamed or removed category is followed.
 
 The map follows the categories by itself (0.8.2): it is read again each time it is shown, when the window comes
 back and every 20 seconds while it is looked at (once a minute for who is not an admin; never while an admin
@@ -877,6 +957,264 @@ brought next to its title ("Updated: new part ..."), the new box and the new "pa
 *Show* brings them in view. An admin sees every category, the ones with no value yet too (a dashed "No value
 yet" box that leads to Categories), and how many proposed values wait in To review: the map draws the approved
 values, a proposed one comes once approved.
+
+## Investigations (0.9)
+
+"Today the night batch of the billing applications is far behind, the runs take longer than usual: why?" is not one
+query. It is finding out what is really off, where, what that depends on, what changed, and checking the cause
+before naming it. A question that asks what is wrong and why (its words: *why*, *cause*, *what happened*,
+*investigate*...; or the router's *incident* route, which covers what is wrong now as well as a past period) gets:
+
+* **The system around the question**, built without the LLM from what the team prepared and given with the
+  question: the parts it names (values of the categories: a family, an application, a pool, a service...), what
+  each consists of (the applications of a family, the servers of a pool), what they **depend on, run on, read
+  from, send data to and call** (the interactions of the System map, with their notes), one step further (what an
+  upstream application reads, the servers of the pool they run on), **where each kind of part is in the data** (the
+  fields and metric labels its category is read from), how the tables join and which field holds the usual value
+  of a measure (the catalog), the health checks. A plain question that names a family gets only what the family
+  consists of, so that "the billing applications" is counted on the right values.
+* **`compare_groups`**: what is unusual in a table, and where is it concentrated? **One call compares every
+  measure of the table** over the question's scope with the same time of each of the 8 previous days that have
+  data (their median), in total and value by value for each of the table's fields of few values (application,
+  server, step, region, version...: the ones asked first, then the others, so that the field that localizes is
+  not missed because nobody thought of it):
+  * the number of rows, each duration **against the field that holds its usual** (`usual_of` in the catalog), the
+    average of each numeric field (waits, volumes...);
+  * for a business date (`POSITION_LABEL = 'D-1'`), **the stages of the rows**: the table's time fields in the
+    order the rows reach them (scheduled, released, started, ended), each with its description from the catalog:
+    how many rows had reached it by that time of day, how long after the stage before, how many were still
+    waiting for it and since when, against the same time of day of the earlier days. The rows are the business
+    date's, as they were at that time on each day: a run not started yet counts the same way on every day. The
+    first stage that is clearly off is said first: released late (they waited for something upstream), released
+    on time but not started (they wait for a slot), started but longer.
+  * for each measure that is off, **the field that holds the change**: the one whose values that stand out hold
+    most of it on the fewest rows (the region whose every run is late, rather than the application of which a
+    third is, or the ten servers of that region); the others it is also seen on are named after it.
+  * **what the related tables hold about what stands out**: the latest records of the last 7 days that the
+    catalog's joins lead to (the changes made to that application, the alerts raised on those servers); for a
+    field nothing joins, the records whose text mentions the value (a change that says it concerns that
+    perimeter).
+
+  * **the reference days your team compares with** (`agent.compare_against`: *yesterday, 1 week ago, 4 weeks
+    ago* by default; any of yesterday, N days ago, N weeks ago, N months ago, 1 year ago, a date; weeks and
+    months are the same weekday): each figure that stands out is given on those days too ("3 now, 1 yesterday,
+    1 one week ago, 1 four weeks ago"). A figure that is **as usual against the last days and far from an older
+    reference day** is said, with where: a change that is ten days old no longer shows against the last eight
+    days, and does against four weeks ago. A question that names its own days ("compared with three months ago")
+    gets them (`against`), each compared in full: what differs from that day, and where. On a Monday, "yesterday"
+    is the Friday; a reference day with no data says so. A figure far from the last days and **the same as on
+    the same weekday of the earlier weeks** is said to be what that weekday is, not a change (twice the volume
+    every Monday).
+  * **since when**: for what stands out, the earlier days that were already off the same way ("off since
+    2026-09-17 (the 2 days before too)", or "new on this day").
+  * **a lead followed once, in the same call**: when the rows wait at a stage where they do not usually, on one
+    value of a field (the runs of one pool waiting for a slot, the orders of one country paid and not shipped),
+    the tool asks the next question itself, whatever the question's scope left out:
+    * `outside_the_scope`: **who else is there**. The rows outside the question's scope that share that value
+      during the window, against the same window of the earlier days and by the scope's own fields: "on POOL =
+      P1, the rows outside the scope during the window: 911 against 350 usually (above usual). Who they are:
+      ENVIRONMENT = TEST (562 rows, none on the earlier days)"; or that nothing else has more rows there than
+      usual. A row is there when its life overlaps the window (from its first stage to its last): a row's own
+      time moves as it advances, and would count a day in progress and a finished one differently.
+    * `the_rows_there`: **the same comparison over every row that has this value** (the business date kept, the
+      scope's other conditions left out): whether all of them are held or only the question's, what lasts
+      longer there and where (four servers of the pool three times slower), since when, and the related records
+      about it (the alerts of those servers). `agent.compare_follow` (on) turns it off; it costs about as many
+      queries again, and is not started once half of the call's time is spent.
+  * **what is off on its own**: after the first late stage, fewer rows at the later stages are its wake; a stage
+    whose rows take longer to reach it from the stage before (a run half longer once started), or are held there,
+    is said separately: a late start does not explain a longer run. Rows that wait at a stage since less long
+    than usual came late to it, and are not counted as held.
+
+  The tool knows nothing of a kind of system: a table, its time field, its numeric fields, its fields of few
+  values, its other time fields, what the catalog says of them and the joins it declares. The runs of a batch,
+  orders (created, paid, shipped), tickets or requests are compared the same way; with a business-date label in
+  the scope the rows are the business date's, else the rows of the window.
+
+  Noise is kept out: a count of 13 against 8 where counts differ from one day to the next (a count that is the
+  same every day has moved when it moves), an average over two rows, 10 s instead of 60 where the usual of all
+  is an hour, a status (its values change as a row advances, and the earlier days are read as they ended), a
+  field the runs not started do not have yet (their server), a value that holds nearly all the rows (the one kind
+  of run there is: no place to look). Four servers of seven three times slower with the three others as usual is
+  a place to look, though more than half of the values stand out. A value never seen on the earlier days stands
+  out in a count when there are more rows in all (as many rows in all are rows that moved to it). A value that
+  took the place of another (a new version of an application) is read against the history of the one it
+  replaces: "2.0 (new, in place of 1.9: x3 its usual)". A weekend is read once. A window that starts the day
+  before does not skip every other day. One measure can still be asked for its values in full (`measure:
+  "avg(FIELD)"`, `"ratio(A, B)"`, `"count"`). The result stays within the room of a tool result (about 6,500
+  characters), what it found first.
+  **A scope written loosely is read as it was meant**: a condition on a time in `where` (the rows since 01:00
+  today) would leave every earlier day empty: a date moves with each earlier day (on any time field, cast or cut
+  to its day), what is no date (since now minus six hours) is left out and said, a condition between two fields
+  or on the hour stays. `"APP" = 'a' OR "APP" = 'b' AND "ENV" = 'P'` is read with the alternatives of one field
+  taken together (in SQL the AND binds first, and 'a' would be read over every environment and every day). A
+  condition that holds only while a row is in progress (`"STATUS" = 'QUEUED'`: no row of the earlier days has
+  it) is left out and said: the stages already say how many rows wait at each. A state written as a
+  business-date label, a subquery, or a scope that matches nothing are refused with how to write it. **A
+  business date is the one of the day asked about**: on a window that ended days ago, the label D-1 is that
+  day's own, and each earlier day's own from there. When nothing stands out, the result says to answer that
+  (`next`), so that a question whose premise is wrong is not investigated for thirty calls.
+  **What one call costs**: about ten small aggregations per field (the window, the 8 earlier days, the reference
+  days), so about a hundred for nine fields, each filtered on the scope and pushed down to OpenSearch, three at a
+  time (`agent.compare_threads`; 1 on a busy cluster); a lead followed adds about sixty. After
+  `agent.compare_seconds` (45) it reads no further field and answers with what it has. With osagg 0.2.13 a call
+  takes 4 to 6 seconds on a hundred thousand rows, 8 to 10 when it follows a lead.
+* **`compare_logs`** (0.9): **what do the logs say that they do not usually?** Application logs, batch logs,
+  events in an OpenSearch index (or any table with a time field and a field of text): the lines of the window
+  (the quiet levels, INFO and DEBUG, left out unless asked) are grouped into **patterns**, what changes from one
+  line to the next left out: the numbers, the times, the ids, the names written as identifiers
+  (`GC overhead on node105: heap 97% used` and `... node107: heap 95% used` are one pattern; a list of names
+  is one name, a line cut in the middle of its list the same pattern), the quoted values. Each pattern is counted
+  against the same window of the 8 earlier days that have data, and said when it is:
+  * **new** (none on the earlier days; from 2 lines for an error, 5 for a warning), **far above its usual**
+    (twice, and beyond the day-to-day noise), or **rare** (there on fewer than half the earlier days: "there on
+    only 1 of the earlier days (2026-08-07 with 63)": a weekly job, or the start of something);
+  * as frequent as usual but **with numbers far from their usual**: each number of a line is compared by its
+    place, named by the words around it ("its number \"after [#] min\" is 60 against 30 usually (x2)"): the same
+    slow write every night, 40 s tonight against 8 s;
+  * **gone** (there on most earlier days, none now: a heartbeat that stopped), and **as every day** (a warning
+    that comes every night is no finding, and is said to be one);
+  * with **where its lines come from**, counted: the values of the table's fields of few values (the servers, the
+    applications, the steps, the loggers), and the names the lines hold when they are a few (written back in
+    the pattern when nearly all of its lines hold one: `no free slot on GRID_EU_STD for <name>`); when
+    (its first and last line); an example; the errors first, then the most lines.
+
+  The patterns are found from up to 450 lines of each level read in each window (its latest of each third),
+  scaled to the lines the window has; the ones that are said are then **counted line by line** in the database
+  (a piece of text all their lines hold), with their first and last line and where they come from counted by
+  field: a burst at the end of the window does not lean the counts or the places. A big table: after
+  40 seconds the counting stops and the rest is said to be estimated. The scope (`where`) is written as for
+  `compare_groups` (a business-date label or date moves with each earlier day); `against` gives each pattern on
+  reference days too. Nothing in it knows a kind of log: the message field is the text field of the table (the
+  one named like a message first), the level field the one named like a level. The picture of a question names
+  the log tables of its parts and their fields (*Their logs*).
+* **`system_links`**: what the System map says of any part by its name (what it is, what it is part of and
+  consists of, its interactions both ways, where its kind is in the data): to go from the part that looks wrong to
+  what it depends on, and to what depends on it. The *technical* route offers it too.
+* **Five steps**, in this order: the facts in one call (`compare_groups` on the question's table and scope, from
+  the start of the runs to now); the reading of its stages (the first that is clearly off says what kind of
+  problem it is, and fewer rows at the stages after it are its wake, while a stage off on its own is a second
+  finding to explain: released late, look upstream; waiting for a slot, who holds it is in the same result,
+  `outside_the_scope` and `the_rows_there`; longer, look at the steps, the servers, the version, the volume);
+  why (the related records it gives, what those parts depend
+  on, the health of their servers and services, their logs, the changes before it, what the team wrote of such a
+  day); the
+  check of the cause (it must cover the same runs and the same time, and what is not affected must be free of it;
+  what else happened and does not match is said to be ruled out; a day the team documented, with the effect it
+  documented, is the explanation); then the answer: what is wrong with its figures against usual, where, since
+  when, the cause with the record or the figure that shows it, what was ruled out, what could not be checked.
+* **Twice the calls** of an answer (`agent.max_steps`), and the reminder to conclude two calls before the end.
+  The calls are kept for what is not yet known: the third query of an answer that differs from earlier ones only
+  by its dates (the same query once per day) is sent back with how to get every day at once (one query grouped by
+  day, or `compare_groups`), and eight tool calls at most are run from one message of the model.
+* **A check of what is blamed**: a part of the system the answer gives as the cause must be tied to the question's
+  parts, by the System map within two steps or by a result of the answer's own queries on those parts. A part
+  that is neither (the servers of another pool that had an alert that night) is sent back once, then marked under
+  the answer.
+* **Investigation paths**: an investigation marked *Helpful* keeps its path, written generic by the LLM in the
+  background: the kind of problem, the kind of cause, the checks in their order (tools, tables, fields and metrics
+  by name; no value of that one case), what confirms the cause, what was ruled out. It waits in *To review* with
+  the answers marked Helpful (*Investigation path*; an admin corrects, confirms or rejects it) and in *Learned by
+  the agent*. Once confirmed it is given with the next investigations of that kind of problem. One symptom has
+  several known causes ("the batch is late": a late feed, servers out of memory, a release, a licence...): each
+  is its own path, and they come together, the closest and the most often found first, three with their steps and
+  the others with their cause and what confirms it; the agent is told to find which one holds, with the check
+  that tells them apart, and that another cause is possible. Nothing is kept when the answer found no cause.
+* **The path of every answer marked Helpful** (0.9): the same learning for a small request as for a big one. A
+  count, an extract, a check or a confirmation marked *Helpful* keeps, with its query, **its path**: the data it
+  used (each table with the fields its queries name, each metric with its labels) and its steps in their order
+  (the tool, what it was asked on, the shape of the query). It is read from the answer itself, without the LLM,
+  and holds no value of that one case: the dates, names and numbers of the queries are left out, and so are the
+  steps that failed. An answer that ran no query to keep (a health check, a comparison with usual, a comparison
+  of groups) is learned **as its path** (*path (no query to run)*); one that only looked things up teaches
+  nothing. The path is shown in *To review* and in *Learned by the agent* under the query, and given to the agent
+  with the learned answer for the next similar question (`its path: ...`), so that it goes to the same tables,
+  fields and metrics by the same steps. **An admin corrects it** in their own words in *Edit* (the path box under
+  the query) before confirming the answer; emptied, it goes back to what the answer did; what an admin wrote
+  stays when the same question is later answered another way. A path is given only to who may query its
+  database, like every learned answer.
+
+**What to prepare** (the more of it, the less the agent has to discover query by query):
+
+* *Categories*: the families, the applications, and your own categories (server, pool, service, feed...) with the
+  field names their values are read from (`categories.fields`: the same pattern covers the index field and the
+  metric label), and what is **part of** what (an application of a family, a server of a pool).
+* *System map*: the **interactions** between parts, with a few words each (which jobs, which step). The daily
+  learning proposes the ones your documents state (below).
+* *Catalog*: for each index its `time_field`, its `relationships` (to: another index, keys: the fields that
+  join them: `compare_groups` follows them to the changes of the application or the alerts of the servers that
+  stand out) and, on the field that holds a usual value, `usual_of: <the measured field>` (an average duration
+  kept on each run: `AVG_DURATION: {usual_of: DURATION}`); **a description of each time field** (when a run was
+  released: "when its feeds and upstream jobs were done"; started: "when it got a slot"; ended): the stages are
+  given with those words, and they say what a late stage waits for; the `relationships` between metric labels and
+  index fields; the health `checks`.
+* *Documents and guides*: how a night goes, what waits for what, the calendar (month end, maintenance windows),
+  what each alert means. They are searched, and read for interactions.
+
+**What is still missing** is listed for you, without the LLM: `superset supagent check-system` counts what the
+agent knows of the system (per category: the values, those that are part of something, those with interactions,
+the fields and metric labels they are read from; the interactions by kind; per table of the catalog: its time
+field, its joins, its usual values; the health checks; the paths) and says in words what it does not find: a
+category whose values interact on the map but are read from no field, values that were left with no interaction
+while others of their category have some, a table with no time field, a field named like a usual value
+(`AVG_...`, `USUAL_...`) whose measured field is not said, no join between the tables, no health check, what waits
+in *To review*. `--question "..."` adds what the agent is given for that question, the parts it names of which
+nothing is said, and the words it writes as names (`ABC_DEF`) that are neither a value of the categories nor a
+table, a field, a metric or a value the agent learned. Admins see the same list on the System map page (*N points
+to complete for investigations*).
+
+**Interactions proposed from your texts** (`learn.interactions`, on): with the daily learning the LLM reads each
+document, guide, Context page and team note next to the names of the known parts it mentions, and proposes how
+those interact (depends on, runs on, reads from, sends data to, calls, triggers, monitors), each with the sentence
+that says so. A proposal is kept only when that sentence is in the text word for word and both parts are named
+there; it waits in *To review* (with its sentence) and is neither drawn on the map nor followed by an
+investigation before an admin approves it; a rejected one is never proposed again; a text is read once.
+`superset supagent interactions` runs the pass at once (`--again` reads every text again, after many new values).
+
+**Interactions the logs show** (0.9, `learn.interactions_logs`, on; no LLM): a scheduler writes what a run waits for
+("APP_B.EU.02 still waiting for its inputs after 40 min: APP_A.EU, MD_EOD_RATES"), an application what it calls
+("request to MDCACHE took 840 ms") or where it writes ("commit to RESULTS_DB took 3.2 s"). With the classification,
+the recent lines of each log table (a time field, a text field and a field of a category's values: its
+application) are read, spread over each hour of the last 14 days (the lines of the levels that are not quiet
+too), and grouped into patterns; the patterns that state an interaction are then read whole (their own lines,
+the first and the last of each day). A line ties the part it
+comes from to the parts it names (the map's names, and the identifiers that start with one: a job of an
+application), the kind read in its words (waits for, inputs: depends on; calls, requests: calls; reads, loads:
+reads from; writes, publishes, commits: sends data to). A line that states no interaction (a GC pause on a server,
+no free slot) proposes nothing; a kind the map already has ties only the categories it ties there (an application
+calls services: a pool named in the same line is not something it calls). A pair seen on 5 lines and 2 days at
+least waits in *To review* with its evidence ("18 lines of app_logs on 3 of the last 14 days, such as ..."), never
+drawn nor followed before an admin approves it; one drawn, proposed or rejected already is never proposed again.
+On a simulated batch platform, from 14 days of its logs, it found the 18 real dependencies between its applications
+and none that was not (16 of the 18 from 7 days).
+
+**Every interaction explained** (0.9): a **short explanation** (a few words from the first part's side: *waits
+for the positions of its perimeter*, *writes its results there*) and a **long one**, what to do when an
+investigation follows it (what to check on the other part in the same window and for the same perimeter, what a
+problem there does here). The LLM writes both with each interaction it reads in a text; for the others (drawn by
+an admin, older ones) the classification's step *interactions explained* writes them from what is known of the
+two parts, the sentence that states it and the Context sentences that name both. Only an empty explanation is
+written: what an admin wrote stays, and a link says who explained it (*Explained by the AI*, *by alice and the
+AI*). On the System map the lines carry no text: **a click on a line** (or on its name in a part's panel) shows
+its short explanation, the long one folded under *What to do when following it*, who explained it and the
+sentence it was read in; an admin corrects both there, in the new-interaction form, or in *To review* before
+approving a proposal. The agent gets them: the short ones with the system around a question, the long ones of the
+question's parts in it too (*What to do when following them*, within its room), and both from `system_links`.
+
+**New, or every night?** `check_health` says of each breach on how many of the seven previous days the same
+series breached the same check in the same window (`earlier_days`), marks the ones that do so on most days
+(`usual: true`) and lists the new ones first: an alert that fires every night is not what changed today. Only the
+checks that breached are run again. `compare_to_usual` gives each series on the team's reference days too
+(`then`: its average over the same window yesterday, a week ago, four weeks ago, or on the days asked with
+`against`). `promql_query` does the same for a level: a query of a few series (12 at
+most, over two days at most) gives each one what it was over the same window of the 7 previous days (`usual_avg`,
+`usual_max`) and says so in words (`against_usual`: "every series is as on the same window of the 7 previous
+days: these levels are their usual, not a change", or which series differ): a pool that is full every night and a
+queue that is as long every night are not causes.
+
+Also in 0.9: `compare_to_usual` refuses a counter read as it is (its value only grows: it says to compare its rate
+or its increase) and says when a value far from its median is still within what the earlier weeks differ by; the
+times of the metric tools ("now-6h") follow `agent.now` when an admin pinned it.
 
 ## The subjects of a chat (0.8)
 
@@ -1172,6 +1510,47 @@ address, so the agent finds the passage a question needs and names its page; the
 Superset's PostgreSQL has pgvector, pg_textsearch or pg_trgm (words, near spellings, meaning), else in the search of
 0.5. The table says how many pieces each document has in the search.
 
+## Backups of the knowledge (0.9)
+
+What people and the learning put into the agent's knowledge is long to make again. A **backup** is one zip file
+holding its latest state, a part per folder:
+
+| Part | What it holds |
+|---|---|
+| `categories` | the values of the categories, what they are part of, the items they are given to, the relations and the interactions of the System map, the map's arrangement, the categories themselves (their fields, their descriptions) |
+| `catalog` | the catalog's entries and their versions |
+| `memory` | the team's and the users' memories |
+| `documents` | the documents and sites, with their texts |
+| `notes` | the notes |
+| `context` | the Context pages |
+| `learned` | the learned answers and the investigation paths, the examples, the words that lead to a table, the kinds of work people confirmed |
+| `dictionary` | the descriptions of the data's objects (written by people or by the LLM), their units, other names and categories |
+| `settings` | the settings |
+| `vectors` | (`backup.vectors`, off) the vectors of the search pieces: several times bigger files, and a full restore then needs no embedding |
+
+**Never a secret** in a file (the LLM's token, a site's sign-in: on the same Superset a restore keeps them, elsewhere
+they are entered again), and not the chats, the usage figures nor the runs.
+
+* **Every day** at `backup.hour` (`backup.enabled`, on; `backup.days`) one is made by the workers' beat, before the
+  learning; the last `backup.keep` (14) are kept: the history to go back to. *Settings → Backups of the knowledge →
+  Back up now*, or `superset supagent backup`, makes one at once (without the beat, plan that command yourself).
+* **Where**: `backup.dir` on the server (default: `supagent-backups` in Superset's home; files readable by their
+  owner only). With several servers, give them a directory they share: the scheduled backup is written by the
+  worker, the page lists and restores the files of the web server. *Download* keeps one elsewhere.
+* **Restore**, whole or by part: *Restore…* on a backup, choose the parts, confirm; or `superset supagent restore
+  <name> --parts categories,catalog --yes` (without `--yes` it lists what the backup holds). The present rows of
+  each part asked are replaced by the backup's, with their ids; the other parts stay as they are. **The present
+  state is saved first** in a backup of its own (`…-before-restore.zip`, the last 5 kept): a restore can be undone.
+  A part put back alone may name items that no longer exist (a category given to an entry deleted since): they
+  are simply not shown. The descriptions of the data go back on the objects of the same name (the objects
+  themselves are learned again from the data). The search follows at once; the vectors of what came back are
+  computed by the hourly indexing (or `superset supagent index`).
+* Backups and restores are **runs**, listed in the settings with the learning runs (their parts, their counts,
+  their time); never while another run is running. A backup made by a later version is refused.
+
+`superset supagent backups` lists them. For the whole of Superset's database (the chats too), your database's own
+dump stays the tool; this one is the knowledge, by part.
+
 ## Where things are kept
 
 Tables in Superset's database. They have no foreign key to Superset's tables, so deleting a
@@ -1230,7 +1609,13 @@ superset supagent search "words" [--user U]                              what th
 superset supagent knowledge [--changes DAYS]
 superset supagent describe "words" [--name INDEX_OR_METRIC] [--user U]   what the agent reads
 superset supagent ask "question" --user U [--pipeline classic|governed]  an answer in this process
-superset supagent classify [--minutes N] [--limit N]                      categories of the knowledge, now
+superset supagent classify [--minutes N] [--limit N]                      categories of the knowledge, now: a run
+                                                                          listed in the settings with its steps (0.9)
+superset supagent interactions [--minutes N] [--limit N] [--again]        the interactions the texts state, proposed (0.9)
+superset supagent check-system [--question "..."] [--user U] [--json]     what the agent knows of the system, and
+                                                                          what is missing for investigations (0.9)
+superset supagent backup [--vectors] | backups                            a backup of the knowledge now; the list (0.9)
+superset supagent restore NAME [--parts a,b] [--yes]                      a backup put back, whole or by part (0.9)
 superset supagent charts [--scan] [--understand] [--chart N]              the nightly look at the charts, now (0.7)
 superset supagent store status | rebuild | sync | wipe [--yes] | search "words" [--user U] [--chats]
                                                                           the knowledge store (0.6)

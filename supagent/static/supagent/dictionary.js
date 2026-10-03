@@ -459,14 +459,19 @@
     });
   });
 
-  /* a learned answer in edit (admins): its generic question and its query, checked on the data before it is
-     confirmed; `after`: called once saved */
+  /* a learned answer in edit (admins): its generic question, its query (checked on the data before it is
+     confirmed) and its path (the data it uses, its steps); `after`: called once saved */
   function recipeEditor(r, box, after) {
     var q = el("textarea", { rows: "2", class: "recipe-q", "aria-label": "The generic question", maxlength: "2000" });
     q.value = r.question || "";
     var code = el("textarea", { rows: Math.min(14, Math.max(4, (r.query || "").split("\n").length + 1)), class: "recipe-query",
                                 spellcheck: "false", "aria-label": "The query" });
     code.value = r.query || "";
+    var noQuery = r.tool === "investigation" || r.tool === "path";      // a path: read, not run
+    /* the path of a learned answer: the data it uses and its steps, as the answer did them or as an admin wrote them */
+    var path = noQuery ? null : el("textarea", { rows: Math.min(10, Math.max(3, (r.path || "").split("\n").length + 1)),
+      class: "recipe-path", spellcheck: "false", "aria-label": "Its path: the data it uses, its steps" });
+    if (path) path.value = r.path || "";
     var res = el("div", { class: "result", role: "status", "aria-live": "polite" });
     var checked = null;                                    // the query text that passed the check
     var show = function (x) {
@@ -490,6 +495,7 @@
     } });
     var save = function (confirmIt) {
       var body = { question: q.value, query: code.value };
+      if (path) body.path = path.value;
       if (confirmIt) body.status = "confirmed";
       res.className = "result"; res.textContent = "saving…";
       return S.dict("POST", "recipes/" + r.id, body).then(function (x) {
@@ -501,9 +507,11 @@
     box.innerHTML = "";
     box.appendChild(el("div", { class: "recipe-edit" }, [
       el("label", { class: "field" }, [el("span", { text: "Question (generic: no one-off date, id or number)" }), q]),
-      el("label", { class: "field" }, [el("span", { text: (r.tool === "promql_query" ? "PromQL" : r.tool === "execute_sql" ||
+      el("label", { class: "field" }, [el("span", { text: (r.tool === "investigation" ? "The investigation path" : r.tool === "path" ?
+        "The path (the checks that answered it: nothing to run again)" : r.tool === "promql_query" ? "PromQL" : r.tool === "execute_sql" ||
         r.tool === "export_excel" ? "SQL" : "Chart settings (JSON)") + (r.target ? " · on " + r.target : "") }), code]),
-      el("div", { class: "actions" }, [check,
+      path ? el("label", { class: "field" }, [el("span", { text: "Its path: the data it uses and its steps (given to the agent with the query; correct it in your words)" }), path]) : null,
+      el("div", { class: "actions" }, [noQuery ? null : check,
         el("button", { type: "button", class: "btn small primary", text: r.status === "confirmed" ? "Save" : "Save and confirm",
           title: "A changed query is run first: it is confirmed only if it works", onclick: function () { save(true); } }),
         r.status === "confirmed" ? null : el("button", { type: "button", class: "btn small", text: "Save only",
@@ -522,9 +530,12 @@
       var tb = $("recipes").querySelector("tbody");
       tb.innerHTML = "";
       (data.recipes || []).forEach(function (r) {
-        var way = el("td", { class: "nm" }, [el("div", { class: "muted", text: r.tool + (r.target ? " · " + r.target : "") }),
+        var kind = r.tool === "investigation" ? "investigation path" : r.tool === "path" ? "path (no query to run)" : r.tool;
+        var way = el("td", { class: "nm" }, [el("div", { class: "muted", text: kind + (r.target ? " · " + r.target : "") }),
                                              el("details", {}, [el("summary", { text: (r.query || "").slice(0, 90) + ((r.query || "").length > 90 ? "…" : "") }),
-                                                                el("pre", { text: r.query || "" })])]);
+                                                                el("pre", { text: r.query || "" })]),
+                                             r.path ? el("details", { class: "recipe-way" }, [el("summary", { text: "its path: the data it uses, its steps" }),
+                                                                                             el("pre", { text: r.path })]) : null]);
         var actions = el("td", { class: "row-actions" });
         var u = r.use || {};
         var q = el("td", {}, [el("div", { text: r.question }), el("div", { class: "use-why" + (r.demoted ? " bad" : r.rank > 0.2 ? " good" : ""),
@@ -542,7 +553,7 @@
               if (x.error) { actions.appendChild(el("span", { class: "result bad", text: x.error })); return; }
               if (D.saved) D.saved(); recipes(); }); } }));
           if (r.status !== "auto") actions.appendChild(el("button", { type: "button", class: "linkish", text: "Edit",
-            title: "Correct its question or its query (then confirm it)", onclick: function () {
+            title: "Correct its question, its query or its path (then confirm it)", onclick: function () {
               if (tr.classList.contains("edited-row")) return;     // its editor is open below it
               var cell = el("td", { colspan: "6" });
               var row = el("tr", { class: "editing" }, [cell]);

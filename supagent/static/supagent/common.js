@@ -196,6 +196,152 @@
       } });
   }
 
+  /* A choice of several values in a long list (what a part is part of, the categories and parts a map shows):
+     the chosen ones as chips, a box to type in, the values that match listed below it: all of them when nothing
+     is typed (the first ones when there are many, with how many more), fewer as one types. Several are chosen
+     one after the other; a chosen one is taken back with its cross, with a click on it in the list, or with
+     Backspace in the empty box. Keys: arrows, Enter, Escape.
+       opts.load(words) -> [{id, label, group, hint}] or {items, more}, or a promise of it (the page's own data, or
+                           the server's search)
+       opts.chosen      the ones chosen at the start; opts.onchange(chosen); opts.placeholder; opts.label
+       opts.single      one at most
+     Returns {el, ids(), chosen(), set(list), close()}. */
+  var pickN = 0;
+  function picker(opts) {
+    opts = opts || {};
+    var id = "pick-" + (++pickN), chosen = (opts.chosen || []).slice(), items = [], more = 0, active = -1, open = false,
+      seq = 0, timer = null, busy = false;
+    var chips = el("span", { class: "pick-chips" });
+    var input = el("input", { type: "text", class: "pick-input", role: "combobox", "aria-expanded": "false",
+      "aria-autocomplete": "list", "aria-controls": id, "aria-label": opts.label || opts.placeholder || "Choose",
+      autocomplete: "off", spellcheck: "false" });
+    var list = el("div", { class: "pick-list", role: "listbox", id: id, "aria-multiselectable": opts.single ? null : "true" });
+    list.hidden = true;
+    var frame = el("div", { class: "pick-box" }, [chips, input]);
+    var box = el("div", { class: "pick" + (opts.cls ? " " + opts.cls : "") }, [frame, list]);
+    function has(i) { return chosen.some(function (c) { return String(c.id) === String(i); }); }
+    function changed() { if (opts.onchange) opts.onchange(chosen.slice()); }
+    function paintChips() {
+      chips.innerHTML = "";
+      chosen.forEach(function (c) {
+        chips.appendChild(el("span", { class: "pick-chip" + (c.cls ? " " + c.cls : ""), title: (c.group ? c.group + ": " : "") + c.label }, [
+          el("span", { class: "pick-chip-text", text: c.label }),
+          el("button", { type: "button", class: "pick-x", "aria-label": "Remove " + c.label, text: "×", onclick: function (ev) {
+            ev.stopPropagation();
+            toggle(c);
+            input.focus();
+          } })]));
+      });
+      input.placeholder = chosen.length ? "" : (opts.placeholder || "");
+    }
+    function toggle(it) {
+      var at = -1;
+      chosen.forEach(function (c, i) { if (String(c.id) === String(it.id)) at = i; });
+      if (at >= 0) chosen.splice(at, 1);
+      else {
+        if (opts.single) chosen = [];
+        chosen.push({ id: it.id, label: it.label, group: it.group, hint: it.hint, data: it.data, cls: it.cls });
+      }
+      paintChips();
+      paintList();
+      changed();
+    }
+    function paintList() {
+      list.innerHTML = "";
+      var group = null;
+      items.forEach(function (it, i) {
+        if ((it.group || "") !== group) {
+          group = it.group || "";
+          if (group) list.appendChild(el("div", { class: "pick-group", text: group }));
+        }
+        var on = has(it.id);
+        var o = el("div", { class: "pick-opt" + (i === active ? " active" : "") + (on ? " on" : ""), role: "option",
+                            id: id + "-" + i, "aria-selected": String(on) }, [
+          el("span", { class: "pick-check", "aria-hidden": "true", text: on ? "✓" : "" }),
+          el("span", { class: "pick-label", text: it.label }),
+          it.hint ? el("span", { class: "pick-hint", text: it.hint }) : null]);
+        o.addEventListener("mousedown", function (ev) { ev.preventDefault(); });       // the box keeps the focus
+        o.addEventListener("click", function () { pick(it); });
+        list.appendChild(o);
+      });
+      if (!items.length) list.appendChild(el("div", { class: "pick-none", text: busy ? "Searching…" : "Nothing matches" }));
+      if (more > 0) list.appendChild(el("div", { class: "pick-none", text: num(more) + " more: type to narrow the list" }));
+      if (active >= 0) input.setAttribute("aria-activedescendant", id + "-" + active);
+      else input.removeAttribute("aria-activedescendant");
+    }
+    function pick(it) {
+      toggle(it);
+      if (opts.single) { close(); return; }
+      if (input.value) { input.value = ""; search(); }
+    }
+    function search() {
+      var mine = ++seq;
+      busy = true;
+      Promise.resolve(opts.load ? opts.load(input.value.trim()) : []).then(function (r) {
+        if (mine !== seq) return;                         // a later typing answers
+        busy = false;
+        items = (r && r.items) || (Array.isArray(r) ? r : []);
+        more = (r && r.more) || 0;
+        active = items.length && input.value.trim() ? 0 : -1;
+        paintList();
+      });
+    }
+    function outside(ev) { if (!box.contains(ev.target)) close(); }
+    function show() {
+      if (open) return;
+      open = true;
+      list.hidden = false;
+      input.setAttribute("aria-expanded", "true");
+      document.addEventListener("pointerdown", outside, true);
+      search();
+    }
+    function close() {
+      if (!open) return;
+      open = false;
+      list.hidden = true;
+      active = -1;
+      input.setAttribute("aria-expanded", "false");
+      input.removeAttribute("aria-activedescendant");
+      document.removeEventListener("pointerdown", outside, true);
+    }
+    input.addEventListener("focus", show);
+    input.addEventListener("click", show);
+    input.addEventListener("input", function () {
+      show();
+      clearTimeout(timer);
+      timer = setTimeout(search, opts.wait === undefined ? 160 : opts.wait);
+    });
+    input.addEventListener("keydown", function (ev) {
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        ev.preventDefault();
+        if (!open) { show(); return; }
+        if (!items.length) return;
+        active = (active + (ev.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+        paintList();
+        var cur = list.querySelector(".pick-opt.active");
+        if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest" });
+      } else if (ev.key === "Enter") {
+        if (open && active >= 0 && items[active]) { ev.preventDefault(); pick(items[active]); }
+      } else if (ev.key === "Escape") {
+        if (open) { ev.preventDefault(); ev.stopPropagation(); close(); }
+      } else if (ev.key === "Backspace" && !input.value && chosen.length) {
+        toggle(chosen[chosen.length - 1]);
+      }
+    });
+    input.addEventListener("blur", function () {
+      setTimeout(function () { if (!box.contains(document.activeElement)) close(); }, 150);
+    });
+    frame.addEventListener("mousedown", function (ev) {
+      if (ev.target !== input && !(ev.target.closest && ev.target.closest(".pick-x"))) { ev.preventDefault(); input.focus(); }
+    });
+    paintChips();
+    return { el: box, input: input,
+             ids: function () { return chosen.map(function (c) { return c.id; }); },
+             chosen: function () { return chosen.slice(); },
+             set: function (now) { chosen = (now || []).slice(); paintChips(); if (open) paintList(); },
+             close: close };
+  }
+
   var body = document.body.dataset;
   window.supagent = {
     chat: function (m, p, b) { return api(body.chatApi, m, p, b); },
@@ -203,7 +349,7 @@
     admin: function (m, p, b) { return api(body.adminApi, m, p, b); },
     isAdmin: body.admin === "yes",
     esc: esc, el: el, when: when, whenFull: whenFull, num: num, bytes: bytes, sourceBadge: sourceBadge, pager: pager,
-    pop: pop, unpop: unpop, info: info, wireInfos: wireInfos, confirm: confirm, sureButton: sureButton
+    pop: pop, unpop: unpop, info: info, wireInfos: wireInfos, confirm: confirm, sureButton: sureButton, picker: picker
   };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { wireInfos(); });
   else wireInfos();

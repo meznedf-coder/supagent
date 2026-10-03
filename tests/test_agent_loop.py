@@ -363,6 +363,89 @@ def test_two_calls_before_the_end_the_model_is_told_to_answer(ctx, monkeypatch):
 
     sql = [{"request": {"database_id": 1, "sql": f"SELECT {i} AS n"}} for i in range(9)]
     a, ran = agent_with(monkeypatch, [call("execute_sql", q) for q in sql] + [say("Found: 8 checks, nothing more.")])
-    answer, _trace = a.ask("Why did the jobs fail?")
+    answer, _trace = a.ask("Which jobs failed, application by application?")
     told = [m for m in a.llm.seen[-1] if m["role"] == "user" and m["content"] == LAST_CALLS]
     assert len(told) == 1 and len(ran) == 9
+
+
+def test_an_investigation_gets_twice_the_calls(ctx, monkeypatch):
+    """The facts, where, why, the check of the cause: an investigation needs more calls than an answer (0.9)."""
+    from supagent.agent import LAST_CALLS
+
+    sql = [{"request": {"database_id": 1, "sql": f"SELECT {i} AS n"}} for i in range(19)]
+    a, ran = agent_with(monkeypatch, [call("execute_sql", q) for q in sql] + [say("The cause is in the results above.")])
+    answer, _trace = a.ask("Why did the jobs fail?")                  # 10 calls for an answer: 20 here
+    told = [m for m in a.llm.seen[-1] if m["role"] == "user" and m["content"] == LAST_CALLS]
+    assert len(told) == 1 and len(ran) == 19 and answer.startswith("The cause")
+    assert "used up" not in answer
+
+
+def test_a_query_per_day_is_sent_back(ctx, monkeypatch):
+    """The same query once per day (0.9): the third that differs from earlier ones only by its dates is not run,
+    nor the next ones; one query grouped by day runs."""
+    def one(day):
+        return call("execute_sql", {"request": {"database_id": 1, "sql":
+            f"SELECT COUNT(*) AS n, AVG(\"D\") AS d FROM \"runs\" WHERE \"APP\" = 'A' AND \"ts\" >= '2026-09-{day:02d} 00:00' "
+            f"AND \"ts\" < '2026-09-{day + 1:02d} 00:00'"}})
+
+    by_day = call("execute_sql", {"request": {"database_id": 1, "sql":
+        "SELECT DATE_TRUNC('day', \"ts\") AS day, COUNT(*) AS n FROM \"runs\" WHERE \"APP\" = 'A' AND \"ts\" >= '2026-09-10 00:00' "
+        "AND \"ts\" < '2026-09-15 00:00' GROUP BY 1"}})
+    a, ran = agent_with(monkeypatch, [one(10), one(11), one(12), one(13), by_day, say("A: 3, B: 2.")])
+    a.ask("How long did the runs of A take each day of last week?")
+    assert len(ran) == 2 + 1                                       # two days, then the grouped query
+    sent_back = [m for m in tool_messages(a.llm) if m.startswith("tool error (not run: one query per day)")]
+    assert len(sent_back) == 2 and "differs from 2 earlier ones only by its dates" in sent_back[0]
+    assert "differs from 3 earlier ones" in sent_back[1] and "GROUP BY DATE_TRUNC('day'" in sent_back[0]
+    # business-date labels and dates written yyyymmdd are days too; a query with no date is none
+    a._shapes = {}
+    for i, label in enumerate(("D-1", "D-2", "D-3")):
+        got = a._day_by_day("execute_sql", {"request": {"sql": f"SELECT COUNT(*) FROM \"runs\" WHERE \"DAY_LABEL\" = '{label}'"}})
+        assert (got is not None) == (i == 2)
+    assert a._day_by_day("execute_sql", {"request": {"sql": "SELECT COUNT(*) FROM \"runs\" WHERE \"APP\" = 'A'"}}) is None
+    assert a._day_by_day("promql_query", {"expr": "up"}) is None
+
+
+def test_a_flood_of_calls_in_one_message_runs_its_first_ones_only(ctx, monkeypatch):
+    from supagent.agent import CALLS_AT_ONCE
+
+    many = {"role": "assistant", "content": "", "tool_calls": [
+        {"id": f"m{i}", "function": {"name": "check_health", "arguments": json.dumps({"entities": [f"srv-{i}"]})}}
+        for i in range(CALLS_AT_ONCE + 4)]}
+    a, ran = agent_with(monkeypatch, [many, say("All servers are fine.")],
+                        results=lambda n, args: json.dumps({"breaches": []}))
+    a.ask("What is the status of the servers srv-0 to srv-11?")
+    assert len(ran) == CALLS_AT_ONCE
+    sent_back = [m for m in tool_messages(a.llm) if m.startswith("tool error (not run): 8 calls at most in one message")]
+    assert len(sent_back) == 4 and len(tool_messages(a.llm)) == CALLS_AT_ONCE + 4      # every call got its answer
+
+
+
+def test_a_conversation_longer_than_the_model_s_context_is_shortened_not_lost(ctx, monkeypatch):
+    """0.9 (d4 V04: 27 calls, 65,756 tokens for a context of 65,536, and the user got an error): when the server
+    says the context is full, the older tool results are shortened (the latest kept whole) and the answer goes
+    on; full again, shortened more and the model is asked to answer from what it has."""
+    from supagent.agent import CONTEXT_FULL_NUDGE
+    from supagent.llm import LLMError
+
+    big = json.dumps({"success": True, "rows": [{"APP": "A" * 50, "n": i} for i in range(80)]})
+    full = LLMError('LLM http://x/v1/chat/completions: HTTP 400: {"error":{"code":400,"message":"request (65756 tokens) '
+                    'exceeds the available context size (65536 tokens), try increasing it","type":"exceed_context_size_error"}}')
+    replies = [call("execute_sql", {"request": {"database_id": 1, "sql": f"SELECT {i}"}}) for i in range(5)]
+    replies += [full, call("execute_sql", {"request": {"database_id": 1, "sql": "SELECT 9"}}), full,
+                say("A has 3 runs; B was not checked.")]
+    a, _ran = agent_with(monkeypatch, replies, results=lambda name, args: big)
+    answer, trace = a.ask("How many runs has each application?")
+    assert answer.startswith("A has 3 runs") and len(trace) == 6
+    first = a.llm.seen[6]                                      # the call after the first "full"
+    tools = [m["content"] for m in first if m["role"] == "tool"]
+    assert all(t.endswith("[shortened: the conversation was too long for the model]") for t in tools[:-3])
+    assert not any("[shortened" in t for t in tools[-3:])       # the latest whole
+    last = a.llm.seen[-1]
+    assert [len(m["content"]) < 700 for m in last if m["role"] == "tool"][:-1] == [True] * 5
+    assert any(m["role"] == "user" and m["content"] == CONTEXT_FULL_NUDGE for m in last)
+    # another error than a full context: as before
+    b, _ran = agent_with(monkeypatch, [call("execute_sql", {"request": {"sql": "SELECT 1"}}), LLMError("HTTP 500: boom")],
+                         results=lambda name, args: big)
+    with pytest.raises(LLMError):
+        b.ask("How many runs has each application?")

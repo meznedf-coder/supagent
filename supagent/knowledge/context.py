@@ -501,6 +501,36 @@ def build_context(reason: str = "manual", llm: bool = True, force: bool = False)
     return {"run": run_id, "status": status, "error": error, **stats}
 
 
+def build_then_classify(reason: str = "manual", llm: bool = True, force: bool = False) -> dict[str, Any]:
+    """A Context build, then the classification on what it wrote (context.classify_after): the categories of the
+    items, the part-of of the values and the interactions are read from the Context pages, the documents, the
+    metrics and the data of that night. The build's own summary, with the classification's under
+    "classification"."""
+    out = build_context(reason=reason, llm=llm, force=force)
+    if llm and settings.get("context.classify_after") and out.get("status") != "skipped":
+        from supagent.knowledge.learner import run_classification
+
+        try:
+            out["classification"] = run_classification(reason="after the Context")
+        except Exception as ex:  # pylint: disable=broad-except   (the build is done: kept)
+            db.session.rollback()
+            log.exception("supagent: the classification after the Context")
+            out["classification"] = {"status": "error", "error": str(ex)[:300]}
+    return out
+
+
+def classify_follows() -> bool:
+    """The categories wait for tonight's Context: it is built every night, the classification follows it, and
+    no build is done yet today (the nightly learning then leaves the categories to it)."""
+    if not (settings.get("context.enabled") and settings.get("context.classify_after")):
+        return False
+    now = dt.datetime.now()
+    start_of_day_utc = dt.datetime.utcnow() - dt.timedelta(hours=now.hour, minutes=now.minute)
+    done = (db.session.query(Run.id).filter(Run.kind == "context", Run.started_at >= start_of_day_utc,
+                                            Run.status.in_(("done", "partial"))).first())
+    return done is None
+
+
 def context_due(now: dt.datetime | None = None) -> bool:
     """The nightly build is due: enabled, its hour has come, none done today, none running."""
     from supagent.knowledge.learner import running_run

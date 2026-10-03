@@ -206,6 +206,12 @@ def _label_context(obj: KObject) -> dict[str, Any]:
 def _write(obj: KObject, entry: dict[str, Any]) -> int:
     """The LLM's description on this object (a label: on every metric that has it); how many."""
     text = str(entry.get("description") or "").strip()[:600]
+    if obj.kind == "field" and (obj.stats or {}).get("computed") and not obj.description:
+        from supagent.knowledge.learn_indices import computed_help
+
+        # a column the connector computes has no value of its own to read: what the connector says it is
+        obj.description, obj.description_source, obj.verified = computed_help(obj.stats["computed"]), "backend", False
+        return 1
     if not text or obj.description:
         return 0
     if obj.kind == "label":

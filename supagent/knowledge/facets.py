@@ -69,6 +69,51 @@ def field_rules() -> list[tuple[str, Any]]:
     return out
 
 
+ABOUT_CHARS = 300
+ABOUT_BUILTIN = {"subject": "the business or technical subjects the knowledge is about",
+                 "application": "the applications, systems and services",
+                 "component": "the parts of the applications: jobs, pipelines, reports, modules"}
+
+
+def about(all_of_them: bool = False) -> dict[str, str]:
+    """What each category is, as an admin wrote it (categories.about); `all_of_them`: the built-in ones say what
+    they are when nobody wrote it."""
+    from supagent import settings
+
+    try:
+        raw = settings.get("categories.about")
+    except Exception:  # pylint: disable=broad-except   (no settings table yet)
+        raw = None
+    cats = set(editable())
+    out = {str(k).strip().lower(): " ".join(str(v).split())[:ABOUT_CHARS]
+           for k, v in (raw if isinstance(raw, dict) else {}).items() if str(v or "").strip()}
+    out = {k: v for k, v in out.items() if k in cats}
+    if all_of_them:
+        for k, v in ABOUT_BUILTIN.items():
+            out.setdefault(k, v)
+    return out
+
+
+def set_about(category: str, text: str, by: str) -> str:
+    """An admin writes (or clears) what a category is; the agent and the map follow at once."""
+    from supagent import settings
+    from supagent.knowledge.freshness import touch
+
+    category = " ".join(str(category or "").lower().split())
+    if category not in editable():
+        raise ValueError(f"no category {category!r}")
+    now = dict(about())
+    text = " ".join(str(text or "").split())[:ABOUT_CHARS]
+    if text:
+        now[category] = text
+    else:
+        now.pop(category, None)
+    settings.set_value("categories.about", now, by=by)
+    touch()
+    db.session.commit()
+    return text
+
+
 def review_all() -> bool:
     """categories.review_all: nothing the LLM finds is used before an admin approves it."""
     from supagent import settings
@@ -120,7 +165,7 @@ def _ensure(facet: str, value: str, status: str, source: str, description: str |
         f = Facet(facet=facet, value=value, status=status, source=source, description=description)
         db.session.add(f)
         db.session.flush()
-    elif f.status == "proposed" and status == "approved":
+    elif f.status == "proposed" and status == "approved":     # (never asked for when everything waits: seed())
         f.status, f.source = "approved", source
     if origin and origin not in (f.origins or []):
         f.origins = ((f.origins or []) + [origin])[-10:]          # where it comes from, the latest ten
@@ -169,40 +214,138 @@ def named(value: str) -> bool:
 
 
 def seed() -> dict[str, int]:
-    """The values that need nobody's approval: the aspects, the categories people wrote (catalog entries,
-    documents, the dictionary's categories), the values of the data's application-like fields."""
-    from supagent.models import Doc, Entry, KObject
+    """The values the learning adds by itself. Approved at once: the aspects, and the categories people wrote (on
+    a catalog entry, on a document, in the catalog for a metric). Found by the learning (0.9): the values of the
+    data's category fields (categories.fields) and the categories it gave to the data's objects (the LLM's
+    descriptions, the names' rules) wait for an admin in To review like the LLM's other proposals; with
+    categories.review_all off they are used at once, as before. A value that exists is not changed here, except
+    for where it is found in the data today (its origins: which field of which indices, which label of which
+    metrics)."""
+    from supagent.models import Doc, Entry, Facet, KObject
 
-    n = {"aspect": 0, "subject": 0, "application": 0}
+    n: dict[str, int] = {"aspect": 0, "subject": 0, "application": 0, "proposed": 0}
+    found = "proposed" if review_all() else "approved"
+    known = {(f, v.lower()) for f, v in db.session.query(Facet.facet, Facet.value)}
+
+    def add(facet: str, value: str, status: str, source: str, origin: str) -> None:
+        new = (facet, " ".join(str(value).split())[:128].lower()) not in known
+        if _ensure(facet, value, status, source, origin=origin) is None:
+            return
+        n[facet] = n.get(facet, 0) + 1
+        if new:
+            known.add((facet, " ".join(str(value).split())[:128].lower()))
+            n["proposed"] += status == "proposed"
+
     for a in ASPECTS:
         n["aspect"] += _ensure("aspect", a, "approved", "seed") is not None
     cats = {c for (c,) in db.session.query(Entry.category).filter(Entry.deleted_at.is_(None), Entry.category.isnot(None))}
     cats |= {c for (c,) in db.session.query(Doc.category).filter(Doc.category.isnot(None))}
-    cats |= {c for (c,) in db.session.query(KObject.category).filter(KObject.category.isnot(None),
-                                                                     KObject.gone_at.is_(None))}
-    for c in sorted(x for x in cats if x and x.strip() and x.lower() not in ("context", "lab")):
-        n["subject"] += _ensure("subject", c, "approved", "seed", origin="a category of the catalog") is not None
-    from supagent import settings
-    from supagent.models import Source
+    try:                                              # the categories the catalog gives to metrics: people wrote them
+        from supagent.knowledge.catalog import load_catalog
 
-    cap = int(settings.get("categories.max_values") or 1000)
-    names = {s.id: s.database_name for s in db.session.query(Source)} if db.session.query(Source).count() else {}
-    rules = field_rules()
-    for o in db.session.query(KObject).filter(KObject.kind.in_(("field", "label")), KObject.gone_at.is_(None)):
-        for cat, rx in rules:
-            if not rx.match(o.name or ""):
+        cats |= {str(spec["category"]) for spec in ((load_catalog().get("metrics") or {}).get("tables") or {}).values()
+                 if isinstance(spec, dict) and spec.get("category")}
+    except Exception:  # pylint: disable=broad-except
+        log.warning("supagent categories: the catalog's categories: not read", exc_info=True)
+    skip = ("context", "lab")
+    wrote = {c.strip().lower() for c in cats if c and c.strip()}
+    for c in sorted(x for x in cats if x and x.strip() and x.lower() not in skip):
+        add("subject", c, "approved", "seed", "a category of the catalog")
+    learned = {c for (c,) in db.session.query(KObject.category).filter(KObject.category.isnot(None),
+                                                                       KObject.gone_at.is_(None))}
+    for c in sorted(x for x in learned if x and x.strip() and x.strip().lower() not in wrote and x.lower() not in skip):
+        add("subject", c, found, "seed" if found == "approved" else "llm",
+            "a category the learning gave to objects of the data (their descriptions, their names)")
+    n["values_read"], n["fields_read"] = 0, 0
+    found_values, read = data_values()
+    n["fields_read"] = read
+    if found_values:
+        cats = sorted({cat for cat, _low in found_values})
+        have = {(f.facet, " ".join(f.value.lower().split())): f
+                for f in db.session.query(Facet).filter(Facet.facet.in_(cats))}
+        for (cat, low), slot in found_values.items():
+            n["values_read"] += 1
+            n[cat] = n.get(cat, 0) + 1
+            f = have.get((cat, low))
+            if f is None:
+                db.session.add(Facet(facet=cat, value=slot["value"], status=found, source="data", origins=slot["origins"]))
+                n["proposed"] += found == "proposed"
                 continue
-            values = (o.stats or {}).get("values") or []
-            most = MAX_DATA_VALUES if cat == "application" else cap
-            if not (0 < len(values) <= most) or (o.stats or {}).get("partial"):
-                continue
-            where = f"field {o.name} of {o.parent}" + (f" ({names[o.source_id]})" if o.source_id in names else "")
-            for v in values:
-                if named(str(v)):
-                    n[cat] = n.get(cat, 0) + (_ensure(cat, str(v), "approved", "data", origin=where) is not None)
+            if f.status == "rejected":
+                continue                              # retired by an admin: left as it is
+            if f.status == "proposed" and found == "approved":
+                f.status, f.source = "approved", "data"
+            other = [o for o in (f.origins or []) if not str(o).startswith(("field ", "label "))]
+            now = (other + slot["origins"])[:ORIGINS]
+            if now != list(f.origins or []):          # where it is in the data today
+                f.origins = now
     n["relations"] = relations_from_data()
     db.session.commit()
     return n
+
+
+ORIGINS = 8                 # origins kept on a value
+ORIGIN_NAMES = 3            # indices or metrics named in one of them
+
+
+def data_values() -> tuple[dict[tuple[str, str], dict[str, Any]], int]:
+    """The values the data has for each category read from fields (categories.fields), each once whatever the
+    number of indices and metrics that carry the field or the label, with where it comes from:
+    ({(category, value in lower case): {"value", "origins": [...]}}, fields and labels read).
+
+    A label is kept once per metric by the learning (thousands of metrics have the label "host"): reading its
+    values there again for every metric, with a query per value, took most of an hour on a platform; here every
+    value is counted in memory and the categories are read and written once."""
+    from supagent import settings
+    from supagent.models import KObject, Source
+
+    rules = field_rules()
+    if not rules:
+        return {}, 0
+    cap = int(settings.get("categories.max_values") or 1000)
+    kinds = ("field", "label")
+    wanted: dict[str, list[str]] = {}
+    for (name,) in db.session.query(KObject.name).filter(KObject.kind.in_(kinds), KObject.gone_at.is_(None)).distinct():
+        cats = [cat for cat, rx in rules if rx.match(name or "")]
+        if cats:
+            wanted[name] = cats
+    if not wanted:
+        return {}, 0
+    names = dict(db.session.query(Source.id, Source.database_name))
+    places: dict[tuple[str, str], dict[tuple[str, int, str], list[Any]]] = {}
+    spelled: dict[tuple[str, str], str] = {}
+    read = 0
+    rows = db.session.query(KObject.kind, KObject.name, KObject.parent, KObject.source_id, KObject.stats).filter(
+        KObject.kind.in_(kinds), KObject.gone_at.is_(None), KObject.name.in_(list(wanted)))
+    for kind, name, parent, source_id, stats in rows.yield_per(500):
+        values = (stats or {}).get("values") or []
+        if not values or (stats or {}).get("partial"):
+            continue
+        read += 1
+        for cat in wanted[name]:
+            if len(values) > (MAX_DATA_VALUES if cat == "application" else cap):
+                continue
+            for v in values:
+                v = " ".join(str(v).split())[:128]
+                if not named(v):
+                    continue
+                key = (cat, v.lower())
+                spelled.setdefault(key, v)
+                slot = places.setdefault(key, {}).setdefault((kind, source_id, name), [0, []])
+                slot[0] += 1
+                if len(slot[1]) < ORIGIN_NAMES:
+                    slot[1].append(parent or "")
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, by_place in places.items():
+        lines = []
+        for (kind, source_id, name), (count, some) in sorted(by_place.items(), key=lambda x: (x[0][0] != "field", x[0][2], x[0][1])):
+            what = "indices" if kind == "field" else "metrics"
+            of = some[0] if count == 1 else f"{count:,} {what} such as {', '.join(sorted(some))}"
+            if kind == "label" and count == 1:
+                of = f"metric {of}"
+            lines.append(f"{kind} {name} of {of}" + (f" ({names[source_id]})" if source_id in names else ""))
+        out[key] = {"value": spelled[key], "origins": lines[:ORIGINS]}
+    return out, read
 
 
 def relations_from_data() -> int:
@@ -268,10 +411,13 @@ def items() -> Iterator[dict[str, Any]]:
     for r in db.session.query(Recipe).filter(Recipe.status.in_(USED)):
         yield {"ref": f"recipe:{r.id}", "kind": "learned answer", "title": (r.question or "")[:120],
                "text": f"{r.question}\n{(r.query or '')[:600]}"}
-    tops = db.session.query(KObject).filter(KObject.kind.in_(("index", "metric")), KObject.gone_at.is_(None)).all()
+    # the columns read only: a platform has tens of thousands of metrics, each with its statistics
+    tops = db.session.query(KObject.id, KObject.kind, KObject.name, KObject.source_id, KObject.description,
+                            KObject.backend_help).filter(KObject.kind.in_(("index", "metric")),
+                                                         KObject.gone_at.is_(None)).all()
     kids: dict[tuple[int, str], list[str]] = {}
     for o in db.session.query(KObject.source_id, KObject.parent, KObject.name).filter(
-            KObject.kind.in_(("field", "label")), KObject.gone_at.is_(None)):
+            KObject.kind == "field", KObject.gone_at.is_(None)):
         kids.setdefault((o[0], o[1]), []).append(o[2])
     families: dict[str, list[Any]] = {}
     for o in tops:
@@ -355,13 +501,23 @@ CLASSIFY_SYSTEM = ("You classify pieces of knowledge of a company's data platfor
                    "says. Call classify_items once.")
 
 
+def llm_categories() -> tuple[str, ...]:
+    """The categories the LLM gives to items and proposes values for: the built-in ones and the deployment's own
+    that are filled by hand. One of the deployment's own that is read from the data's fields (categories.fields:
+    servers, hosts, environments...) takes its values from the data, where each is read once with the index and
+    the field, or the metric and the label, it comes from: hundreds of names are neither a list for the LLM to
+    choose in at every call, nor one for it to add to."""
+    read = {c for c, _rx in field_rules()}
+    return tuple(c for c in editable() if c in BUILTIN or c not in read)
+
+
 def classify_tool() -> dict[str, Any]:
-    """The tool with the deployment's own categories (categories.custom / categories.fields) as well."""
+    """The tool with the deployment's own categories that are filled by hand (llm_categories) as well."""
     import copy
 
     tool = copy.deepcopy(CLASSIFY_TOOL)
     props = tool["function"]["parameters"]["properties"]
-    cats = list(editable())
+    cats = list(llm_categories())
     props["new_values"]["items"]["properties"]["facet"]["enum"] = cats
     own = [c for c in cats if c not in BUILTIN]
     if own:
@@ -375,7 +531,7 @@ def classify_tool() -> dict[str, Any]:
 def classify_messages(batch: list[dict[str, Any]], vocab: dict[str, list[dict[str, Any]]],
                       tables: list[str]) -> list[dict[str, str]]:
     lines = ["Known values:"]
-    for facet in editable():
+    for facet in llm_categories():
         vals = [v["value"] for v in vocab.get(facet, [])][:120]
         lines.append(f"- {facet}: " + (", ".join(vals) if vals else "(none yet)"))
     if tables:
@@ -422,6 +578,7 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
 
     n = {"tags": 0, "proposed": 0, "links": 0}
     strict = review_all()
+    llm_cats = set(llm_categories())               # a category read from the data's fields: its values come from there
 
     def data_name(facet: str, value: str) -> str | None:     # a "component" that is a table's name: a link
         return table_refs.get(value.strip().lower()) if facet == "component" else None
@@ -438,10 +595,22 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
             hit = next((x for x in rows if any(str(s).lower() == low for s in (x.synonyms or []))), None)
         return None if hit is None or hit.id == not_id else hit
 
+    def elsewhere(facet: str, value: str) -> Any:
+        """The approved value of another category that has this name: the same part of the system, which the team
+        filed elsewhere (a "component" X when X is a service of theirs): the item is about that one. A subject
+        is a topic: it may share its name with a part."""
+        if facet in ("subject", "aspect"):
+            return None
+        hit = known(value)
+        return hit if hit is not None and hit.facet not in (facet, "subject") and hit.status == "approved" else None
+
     for nv in args.get("new_values") or []:
         if data_name(str(nv.get("facet") or ""), str(nv.get("value") or "")):
             continue
-        if nv.get("facet") in editable() and str(nv.get("value") or "").strip():
+        if nv.get("facet") in llm_cats and str(nv.get("value") or "").strip():
+            if db.session.query(Facet.id).filter(Facet.facet == nv["facet"], Facet.value.ilike(
+                    " ".join(str(nv["value"]).split()))).first() is None and elsewhere(nv["facet"], nv["value"]):
+                continue                              # known under another category: nothing new to propose
             f = _ensure(nv["facet"], nv["value"], "proposed", "llm", str(nv.get("description") or "")[:500] or None)
             if f is not None and f.status == "proposed":
                 n["proposed"] += 1
@@ -488,13 +657,13 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
                     links.append({"to": str(v), "kind": "about"})
                 else:
                     wanted.append((facet, str(v)))
-        own = set(editable()) - set(BUILTIN)
-        for o in (row.get("others") or [])[:6]:            # the deployment's own categories (server, team...)
+        own = llm_cats - set(BUILTIN)
+        for o in (row.get("others") or [])[:6]:            # the deployment's own categories filled by hand (team...)
             if isinstance(o, dict) and o.get("category") in own and str(o.get("value") or "").strip():
                 wanted.append((o["category"], str(o["value"])))
         for facet, value in wanted:
             f = (db.session.query(Facet).filter(Facet.facet == facet, Facet.value.ilike(value.strip())).first()
-                 or _ensure(facet, value, "proposed", "llm"))
+                 or elsewhere(facet, value) or _ensure(facet, value, "proposed", "llm"))
             if f is None or f.status == "rejected":
                 continue
             t = db.session.query(Tag).filter(Tag.ref == ref, Tag.facet_id == f.id).first()
@@ -526,23 +695,35 @@ def apply(args: dict[str, Any], batch: list[dict[str, Any]], table_refs: dict[st
 
 
 def settle() -> dict[str, int]:
-    """What waits for an admin, by the rules above (for what an older rule left waiting): the confident tags of
-    approved values and the confident links are used; the "components" that are tables' names are dropped."""
+    """What waits for an admin, by the rules above (for what an older rule left waiting): the proposed
+    "components" that are tables' names are taken back, a proposed value that has the name of an approved value
+    of another category says so (to merge in one click); with categories.review_all off, the confident tags of
+    approved values and the confident links are used."""
     from supagent.models import Facet, Link, Tag
 
     out = {"tags": 0, "links": 0, "values": 0}
-    for f in db.session.query(Facet).filter(Facet.facet == "application", Facet.source == "data",
-                                             Facet.status != "rejected"):
-        if not named(f.value):                        # seeded by an older rule: a code that names nothing
-            db.session.query(Tag).filter(Tag.facet_id == f.id).delete(synchronize_session=False)
-            f.status = "rejected"
-            out["values"] += 1
+    # (a value in use is never retired, merged or changed here: what looks wrong with one is proposed to an admin,
+    # knowledge.retire; only the learning's own proposals nobody approved are taken back)
     names = _table_refs()
     for f in db.session.query(Facet).filter(Facet.facet == "component", Facet.status == "proposed",
                                              Facet.source == "llm"):
         if f.value.strip().lower() in names:
             db.session.query(Tag).filter(Tag.facet_id == f.id).delete(synchronize_session=False)
             db.session.delete(f)
+            out["values"] += 1
+    # a value proposed under one category whose name is an approved value of another (not a subject: a topic may
+    # share its name with a part): probably the same part, filed there
+    approved_names: dict[str, Any] = {}
+    cats = [c for c in editable() if c != "subject"]
+    for a in db.session.query(Facet).filter(Facet.status == "approved", Facet.facet.in_(cats)):
+        for name in [a.value] + [str(x) for x in (a.synonyms or [])]:
+            approved_names.setdefault(" ".join(name.lower().split()), a)
+    for f in db.session.query(Facet).filter(Facet.status == "proposed", Facet.source == "llm", Facet.facet.in_(cats)).all():
+        to = approved_names.get(" ".join((f.value or "").lower().split()))
+        sug = dict(f.suggested or {})
+        if to is not None and to.facet != f.facet and sug.get("same_as") != to.id:
+            sug["same_as"] = to.id                    # said in To review: one click merges it, an admin decides
+            f.suggested = sug
             out["values"] += 1
     if review_all():                                  # nothing used before an admin approves it
         db.session.commit()
@@ -551,8 +732,11 @@ def settle() -> dict[str, int]:
     out["tags"] = (db.session.query(Tag).filter(Tag.status == "proposed", Tag.source == "llm",
                                                Tag.confidence >= CONFIDENT, Tag.facet_id.in_(approved or [-1]))
                    .update({Tag.status: "approved"}, synchronize_session=False))
+    # (an interaction between two parts of the system, proposed from a text, always waits for an admin: it would
+    # be drawn on the System map and followed by the investigations)
     out["links"] = (db.session.query(Link).filter(Link.status == "proposed", Link.source == "llm",
-                                                 Link.confidence >= CONFIDENT, Link.kind.notin_(REVIEWED_LINKS))
+                                                 Link.confidence >= CONFIDENT, Link.kind.notin_(REVIEWED_LINKS),
+                                                 ~(Link.a_ref.like("facet:%") & Link.b_ref.like("facet:%")))
                     .update({Link.status: "approved"}, synchronize_session=False))
     db.session.commit()
     if any(out.values()):
@@ -560,35 +744,68 @@ def settle() -> dict[str, int]:
     return out
 
 
-def classify(llm: Any, seconds: float = 900.0, limit: int = 400) -> dict[str, Any]:
-    """The items that changed, BATCH at a time, until `seconds` or `limit`; the next run continues."""
+class _Quiet:
+    """The steps of a classification nobody records (a test, a caller without a run)."""
+
+    def begin(self, name: str, database: str | None = None) -> None:
+        pass
+
+    def update(self, **counts: Any) -> None:
+        pass
+
+    def end(self, **counts: Any) -> None:
+        pass
+
+
+def classify(llm: Any, seconds: float = 900.0, limit: int = 400, steps: Any = None) -> dict[str, Any]:
+    """The values of the data read, what waits settled, then the items that changed classified by the LLM, BATCH
+    at a time, until `seconds` or `limit`; the next run continues. `steps` (the run's, knowledge.learner.Steps)
+    gets each part with its time and its counts: the settings page shows them."""
     from supagent.knowledge.stopping import check
 
+    steps = steps or _Quiet()
     t0 = time.time()
-    out: dict[str, Any] = {"seeded": seed(), "settled": settle(), "items": 0, "tags": 0, "proposed": 0, "links": 0,
-                           "calls": 0}
+    out: dict[str, Any] = {"items": 0, "tags": 0, "proposed": 0, "links": 0, "calls": 0}
+    steps.begin("categories: the values read in the data's fields")
+    out["seeded"] = seed()
+    steps.end(**{k: v for k, v in out["seeded"].items() if k not in ("aspect",)})
+    steps.begin("categories: what waits, by the rules")
+    out["settled"] = settle()
+    steps.end(**out["settled"])
+    steps.begin("categories: the knowledge items that changed")
     todo = pending(limit)
+    steps.end(to_classify=len(todo))
     if not todo:
         return out
+    steps.begin("categories: given to the items by the LLM")
     table_refs = _table_refs()
     tables = sorted({r.split(":", 2)[2] for r in table_refs.values()})
-    for i in range(0, len(todo), BATCH):
-        if time.time() - t0 > seconds:
-            out["left"] = len(todo) - i
-            break
-        check()
-        batch = todo[i:i + BATCH]
-        try:
-            msg = llm.chat(classify_messages(batch, vocabulary(), tables), tools=[classify_tool()], max_tokens=2500)
-        except Exception as ex:  # pylint: disable=broad-except
-            log.warning("supagent facets: classification failed: %s", str(ex)[:300])
-            out["error"] = str(ex)[:300]
-            break
-        out["calls"] += 1
-        n = apply(_args(msg), batch, table_refs)
-        out["items"] += len(batch)
-        for k, v in n.items():
-            out[k] = out.get(k, 0) + v
+    vocab = vocabulary()                              # read again only when a call added values
+    tool = classify_tool()
+    try:
+        for i in range(0, len(todo), BATCH):
+            if time.time() - t0 > seconds:
+                out["left"] = len(todo) - i
+                break
+            check()
+            batch = todo[i:i + BATCH]
+            try:
+                msg = llm.chat(classify_messages(batch, vocab, tables), tools=[tool], max_tokens=2500)
+            except Exception as ex:  # pylint: disable=broad-except
+                log.warning("supagent facets: classification failed: %s", str(ex)[:300])
+                out["error"] = str(ex)[:300]
+                break
+            out["calls"] += 1
+            n = apply(_args(msg), batch, table_refs)
+            out["items"] += len(batch)
+            for k, v in n.items():
+                out[k] = out.get(k, 0) + v
+            if n.get("proposed"):
+                vocab = vocabulary()
+            steps.update(calls=out["calls"], items=out["items"], tags=out["tags"], proposed=out["proposed"],
+                         links=out["links"])
+    finally:
+        steps.end(**{k: out[k] for k in ("calls", "items", "tags", "proposed", "links", "left", "error") if out.get(k)})
     if out["tags"] or out["links"]:
         from supagent.knowledge.freshness import touch
 
@@ -660,8 +877,9 @@ def categories_info() -> list[dict[str, Any]]:
 
     fields = settings.get("categories.fields")
     fields = {str(k).strip().lower(): str(v) for k, v in (fields if isinstance(fields, dict) else {}).items()}
-    info = {c: {"name": c, "builtin": c in BUILTIN, "fields": fields.get(c) or "", "values": 0, "tags": 0, "parts": 0,
-                "interactions": 0} for c in editable()}
+    said = about()
+    info = {c: {"name": c, "builtin": c in BUILTIN, "fields": fields.get(c) or "", "about": said.get(c, ""),
+                "values": 0, "tags": 0, "parts": 0, "interactions": 0} for c in editable()}
     cat_of: dict[int, str] = {}
     rows = db.session.query(Facet.id, Facet.facet, Facet.status, Facet.parents).filter(Facet.facet.in_(list(info))).all()
     for fid, cat, _status, _parents in rows:
@@ -729,10 +947,24 @@ def rename_category(old: str, new: str, by: str) -> str:
         if old in fields:
             fields[new] = fields.pop(old)
 
+    said = dict(about())                              # what it is: under its new name (read before the name goes)
     _set_categories(change, by)
+    if old in said:
+        from supagent import settings
+
+        said[new] = said.pop(old)
+        settings.set_value("categories.about", said, by=by)
     lay = sysmap.layout()
-    if old in (lay.get("folded") or {}):
-        lay["folded"][new] = lay["folded"].pop(old)
+    named = False
+    for key in ("folded", "columns"):                 # its fold, where it was moved
+        if old in (lay.get(key) or {}):
+            lay[key][new] = lay[key].pop(old)
+            named = True
+    for g in lay.get("groups") or []:                 # the group it is in
+        if old in (g.get("categories") or []):
+            g["categories"] = [new if c == old else c for c in g["categories"]]
+            named = True
+    if named:
         sysmap.save_layout(lay, by)
     touch()
     db.session.commit()
@@ -792,13 +1024,23 @@ def remove_category(name: str, by: str) -> dict[str, int]:
             custom.remove(name)
         fields.pop(name, None)
 
+    said = dict(about())
     _set_categories(change, by)
+    if name in said:
+        from supagent import settings
+
+        said.pop(name)
+        settings.set_value("categories.about", said, by=by)
     lay = sysmap.layout()
     places = {k: v for k, v in (lay.get("positions") or {}).items() if not (str(k).isdigit() and int(k) in gone)}
     hidden = [i for i in lay.get("hidden") or [] if i not in gone]
     folded = {k: v for k, v in (lay.get("folded") or {}).items() if k != name}
-    if lay and (places != (lay.get("positions") or {}) or hidden != (lay.get("hidden") or []) or folded != (lay.get("folded") or {})):
-        sysmap.save_layout({"positions": places, "hidden": hidden, "folded": folded}, by)
+    columns = {k: v for k, v in (lay.get("columns") or {}).items() if k != name}
+    groups = [{"name": g.get("name"), "categories": [c for c in g.get("categories") or [] if c != name]}
+              for g in lay.get("groups") or []]
+    kept = {"positions": places, "hidden": hidden, "folded": folded, "columns": columns, "groups": groups}
+    if lay and any(kept[k] != (lay.get(k) or type(kept[k])()) for k in kept):
+        sysmap.save_layout(kept, by)
     touch()
     db.session.commit()
     return out
@@ -912,9 +1154,12 @@ def review_counts() -> dict[str, int]:
     from supagent.models import Facet, Link, Tag
 
     try:
+        from supagent.knowledge.retire import waiting
+
         return {"values": db.session.query(Facet).filter(Facet.status == "proposed").count(),
                 "tags": db.session.query(Tag).filter(Tag.status == "proposed").count(),
-                "links": db.session.query(Link).filter(Link.status == "proposed").count()}
+                "links": db.session.query(Link).filter(Link.status == "proposed").count(),
+                "retire": waiting(1)[1]}
     except Exception:  # pylint: disable=broad-except
         db.session.rollback()
-        return {"values": 0, "tags": 0, "links": 0}
+        return {"values": 0, "tags": 0, "links": 0, "retire": 0}

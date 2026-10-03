@@ -83,6 +83,31 @@ def test_the_words_about_writing_the_answer_go():
     kept = "The 3 servers with the most failures:\n\n" + body
     assert without_preamble(kept) == kept
     assert without_preamble("Let me write the summary:\n\nShort.") == "Let me write the summary:\n\nShort."
+    # 0.9: an investigation thought aloud, then announced its answer: the answer is what follows the last announcement
+    full = ("# Why the batch is slow today\n\n## Root cause\n\nThe cache was degraded from 00:25 to 02:42 when one of its two "
+            "servers left the cluster: the steps that read it took eight times longer in every region.\n\n## What was ruled "
+            "out\n\n- The feeds arrived on time.\n- No server of the pool lacked memory or processor.\n\n## What it delays\n\n"
+            "The 65 runs still waiting start as the slots free up; the reports of 07:00 are at risk.")
+    aloud = ("Perfect! Now I have the complete picture. The publishing jobs wrote to the degraded cache (00:39-01:49). Let me "
+             "now write the complete answer.\n\n")
+    assert without_preamble(aloud + full) == full
+    draft = ("No breach on the servers. Let me now check whether today is a month end.\n\nThe 11th is the second Friday: it "
+             "is not.\n\nNow let me summarize what I've found and provide the answer.\n\n## Findings\n\n1. The ratio is "
+             "1.33.\n\nLet me provide the final answer.\n\n---\n\n**Answer:**\n\n")
+    assert without_preamble(draft + full) == full
+    assert without_preamble(aloud + "Short.") == aloud + "Short."                       # no full answer after it: kept
+    again = ("The map shows no link between the two. Let me re-examine the evidence to cite only what is established.\n\n"
+             "Looking at the data again: the step is 4.3x slower (1,752 s).\n\nHere's the corrected answer:\n\n")
+    assert without_preamble(again + full) == full
+    assert without_preamble("Now I have all the data needed. Let me compile the answer.\n\n---\n\n## Answer\n\n" + full) == full
+    told = full + "\n\nLet me know if I should write the note for the team."              # not an announcement of the answer
+    assert without_preamble(told) == told
+    # an answer that announces one of its own parts keeps everything before it
+    table = "| Region | Runs | Late |\n|---|---|---|\n" + "".join(f"| R{i} | {100 + i} | {i} |\n" for i in range(30))
+    parts = "## Cause\n\n" + "The cache lost a server at 00:25. " * 12 + "\n\nI'll provide the breakdown by region:\n\n" + table
+    assert without_preamble(parts) == parts
+    summed = "## Cause\n\n" + "The cache lost a server at 00:25. " * 12 + "\n\nLet me give a summary of the findings:\n\n" + full
+    assert without_preamble(summed) == summed                                             # no work said aloud before it
 
 
 def test_the_rows_a_limit_let_through_are_not_a_count(ctx, monkeypatch):

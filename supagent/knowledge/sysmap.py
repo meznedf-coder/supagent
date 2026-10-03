@@ -12,6 +12,7 @@ database they may query, a document, a guide, a Context page of their databases.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -192,22 +193,57 @@ def layout() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+GROUPS = 12               # groups of categories on the map at most
+GROUP_NAME = 40
+
+
+def _groups(raw: Any) -> list[dict[str, Any]]:
+    """The groups of categories an admin made for the display: a name and its categories, a category in one group
+    only (the first that names it), an empty group left out."""
+    out: list[dict[str, Any]] = []
+    taken: set[str] = set()
+    for g in (raw if isinstance(raw, list) else [])[:GROUPS]:
+        if not isinstance(g, dict):
+            continue
+        name = " ".join(str(g.get("name") or "").split())[:GROUP_NAME]
+        cats = []
+        for c in g.get("categories") or []:
+            c = str(c).strip().lower()[:24]
+            if c and c not in taken and c not in cats:
+                cats.append(c)
+        if name and cats:
+            taken |= set(cats)
+            out.append({"name": name, "categories": cats})
+    return out
+
+
 def save_layout(data: dict[str, Any], by: str) -> dict[str, Any]:
-    """An admin's places of the boxes ({"positions": {id: [x, y]}, "hidden": [ids], "folded": {category: bool}})."""
+    """An admin's arrangement of the map: {"positions": {id: [x, y]} the boxes placed by hand, "hidden": [ids],
+    "folded": {category: bool}, "columns": {category: [dx, dy]} where a category was moved from its place,
+    "groups": [{"name", "categories"}] the frames drawn around categories}. Display only: nothing here is read
+    by the agent."""
     import datetime as dt
 
     from supagent.models import Meta
 
+    def pair(v: Any) -> list[float] | None:
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            try:
+                return [round(float(v[0]), 1), round(float(v[1]), 1)]
+            except (TypeError, ValueError):
+                return None
+        return None
+
     pos = {}
     for k, v in (data.get("positions") or {}).items():
-        if str(k).isdigit() and isinstance(v, (list, tuple)) and len(v) == 2:
-            try:
-                pos[str(int(k))] = [round(float(v[0]), 1), round(float(v[1]), 1)]
-            except (TypeError, ValueError):
-                continue
+        if str(k).isdigit() and pair(v) is not None:
+            pos[str(int(k))] = pair(v)
     hidden = sorted({int(x) for x in data.get("hidden") or [] if str(x).isdigit()})
     folded = {str(k)[:24]: bool(v) for k, v in (data.get("folded") or {}).items()}
-    out = {"positions": pos, "hidden": hidden, "folded": folded, "updated_by": by,
+    columns = {str(k).strip().lower()[:24]: pair(v) for k, v in (data.get("columns") or {}).items()
+               if pair(v) is not None and pair(v) != [0.0, 0.0]}
+    out = {"positions": pos, "hidden": hidden, "folded": folded, "columns": columns,
+           "groups": _groups(data.get("groups")), "updated_by": by,
            "updated_at": dt.datetime.utcnow().isoformat(timespec="seconds")}
     row = db.session.get(Meta, LAYOUT_KEY)
     if row is None:
@@ -219,21 +255,27 @@ def save_layout(data: dict[str, Any], by: str) -> dict[str, Any]:
 
 
 def interactions() -> list[dict[str, Any]]:
+    """The interactions in use: drawn by an admin, or proposed from the texts and approved (0.9: a proposed one
+    waits in To review and is not drawn before)."""
     from supagent.models import Link
 
     rows = (db.session.query(Link).filter(Link.a_ref.like("facet:%"), Link.b_ref.like("facet:%"),
-                                          Link.status != "rejected").order_by(Link.id))
+                                          Link.status == "approved").order_by(Link.id))
     out = []
     for x in rows:
         a, b = x.a_ref.split(":", 1)[1], x.b_ref.split(":", 1)[1]
         if a.isdigit() and b.isdigit():
             out.append({"id": x.id, "a": int(a), "b": int(b), "kind": x.kind, "label": INTERACTIONS.get(x.kind, x.kind),
-                        "note": x.note or "", "status": x.status, "source": x.source})
+                        "note": x.note or "", "detail": x.detail or "", "evidence": x.evidence or "",
+                        "explained_by": x.explained_by or "", "status": x.status, "source": x.source})
     return out
 
 
-def save_interaction(a: int, b: int, kind: str, note: str, by: str, link_id: int | None = None) -> dict[str, Any]:
-    """An admin draws (or changes) an interaction between two values: approved at once."""
+def save_interaction(a: int, b: int, kind: str, note: str, by: str, link_id: int | None = None,
+                     detail: str | None = None) -> dict[str, Any]:
+    """An admin draws (or changes) an interaction between two values: approved at once, with its short
+    explanation (`note`) and its long one (`detail`: what to do when following it); explanations an admin
+    writes are never written over by the LLM."""
     from supagent.models import Facet, Link
 
     if kind not in INTERACTIONS:
@@ -251,10 +293,16 @@ def save_interaction(a: int, b: int, kind: str, note: str, by: str, link_id: int
         x = Link(a_ref=f"facet:{a}", b_ref=f"facet:{b}", kind=kind)
         db.session.add(x)
     x.a_ref, x.b_ref, x.kind = f"facet:{a}", f"facet:{b}", kind
-    x.note = (note or "").strip()[:500] or None
-    x.status, x.source, x.reviewed_by, x.confidence = "approved", "admin", by, 1.0
+    short = (note or "").strip()[:500] or None
+    long_ = (detail or "").strip()[:2000] or None if detail is not None else x.detail
+    if short != x.note or long_ != x.detail:          # written by the admin from now on
+        x.explained_by = by if (short or long_) else None
+    x.note, x.detail = short, long_
+    x.status, x.reviewed_by, x.confidence = "approved", by, 1.0
+    x.source = x.source if x.source in ("llm", "data") and link_id else "admin"
     db.session.commit()
-    return {"id": x.id, "a": a, "b": b, "kind": kind, "label": INTERACTIONS[kind], "note": x.note or ""}
+    return {"id": x.id, "a": a, "b": b, "kind": kind, "label": INTERACTIONS[kind], "note": x.note or "",
+            "detail": x.detail or "", "evidence": x.evidence or "", "explained_by": x.explained_by or ""}
 
 
 def delete_interaction(link_id: int) -> bool:
@@ -321,7 +369,25 @@ def map_data(admin: bool) -> dict[str, Any]:
     # an admin sees every category, the ones with no value yet too (a category just added has its column at once),
     # and how many proposed values wait (they are drawn once approved)
     proposed = db.session.query(Facet.id).filter(Facet.status == "proposed", Facet.facet.in_(cats)).count() if admin else 0
-    return {"categories": [{"name": c, "count": counts.get(c, 0), "builtin": c in ("subject", "application", "component")}
+    from supagent.models import Link
+
+    waiting = db.session.query(Link.id).filter(Link.a_ref.like("facet:%"), Link.b_ref.like("facet:%"),
+                                               Link.status == "proposed").count() if admin else 0
+    missing: list[str] = []
+    if admin:                                   # what an investigation still lacks (knowledge.readiness)
+        try:
+            from supagent.knowledge.readiness import report
+
+            missing = [x for x in report()["to_do"] if "wait in Data dictionary" not in x]
+        except Exception:  # pylint: disable=broad-except   (the map without it)
+            log.warning("supagent map: what is missing for investigations: not read", exc_info=True)
+            db.session.rollback()
+    from supagent.knowledge.facets import about, field_rules
+
+    said = about()
+    read = {c: rx.pattern for c, rx in field_rules()}
+    return {"categories": [{"name": c, "count": counts.get(c, 0), "builtin": c in ("subject", "application", "component"),
+                            "about": said.get(c, ""), "fields": read.get(c, "")}
                            for c in order if counts.get(c) or admin],
             "values": values, "links": links, "layout": layout(), "interactions": INTERACTIONS, "is_admin": admin,
-            "proposed": proposed}
+            "proposed": proposed, "proposed_interactions": waiting, "missing": missing}

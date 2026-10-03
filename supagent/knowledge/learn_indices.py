@@ -78,6 +78,32 @@ def computed_text(f: Any) -> str:
     return f"computed by the connector: the business-day label of {args[0] if args else 'a date'} (D, D-1, W-1, Y-1...)"
 
 
+def computed_help(text: str) -> str:
+    """What a computed column is, as its description: the connector knows it; the LLM, shown a column with no
+    value of its own, guesses (a business-date label described as "the status of a run")."""
+    text = str(text or "").strip()
+    return text[:1].upper() + text[1:] if text else ""
+
+
+def _field_facts(ftype: Any, st: dict[str, Any]) -> dict[str, Any]:
+    facts: dict[str, Any] = {"data_type": ftype, "stats": st}
+    if st.get("computed"):
+        facts["backend_help"] = computed_help(st["computed"])
+    return facts
+
+
+def describe_computed(source_id: int) -> int:
+    """The computed columns of a database whose description the LLM wrote and nobody verified: what the
+    connector says they are instead. Returns how many were corrected."""
+    n = 0
+    for f in db.session.query(KObject).filter(KObject.source_id == source_id, KObject.kind == "field",
+                                              KObject.gone_at.is_(None)):
+        said = computed_help((f.stats or {}).get("computed"))
+        if said and not f.verified and f.description_source in (None, "", "llm", "backend") and f.description != said:
+            f.description, f.description_source, n = said, "backend", n + 1
+    return n
+
+
 def computed_fields(conn: Any, index: str) -> dict[str, dict[str, Any]]:
     """The columns the connector computes for an index (none: no request)."""
     if not (getattr(conn, "label_column", None) or getattr(conn, "label_time_column", None)):
@@ -273,6 +299,7 @@ def learn_indices(run: Run, source: Source, database: Any, deadline: float, prog
         else:
             objects = {n: n for n in names}
         known = {o.name: o for o in db.session.query(KObject).filter_by(source_id=source.id, kind="index")}
+        out["computed_described"] = describe_computed(source.id)      # (what the connector says of its own columns)
         seen_idx = {("", n) for n in objects}          # the listing is complete: gone indices are known
         seen_fields: set[tuple[str, str]] = set()
 
@@ -297,7 +324,7 @@ def learn_indices(run: Run, source: Source, database: Any, deadline: float, prog
                     try:                               # learned before they were: at once, not at the next profile
                         for fname, st in computed_fields(conn, index).items():
                             ftype = st.pop("type", None)
-                            upsert(run, source, "field", obj_name, fname, {"data_type": ftype, "stats": st})
+                            upsert(run, source, "field", obj_name, fname, _field_facts(ftype, st))
                             seen_fields.add((obj_name, fname))
                             out["fields"] += 1
                     except SourceStopped:
@@ -330,7 +357,7 @@ def learn_indices(run: Run, source: Source, database: Any, deadline: float, prog
             out["profiled"] += 1
             for fname, st in fstats.items():
                 ftype = st.pop("type", None)
-                upsert(run, source, "field", obj_name, fname, {"data_type": ftype, "stats": st})
+                upsert(run, source, "field", obj_name, fname, _field_facts(ftype, st))
                 seen_fields.add((obj_name, fname))
                 out["fields"] += 1
             db.session.commit()

@@ -40,14 +40,26 @@ def learn_task(reason: str = "manual", databases: list[str] | None = None) -> di
     return run_learning(reason=reason, databases=databases)
 
 
+@celery_app.task(name="supagent.classify", soft_time_limit=2 * 3600, time_limit=2 * 3600 + 300)
+def classify_task(reason: str = "manual", minutes: int | None = None) -> dict:
+    from superset import db
+
+    from supagent.knowledge.learner import run_classification
+
+    try:
+        return run_classification(reason=reason, minutes=minutes)
+    finally:
+        db.session.remove()
+
+
 @celery_app.task(name="supagent.context", soft_time_limit=2 * 3600, time_limit=2 * 3600 + 300)
 def context_task(reason: str = "manual") -> dict:
     from superset import db
 
-    from supagent.knowledge.context import build_context
+    from supagent.knowledge.context import build_then_classify
 
     try:
-        return build_context(reason=reason)
+        return build_then_classify(reason=reason)
     finally:
         db.session.remove()
 
@@ -149,6 +161,14 @@ def learn_tick() -> None:
         except Exception:  # pylint: disable=broad-except
             db.session.rollback()
             log.exception("supagent: clean-up of the LLM calls")
+        try:                                     # the daily backup of the knowledge, before the learning changes it
+            from supagent.knowledge import backup
+
+            if backup.due():
+                backup.run_backup(reason="schedule")
+        except Exception:  # pylint: disable=broad-except   (the learning goes on)
+            db.session.rollback()
+            log.exception("supagent: the daily backup of the knowledge")
         if due_today():
             run_learning(reason="schedule")
         else:
@@ -171,10 +191,10 @@ def learn_tick() -> None:
         except Exception:  # pylint: disable=broad-except
             db.session.rollback()
             log.exception("supagent: the knowledge store was not kept in step")
-        from supagent.knowledge.context import build_context, context_due
+        from supagent.knowledge.context import build_then_classify, context_due
 
-        if context_due():                    # the nightly Context, after the day's learning
-            build_context(reason="schedule")
+        if context_due():                    # the nightly Context, after the day's learning, then the categories
+            build_then_classify(reason="schedule")
     finally:
         db.session.remove()
 
@@ -289,9 +309,40 @@ def dispatch_learning(reason: str = "manual", databases: list[str] | None = None
     return "thread"
 
 
+def dispatch_classification(reason: str = "manual", minutes: int | None = None) -> str:
+    from supagent import settings
+    from supagent.knowledge.learner import run_classification
+
+    mode = settings.get("agent.executor")
+    if mode == "celery" or (mode == "auto" and workers_alive()):
+        try:
+            classify_task.apply_async(args=[reason, minutes], **_queue())
+            return "celery"
+        except Exception as ex:  # pylint: disable=broad-except
+            log.warning("supagent: Celery refused the classification (%s), running it in the web server", ex)
+    _in_thread(lambda: run_classification(reason=reason, minutes=minutes))
+    return "thread"
+
+
+def dispatch_backup(by: str = "") -> str:
+    """A backup asked in the page: made by this web server, in its own directory (where the page lists it)."""
+    from supagent.knowledge.backup import run_backup
+
+    _in_thread(lambda: run_backup(reason="manual", by=by))
+    return "thread"
+
+
+def dispatch_restore(name: str, parts: list[str] | None, by: str = "") -> str:
+    """A restore asked in the page: done by this web server, which has the file."""
+    from supagent.knowledge.backup import run_restore
+
+    _in_thread(lambda: run_restore(name, parts, by=by))
+    return "thread"
+
+
 def dispatch_context(reason: str = "manual") -> str:
     from supagent import settings
-    from supagent.knowledge.context import build_context
+    from supagent.knowledge.context import build_then_classify
 
     mode = settings.get("agent.executor")
     if mode == "celery" or (mode == "auto" and workers_alive()):
@@ -300,7 +351,7 @@ def dispatch_context(reason: str = "manual") -> str:
             return "celery"
         except Exception as ex:  # pylint: disable=broad-except
             log.warning("supagent: Celery refused the context build (%s), running it in the web server", ex)
-    _in_thread(lambda: build_context(reason=reason))
+    _in_thread(lambda: build_then_classify(reason=reason))
     return "thread"
 
 

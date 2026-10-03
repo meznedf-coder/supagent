@@ -16,7 +16,7 @@ from superset.extensions import encrypted_field_factory
 
 from supagent.textsafe import SafeString, SafeText
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def _now() -> dt.datetime:
@@ -566,7 +566,13 @@ class Link(db.Model):  # type: ignore[name-defined]
     status = sa.Column(SafeString(16), default="approved")
     created_at = sa.Column(sa.DateTime, default=_now)
     reviewed_by = sa.Column(SafeString(255))
-    note = sa.Column(SafeText)                  # 14: what the relation is, in a few words (the system map shows it)
+    note = sa.Column(SafeText)                  # 14: what the relation is, in a few words (15: the short explanation,
+    #                                             shown when the link is clicked on the map)
+    # 15: the long explanation: what to do when following it (what to check on the other part, what a problem there
+    # does here), given to the agent with the system around a question
+    detail = sa.Column(SafeText)
+    evidence = sa.Column(SafeText)              # 15: where it was found (the sentence of a document, with its title)
+    explained_by = sa.Column(SafeString(255))   # 15: who wrote the explanations: "llm" or the admin
 
 
 class Classified(db.Model):  # type: ignore[name-defined]
@@ -673,6 +679,16 @@ def store_kinds() -> int:
     return n
 
 
+def _link_notes_as_evidence() -> None:
+    """0.9: a link the LLM proposed from a text kept the sentence that says it as its note; the note is now the
+    short explanation shown on the map, the sentence its evidence (the explanations are written by the next
+    classification)."""
+    for x in db.session.query(Link).filter(Link.source == "llm", Link.note.isnot(None)):
+        if len(x.note or "") > 120 and not x.evidence:
+            x.evidence, x.note = x.note, None
+    db.session.flush()
+
+
 def create_or_upgrade() -> tuple[int, int]:
     """Create the missing tables and columns and record the schema version; (version before, after)."""
     engine = db.engine
@@ -693,6 +709,8 @@ def create_or_upgrade() -> tuple[int, int]:
         _restem()
     if 0 < before < 14:
         _rename_classification("note", "guide")
+    if 0 < before < 15:
+        _link_notes_as_evidence()
     if row is None:
         db.session.add(Meta(key="schema_version", value=str(SCHEMA_VERSION)))
     else:

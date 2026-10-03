@@ -152,7 +152,10 @@
     "sync.unchanged": "search pieces unchanged", "embed.embedded": "embedded", "embed.left": "left to embed",
     answers: "Helpful answers checked", hit_at_1: "share found first", hit_at_3: "share found in the first 3",
     mrr: "mean reciprocal rank", curated: "catalog descriptions", relations: "catalog relations",
-    "documents.documents_read": "documents read", "documents.refused": "definitions refused" };
+    "documents.documents_read": "documents read", "documents.refused": "definitions refused",
+    values_read: "values read", fields_read: "fields and labels read", proposed: "proposed (To review)",
+    to_classify: "to classify", calls: "LLM calls", items: "items", tags: "categories given", links: "relations",
+    values: "values", texts: "texts read", subject: "subjects", application: "applications", component: "components" };
   var STEP_SKIP = ["step", "at", "database", "seconds", "phase", "fallbacks", "changes", "interrupted", "last_error",
     "complete", "error", "stopped"];
   function stepText(x) {
@@ -223,12 +226,31 @@
           S.num(st.during.requests) + " calls (" + S.num(st.during.tokens) + " tokens), " + S.num(st.during.copied) +
           " copied from the same name");
         Object.keys(st.skipped || {}).forEach(function (name) { parts.push(name + ": not learned: " + st.skipped[name]); });
+        if (r.kind === "classify") {                         // a classification run: what it read, what it proposed
+          var cl = st.classified || {}, seed = cl.seeded || {};
+          if (seed.values_read) parts.push(S.num(seed.values_read) + " values read in the data (" + S.num(seed.fields_read || 0) + " fields and labels)");
+          if (seed.proposed) parts.push(S.num(seed.proposed) + " new value" + (seed.proposed > 1 ? "s wait" : " waits") + " in To review");
+          if (cl.items) parts.push(S.num(cl.items) + " items classified in " + S.num(cl.calls || 0) + " LLM calls: " + S.num(cl.tags || 0) +
+            " categories given, " + S.num(cl.proposed || 0) + " values proposed, " + S.num(cl.links || 0) + " relations");
+          else if (!cl.error) parts.push("no item changed");
+          if (cl.left) parts.push(S.num(cl.left) + " items left (the next run goes on)");
+          if (cl.error) parts.push("error: " + cl.error);
+          var inter = st.interactions;
+          if (inter && (inter.texts || inter.proposed || inter.error)) parts.push("interactions: " + S.num(inter.texts || 0) + " texts read, " +
+            S.num(inter.proposed || 0) + " proposed" + (inter.error ? " (" + inter.error + ")" : ""));
+        }
+        if (r.kind === "backup" && st.name) parts.push("file " + st.name + (st.bytes ? " (" + (S.bytes ? S.bytes(st.bytes) : S.num(st.bytes)) + ")" : "") +
+          ((st.removed || []).length ? " · " + st.removed.length + " older removed" : ""));
+        if (r.kind === "restore" && st.name) parts.push("of " + st.name + (st.saved_first ? " · the present state saved first in " + st.saved_first : "") +
+          (st.error ? " · " + st.error : ""));
+        if (st.llm_use) parts.push("LLM: " + S.num(st.llm_use.calls) + " calls, " + S.num((st.llm_use.prompt_tokens || 0) + (st.llm_use.completion_tokens || 0)) +
+          " tokens, " + S.num(Math.round(st.llm_use.seconds || 0)) + " s" + (st.llm_use.failed ? ", " + S.num(st.llm_use.failed) + " failed" : ""));
         if (st.relations) parts.push("relations: " + (st.relations.same_values || 0) + " measured");
         if (st.llm) parts.push("AI descriptions: " + (st.llm.written || 0) + (st.llm.left ? ", " + st.llm.left +
           " left (the next run goes on)" : "") + (st.llm.error ? " (" + st.llm.error + ")" : ""));
         if (r.error && !/^stop asked at /.test(r.error)) parts.push(r.error);
         if (r.status === "running" || r.status === "stopping") running = true;
-        tb.appendChild(el("tr", {}, [el("td", { text: "#" + r.id }), el("td", { text: (r.kind === "context" ? "context · " : "") + r.reason }), el("td", { text: S.when(r.started_at) }),
+        tb.appendChild(el("tr", {}, [el("td", { text: "#" + r.id }), el("td", { text: (r.kind && r.kind !== "learn" ? r.kind + " · " : "") + r.reason }), el("td", { text: S.when(r.started_at) }),
           el("td", { text: secs }), el("td", { html: '<span class="badge ' + (r.status === "done" ? "ok" : r.status === "error" ? "bad" : "") + '">' + S.esc(r.status === "stopping" ? "stopping…" : r.status) + "</span>" }),
           el("td", { class: "num", text: S.num(r.changes) }), el("td", {}, [el("span", { text: parts.join(" · ") }), stepsBox(r)])]));
       });
@@ -278,6 +300,14 @@
       setTimeout(runs, 1500);
     });
   });
+  $("classify-now").addEventListener("click", function () {
+    var res = $("learn-result");
+    S.admin("POST", "classify", {}).then(function (r) {
+      res.textContent = r.error || "classification started (" + r.started + "): it is listed below with its steps";
+      res.className = "result " + (r.error ? "bad" : "good");
+      setTimeout(runs, 1500);
+    });
+  });
   $("learn-stop").addEventListener("click", function () {
     var res = $("learn-result"), btn = $("learn-stop");
     btn.disabled = true;
@@ -288,6 +318,70 @@
       setTimeout(runs, 1000);
     });
   });
+  // ---------------------------------------------------------------- the backups of the knowledge
+  var PART_WORDS = { categories: "categories and System map", catalog: "catalog", memory: "memory", documents: "documents",
+    notes: "notes", context: "Context", learned: "learned answers and paths", dictionary: "descriptions of the data",
+    settings: "settings", vectors: "vectors" };
+  function backups() {
+    return S.admin("GET", "backups").then(function (d) {
+      var tb = $("backups").querySelector("tbody");
+      tb.innerHTML = "";
+      $("backup-dir").textContent = d.error ? "The directory " + d.directory + " cannot be read: " + d.error :
+        "Written on this server in " + d.directory;
+      (d.backups || []).forEach(function (b) {
+        var parts = Object.keys(b.parts || {});
+        var holds = parts.map(function (p) { return (PART_WORDS[p] || p) + " " + S.num(b.parts[p]); }).join(" · ");
+        var acts = el("td", { class: "row-actions" });
+        var panel = el("tr", { class: "backup-restore", hidden: "hidden" });
+        if (!b.error) {
+          acts.appendChild(el("a", { class: "linkish", href: document.body.dataset.adminApi + "backups/" + encodeURIComponent(b.name),
+                                     download: b.name, text: "Download" }));
+          acts.appendChild(el("button", { type: "button", class: "linkish", text: "Restore…", "aria-expanded": "false", onclick: function (ev) {
+            panel.hidden = !panel.hidden;
+            ev.currentTarget.setAttribute("aria-expanded", String(!panel.hidden));
+          } }));
+          var boxes = parts.map(function (p) {
+            var cb = el("input", { type: "checkbox", value: p });
+            return el("label", { class: "backup-part" }, [cb, document.createTextNode(" " + (PART_WORDS[p] || p) + " (" + S.num(b.parts[p]) + ")")]);
+          });
+          var res = el("span", { class: "result", role: "status" });
+          var go = el("button", { type: "button", class: "btn small primary", text: "Restore the parts chosen", onclick: function () {
+            var chosen = boxes.map(function (l) { return l.firstChild; }).filter(function (c) { return c.checked; }).map(function (c) { return c.value; });
+            if (!chosen.length) { res.textContent = "choose the parts to put back"; res.className = "result bad"; return; }
+            S.confirm(go, "Put back " + chosen.map(function (p) { return PART_WORDS[p] || p; }).join(", ") + " as of " + S.when(b.created_at) + "?",
+              { yes: "Restore", no: "Cancel", detail: "The present " + (chosen.length > 1 ? "parts are" : "part is") +
+                " replaced by the backup's. The present state is saved first in a backup of its own: a restore can be undone." }).then(function (ok) {
+              if (!ok) return;
+              go.disabled = true;
+              S.admin("POST", "backups/" + encodeURIComponent(b.name) + "/restore", { parts: chosen }).then(function (r) {
+                go.disabled = false;
+                res.textContent = r.error || "restore started: it is listed with the runs (Daily learning)";
+                res.className = "result " + (r.error ? "bad" : "good");
+                setTimeout(function () { runs(); backups(); }, 2500);
+              });
+            });
+          } });
+          panel.appendChild(el("td", { colspan: "6" }, [el("div", { class: "backup-parts" }, boxes), el("div", { class: "actions" }, [go, res])]));
+        }
+        tb.appendChild(el("tr", {}, [el("td", { text: b.name }), el("td", { text: S.when(b.created_at) }),
+          el("td", { class: "num", text: S.bytes ? S.bytes(b.bytes) : S.num(b.bytes) }),
+          el("td", { class: "muted", text: (b.reason || "") + (b.by ? " · " + b.by : "") }),
+          el("td", { class: "muted", text: b.error || holds }), acts]));
+        tb.appendChild(panel);
+      });
+      if (!(d.backups || []).length) tb.appendChild(el("tr", {}, [el("td", { colspan: "6", class: "muted",
+        text: "No backup on this server yet: the daily one is made at the hour above (by the workers' beat), or Back up now." })]));
+    });
+  }
+  $("backup-now").addEventListener("click", function () {
+    var res = $("backup-result");
+    S.admin("POST", "backups", {}).then(function (r) {
+      res.textContent = r.error || "backup started: it is listed below in a moment, and with the runs";
+      res.className = "result " + (r.error ? "bad" : "good");
+      setTimeout(function () { runs(); backups(); }, 2500);
+    });
+  });
+  backups();
   // ---------------------------------------------------------------- the knowledge: in the Data dictionary
   var dictUrl = document.body.dataset.dictionaryUrl || "";
   [["go-review", "review"], ["go-catalog", "catalog"], ["go-memory", "memory"], ["go-docs", "docs"]].forEach(function (x) {

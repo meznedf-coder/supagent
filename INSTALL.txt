@@ -1,16 +1,17 @@
-supagent 0.8.2 - the AI agent inside Apache Superset
+supagent 0.9.0 - the AI agent inside Apache Superset
 ====================================================
 
 What is in this folder
-  supagent-0.8.2-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
+  supagent-0.9.0-py3-none-any.whl   the package for Superset 6.1 (pure Python; nothing else to install)
   supagent-guide.html / .pdf        the guide (install, LLM middleware, learning, screens)
   catalog.example.yaml              an example catalog, to adapt
   SHA256SUMS                        checksums
 
-Upgrading? From 0.8.0 or 0.8.1: pip install this wheel on every host and restart (no schema change). From 0.7.0 or
-0.7.1: "Upgrade from 0.7 to 0.8.0" below (with this wheel). From 0.6.0: the same steps (init then goes
-from schema 9 to 14). From 0.5.4: the steps of "Upgrade from 0.5.4 to 0.6.0" with this wheel (schema 7 to 14).
-Steps 1-8 are for a new install.
+Upgrading? From 0.8.x: pip install this wheel on every host, superset supagent init once (schema 14 to 15: three
+new nullable columns), restart ("From 0.8 to 0.9.0" below says what starts by itself and how to go back). From
+0.7.0 or 0.7.1: "Upgrade from 0.7 to 0.8.0" below (with this wheel: schema 13 to 15). From 0.6.0: the same steps
+(init then goes from schema 9 to 15). From 0.5.4: the steps of "Upgrade from 0.5.4 to 0.6.0" with this wheel
+(schema 7 to 15). Steps 1-8 are for a new install.
 
 A new Superset 6.1.0 installed from PyPI (tested 2 Oct 2026, on an empty PostgreSQL database owned by an ordinary
 role): three packages must be pinned, or Superset itself does not start (none is about supagent):
@@ -24,7 +25,7 @@ role): three packages must be pinned, or Superset itself does not start (none is
 1. Install in Superset's virtualenv (pip only)
 
    PY=$(head -1 "$(command -v superset)" | sed 's/^#!//')
-   $PY -m pip install supagent-0.8.2-py3-none-any.whl
+   $PY -m pip install supagent-0.9.0-py3-none-any.whl
    Superset 6.1: nothing else is needed (offline too).
 
 2. Register it: one line in superset_config.py (no logic)
@@ -121,6 +122,70 @@ role): three packages must be pinned, or Superset itself does not start (none is
      superset supagent init          builds it (the first time it finds the extensions)
      superset supagent store status  extensions, versions, size, warnings
 
+From 0.8 to 0.9.0
+=================
+
+On every host  $PY -m pip install supagent-0.9.0-py3-none-any.whl, then once, on one host:
+      superset supagent init          tables: schema version 14 -> 15
+(three new nullable columns on supagent_link: detail, evidence, explained_by: the long explanation of an
+interaction, where it was found, who explained it; the sentence an older proposed interaction kept as its note
+moves to its evidence). Then restart the web servers, the Celery workers and beat. Settings -> Chat settings
+shows "supagent 0.9.0 (tables v15)".
+
+What starts by itself:
+  - A question that asks what is wrong and why gets the system around it, two more tools (compare_groups,
+    system_links), the investigation's steps and twice the calls of an answer (agent.max_steps). Nothing to set.
+    compare_groups reads every measure of a table in one call (about a hundred small aggregations filtered on
+    the question's scope, three at a time): with osagg 0.2.13 it takes 4 to 6 seconds, with 0.2.12 about twice
+    that (same results). On a busy OpenSearch: Settings -> agent.compare_threads = 1 (one query at a time) and
+    agent.compare_seconds (45: after it, no further field is read).
+    When the rows wait on one value (a pool, a queue), the same call also compares every row that has this value
+    (who else is there, what holds it): about sixty more aggregations, 8 to 10 seconds in all. To leave it to the
+    agent's own calls: Settings -> agent.compare_follow = off.
+    The days your team compares with: Settings -> agent.compare_against (yesterday, 1 week ago, 4 weeks ago by
+    default; e.g. "yesterday, 1 week ago, 3 weeks ago, 3 months ago"; empty: the usual of the last days only).
+    What makes it say more: in the catalog, a description of each time field of the tables of runs (released,
+    started, ended), usual_of on the field that holds a usual value, and the relationships to the tables of
+    changes and alerts (README, Investigations: What to prepare).
+  - With the daily learning, the LLM reads the documents, guides, Context pages and team notes for the
+    interactions they state between known parts (learn.interactions, on; at most ten minutes a day, each text
+    once). What it finds waits in Data dictionary -> To review; nothing is drawn or used before an admin approves
+    it. To leave it off: Settings -> learn.interactions.
+  - An answer of an investigation marked Helpful keeps its path instead of its last query (To review). Every
+    other answer marked Helpful keeps, with its query, its path (the tables and fields, the metrics and labels,
+    the steps); one that ran no query to keep (a health check, a comparison) is learned as its path. An admin
+    corrects a path in Edit before confirming.
+  - The categories: the new values the learning reads in the data's fields (categories.fields) now wait in To
+    review like the LLM's proposals (one click approves a category's found values); the values in use stay as
+    they are. Parts that look retired are proposed there too (categories.retire_days, 14): nothing is retired by
+    itself. To have the values of the data approved at once as before: Settings -> categories.review_all off.
+  - superset supagent classify (and Classify now in the settings) is a run listed with the learning runs. Each
+    Context build is followed by the classification (context.classify_after, on), which reads what the Context
+    wrote; the nightly learning leaves the categories to it.
+  - Every interaction of the System map gets a short and a long explanation (what to do when an investigation
+    follows it), written by the LLM with the classification for the ones that have none (an admin's words are
+    kept); the lines of the map carry no text, a click shows them. The agent gets them.
+  - With the classification, the log tables are read for the interactions their lines state (learn.interactions_logs,
+    on; no LLM): what they find waits in To review with its evidence, like the documents' proposals.
+  - Log tables: compare_logs (what the logs say that they do not usually) is offered to investigations and to
+    the questions about status; a table is read as logs when it has a text field (a message) and a time field.
+    Its counting line by line stops after 40 seconds on a big table (said in its result).
+  - A backup of the knowledge is written every day at 01:00 (the workers' beat) in supagent-backups in Superset's
+    home, the last 14 kept (Settings -> Backups of the knowledge: backup.enabled, backup.hour, backup.keep,
+    backup.dir). With several servers, set backup.dir to a directory they share. No secret is in a file.
+What helps most, and what is missing: superset supagent check-system  (and --question "..." for one question).
+
+Back to 0.8.2: pip install the 0.8.2 wheel on every host, then, in Superset's database, remove what 0.8 does not
+know (it would draw a waiting interaction as an approved one, and give a path as a query to run; the path
+kept with the other learned answers is ignored by 0.8; the three new columns of supagent_link stay, unused):
+      DELETE FROM supagent_link WHERE status = 'proposed' AND a_ref LIKE 'facet:%' AND b_ref LIKE 'facet:%';
+      DELETE FROM supagent_recipe WHERE tool IN ('investigation', 'path');
+      DELETE FROM supagent_classified WHERE ref LIKE '%#links';
+   and restart. The interactions an admin approved stay (0.8 draws them); the rejected ones stay too, unseen.
+   The values found in the data that still wait in To review are approved by 0.8's next learning (its rule); the
+   map's groups and moved categories, the categories' descriptions and the retirement proposals are ignored by
+   0.8 and found again by 0.9.
+
 Upgrade from 0.7 to 0.8.0
 ========================
 
@@ -140,16 +205,17 @@ What changes:
     exchanges, as before.
   - Superset's database: new nullable columns (supagent_message.topic, supagent_recipe.edited_by, .edited_at,
     .previous, supagent_association.source, .added_by, supagent_doc.reader, .auth, .secret, supagent_link.note),
-    schema 14; the guides renamed; no table added, nothing deleted. superset_config.py does not change.
+    schema 14 (15 with this wheel: three more columns of supagent_link, see "From 0.8 to 0.9.0"); the guides
+    renamed; no table added, nothing deleted. superset_config.py does not change.
 
 Steps (Superset stopped for a few minutes):
  1. Stop the web servers, the Celery workers and beat, on every host.
  2. Back up: pg_dump -Fc -f superset-before-0.8.0.dump "<Superset's database>"; $PY -m pip freeze > pip-before-0.8.0.txt
- 3. On every host: $PY -m pip install supagent-0.8.2-py3-none-any.whl     ($PY -m pip show supagent: 0.8.2)
+ 3. On every host: $PY -m pip install supagent-0.9.0-py3-none-any.whl     ($PY -m pip show supagent: 0.9.0)
  4. Once, on one host: superset supagent init
-      tables: schema version 13 -> 14
+      tables: schema version 13 -> 15
       knowledge store: N pieces of the catalog's notes are guides now      (when the store is used and had some)
- 5. Start everything. Checks: Settings -> Chat settings shows "supagent 0.8.2 (tables v14)"; Data dictionary ->
+ 5. Start everything. Checks: Settings -> Chat settings shows "supagent 0.9.0 (tables v15)"; Data dictionary ->
     Knowledge -> Catalog: the former notes are guides; a question in the chat answers.
 
 Back to 0.7.1: stop, pip install the 0.7.1 wheel, then in Superset's database:

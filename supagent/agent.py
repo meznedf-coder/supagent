@@ -31,6 +31,8 @@ HISTORY_MESSAGES = 40      # of the chat given with a question at most (the runn
 HISTORY_CHARS = 3000      # of one earlier message given with the question
 REPLY_WORDS = 25          # a reply to the agent's question back is at most this long
 MANY_PARTS = 4            # a question of this many parts (commas, "and") gets half as many calls more
+INVESTIGATION_STEPS = 2   # an investigation gets this many times the calls of an answer
+RETRY_TOKENS = 2048       # tokens of the step after an unreadable tool call, at least
 FRAGMENT_WORDS = 8        # "The failed jobs.", "Only PROD.": completes the previous question
 FRAGMENT = re.compile(r"^\s*(?:and|et|or|ou|only|just|but|mais|the|le|la|les|for|pour|in|on|with|without|avec|"
                       r"sans|per|par|by|excluding|including|except|hors|what about|how about|same|m[êe]me|seulement|"
@@ -171,15 +173,43 @@ queries of the chat's earlier answers are listed with the question), and give th
 name.""",
     "investigation": """
 
-Investigations ("why did ... fail", "what happened on ...", "was a server saturated"): 1) find where and when
-in the data the question is about (its own table: counts by its fields and by hour or day, against the days
-before); 2) read what people said about that time: the team's notes (search_notes with those days) and the
-documents (search_knowledge); 3) when that data is about systems (jobs, servers, applications), call
-check_health for that window with entities = the servers / applications found (CPU, memory, disk, OOM kills,
-outages, queues, HTTP errors, latency, licences with from-to and worst value); list_alerts shows the alerts
-firing now; compare_to_usual says whether a metric was unusual for that time (the same window on earlier
-weeks); 4) answer with what matches, where each finding comes from, and what was not found. Stay on the
-question's data: other subjects' tables only when the question or what you found points to them.""",
+Investigations ("why is ... late, slow, failing", "what happened", "find the cause"): work in this order.
+1) The facts, in one call: compare_groups on the question's table with its scope (the parts it names: "The system
+   around this question" lists them; the environment; the business date when there is one) and no measure. It
+   compares every measure with the same time of the earlier days (the usual) and gives it on the team's reference
+   days (yesterday, a week ago, weeks ago; against = [...] for the days the question names: "than last month"),
+   and says which is off and on which values: each duration against its usual, the volumes, and the stages of
+   the rows in their order (the table's time fields: how many rows had reached each by now, how long after the
+   one before, how many wait). start: when what is looked at began (today's rows: midnight today), end: now.
+   Never compare days with queries of your own, nor count again what it gave. If it answers with an error, fix
+   the call as the error says and make it again: it is the base of everything after. If nothing stands out,
+   against the usual and against the older reference days, say so with its figures and stop.
+2) Read it in the order of the stages: the first that is clearly off says what kind of problem it is (its
+   description says what a row waits for there); fewer rows at the stages after it are its wake, but a stage it
+   says is off on its own (the rows take longer once there) is a second finding: explain each. Late before
+   it could start: it waited for what it depends on (look at those: what feeds it, what runs before it). Ready
+   but waiting: it waits for a capacity (a slot, a token, a queue): who holds it is in the same result,
+   outside_the_scope (the rows outside the question's scope there: more than usual, and whose) and
+   the_rows_there (the same comparison over every row there: what lasts longer, and where). Started but longer:
+   where (the same call on the table of its steps; the servers; the version; the volume processed). The field
+   named first is where the change is concentrated. A figure as usual against the last days and far from an
+   older reference day is a change older than those days: look at what changed between the two.
+3) Why, from what stands out: the records compare_groups gives under "related" (the changes made to that
+   application, the alerts of those servers); what it depends on, runs on, reads or calls in the system picture
+   (system_links for any part) and the health of those servers or services in that window (check_health with
+   entities = their names) and their logs (compare_logs: what they say that they do not usually); the changes
+   recorded before it started; what the team wrote of such a day (memory, documents, notes: a month end). A level is a finding only against its usual:
+   promql_query says whether each series is "as on the previous days" (a pool that is full every night, a queue
+   as long as every night are not what changed), check_health marks the breaches that happen on most days.
+4) Check a cause before naming it: it must concern the same rows (those servers, that step, that application)
+   and the same time, and what is not affected must be free of it. What else happened and does not match (an
+   alert on a server those rows did not use, a release of an application whose other rows are on time, an input
+   they do not read, a level or a breach that is usual, a known effect of another size) is not the cause: say in
+   one line that it was ruled out, and why. A day the team documented, with the effect it documented, is the
+   explanation: say it is expected.
+5) Answer: what is wrong with its figures against usual (and against the reference days when they say more),
+   where, since when, the cause with the record or the figure that shows it, what it delays, what was ruled out,
+   and what you could not check.""",
     "usual": """
 
 Unusual or not (asked here): compare_to_usual(promql, start, end) compares the window with the same window
@@ -214,7 +244,8 @@ INTENTS = {
                          r"\b(saved?|create|creer|cr[ée]e|build|update|modif\w*|enregistr\w*|edit)\b[^.?!\n]{0,50}"
                          r"\b(chart|graph|graphique)|\bchart (id|#)\s*\d+|\bexisting (chart|dashboard)", re.I),
     "investigation": re.compile(r"\b(why|cause|reason|root cause|saturat\w*|incident|slow\w*|degrad\w*|outage|"
-                                r"pourquoi|raison|lent\w*|panne)\b", re.I),
+                                r"investigat\w*|diagnos\w*|troubleshoot\w*|what (has |have )?happened|"
+                                r"what explains?|pourquoi|raison|lent\w*|panne|que s'est-il pass[ée])\b", re.I),
     "files": re.compile(r"\b(excel|xlsx|csv|extract\w*|export\w*|file|fichier|download|t[ée]l[ée]charg\w*|mail\w*|"
                         r"e-mail|envoi\w*|send|report\w*|rapport|schedul\w*|every (day|week|morning|monday)|"
                         r"chaque|tous les|quotidien|hebdo\w*|json)\b", re.I),
@@ -253,13 +284,15 @@ TOOLS_OF = {
                "get_dashboard_info", "fix_chart_time_range", "chart_image", "create_virtual_dataset", "get_chart_data"},
     "files": {"export_excel", "send_email", "create_report", "list_reports"},
     "images": {"chart_from_sql", "chart_image"},
-    "usual": {"compare_to_usual", "chart_anomalies"},
+    "usual": {"compare_to_usual", "chart_anomalies", "compare_groups", "compare_logs"},
     "sqllab": {"save_sql_query", "open_sql_lab_with_context", "generate_explore_link"},
     "read_charts": {"get_chart_data", "get_chart_info", "list_charts", "list_dashboards", "get_dashboard_info",
                     "chart_image", "chart_anomalies"},
     "status": {"get_chart_data", "get_chart_info", "list_charts", "list_dashboards", "get_dashboard_info",
-               "chart_image", "compare_to_usual", "chart_anomalies"},
-    "investigation": {"compare_to_usual", "chart_anomalies", "search_notes"},
+               "chart_image", "compare_to_usual", "chart_anomalies", "compare_groups", "compare_logs", "system_links"},
+    "investigation": {"compare_to_usual", "chart_anomalies", "search_notes", "compare_groups", "compare_logs",
+                      "system_links"},
+    "system": {"system_links"},
     "history": {"search_my_chats"},
     "notes": {"search_notes", "read_note", "add_note", "change_note", "delete_note"},
 }
@@ -939,7 +972,8 @@ def claims_check(answer: str, trace: list[dict]) -> str:
     return ("\n\n(Check: " + "; ".join(dict.fromkeys(notes)) + ".)") if notes else ""
 
 
-QUERY_TOOLS = ("execute_sql", "promql_query", "export_excel", "check_health", "chart_from_sql", "get_chart_data")
+QUERY_TOOLS = ("execute_sql", "promql_query", "export_excel", "check_health", "chart_from_sql", "get_chart_data",
+               "compare_groups", "compare_logs", "compare_to_usual")
 LOOKUP_TOOLS = QUERY_TOOLS + ("describe_data", "data_changes", "search_knowledge", "get_dataset_info",
                               "list_datasets", "list_charts", "get_chart_info", "list_dashboards", "get_dashboard_info")
 RESULT_CLAIM = re.compile(r"```json|\b(sql|query|requ[êe]te|promql)\s+(run|ran|executed|ex[ée]cut[ée]e?)\b|"
@@ -956,12 +990,17 @@ LOOKUP_NUDGE = ("(Check before answering: your answer says the data has no such 
                 "another name (a channel, a direction, a source). Then answer, or ask back if it really is not there. "
                 "Either way write the whole answer for the user as if for the first time: they see neither the one "
                 "above nor this check, so never mention it, apologise or say what changed.)")
-WRITTEN_SQL_NUDGE = ("(Check before answering: your answer shows a query that was not run, with numbers that no query "
+WRITTEN_SQL_NUDGE = ("(Check before answering: your answer shows a query that was not run, with results that no query "
                      "returned. Call execute_sql with that query now: the tool runs it on the data and gives you its "
                      "rows; then answer from its result. Never write a query in the answer instead of running it. Then "
                      "write the whole answer for the user as if for the first time: they see neither the one above nor "
                      "this check, so never mention it, apologise or say what changed.)")
 WRITTEN_SQL = re.compile(r"```[a-z]*\s*\n\s*(?:WITH|SELECT)\b", re.I)       # a query written out, not run
+# ... and what it returned said in words ("The query returned no rows", "this query gives the traders..."): a result
+# no query gave
+CLAIMED_RESULT = re.compile(r"\b(?:the|this|that) (?:query|request|sql) (?:returned|returns|gave|gives|shows|showed|"
+                            r"found|finds|lists)\b|\breturned (?:no|\d)|\bno (?:rows?|records?|results?) "
+                            r"(?:were |was |are |is )?(?:returned|found)\b|\bla requ[êe]te (?:a )?(?:renvoy|retourn|donn)", re.I)
 # "The data does not contain a 'voice' field", "there is no such column", "n'existe pas": a claim of absence
 ABSENCE = re.compile(
     r"\b(?:does not|doesn't|do not|don't) (?:contain|have|include|hold|record)\b|\bno (?:such )?(?:field|column|"
@@ -977,6 +1016,14 @@ NUMBERS_NUDGE = ("(Check before answering: these numbers or names of your answer
 NUMBERS_NOTE = ("\n\n(Check: these numbers or names do not come from the results of this answer's queries: "
                 "{numbers}.)")
 BAD_TOOL_CALL = re.compile(r"parse tool call|tool call arguments|invalid tool call|failed to parse", re.I)
+# the conversation is longer than the model's context (llama.cpp, vLLM, OpenAI say it their way)
+CONTEXT_FULL = re.compile(r"exceeds? the available context|exceed_context_size|context (?:size|length|window) "
+                          r"(?:exceeded|is exceeded)|maximum context length|too many tokens|prompt is too long", re.I)
+SHRUNK = (1500, 500)       # chars kept of the older tool results when the context is full, then again
+KEPT_WHOLE = 3             # the latest tool results kept whole the first time
+CONTEXT_FULL_NUDGE = ("(The conversation became longer than the model can read: the older results above were "
+                      "shortened. Make no more calls unless one is essential; write the answer for the user now from "
+                      "the results above, and say what could not be checked.)")
 UNREADABLE_CALL = ("(Your last reply could not be read: the arguments of its tool call were not valid JSON (too long, "
                    "or cut). Call the tool again with short arguments: a chart config names columns and aggregates, "
                    "never the data rows. Or write the answer with what you have.)")
@@ -1003,6 +1050,14 @@ LIMIT_NUDGE = ("(Check before answering: {n} is the number of rows the LIMIT {n}
                "time: they see neither the one above nor this check, so never mention it, apologise or say what "
                "changed.)")
 LIMIT_NOTE = "\n\n(Check: {n} is where the LIMIT of a query cut its rows, not a count: more rows match.)"
+TIE_NUDGE = ("(Check before answering: your answer gives {names} as a cause, but nothing ties {it} to {scope}: the "
+             "team's system map shows no link between them, and no result of this answer shows the affected rows on "
+             "{it}. Either check it (group the affected rows by the field that holds {it}; system_links says what "
+             "{scope} runs on and depends on), or take {it} out of the causes and say what is established. Then write "
+             "the whole answer for the user as if for the first time: they see neither the one above nor this check, "
+             "so never mention it, apologise or say what changed.)")
+TIE_NOTE = ("\n\n(Check: {names} named as a cause, but neither the system map nor this answer's results tie {it} to "
+            "{scope}.)")
 HOW_MANY = re.compile(r"\b(how many|how much|combien|quel(?:le)? (?:nombre|quantit[ée]))\b", re.I)
 NONE_SAID = re.compile(r"\b(no|none|zero|nothing|aucun\w*|z[ée]ro|pas de|rien)\b", re.I)
 
@@ -1104,6 +1159,19 @@ def repeating(text: str) -> int | None:
     return None
 
 
+def shortened(messages: list[dict], chars: int, keep: int) -> int:
+    """The conversation made shorter when the model's context is full: the tool results but the latest `keep`
+    cut to their first `chars` characters (the conclusion of a tool comes first). How many were cut."""
+    tools = [m for m in messages if m.get("role") == "tool"]
+    n = 0
+    for m in tools[:-keep] if keep else tools:
+        text = str(m.get("content") or "")
+        if len(text) > chars + 80:
+            m["content"] = text[:chars] + " ...[shortened: the conversation was too long for the model]"
+            n += 1
+    return n
+
+
 def unsupported_answer(answer: str, trace: list[dict]) -> str | None:
     """A reminder when an answer was written without the tools: no tool called at all, or
     results shown (a JSON block, "SQL run", a table of numbers) with no query run. A question
@@ -1113,8 +1181,9 @@ def unsupported_answer(answer: str, trace: list[dict]) -> str | None:
     if asks_back(answer) and not _has_data(answer):   # a question back, not results with an offer at the end
         return None
     done = {t.get("called") or t["tool"] for t in trace if t.get("status") == "done"}
-    if WRITTEN_SQL.search(answer or "") and _has_data(answer) and not done & set(QUERY_TOOLS):
-        return WRITTEN_SQL_NUDGE                       # the query in the text, its figures made up
+    if WRITTEN_SQL.search(answer or "") and not done & set(QUERY_TOOLS) and \
+            (_has_data(answer) or CLAIMED_RESULT.search(answer or "")):
+        return WRITTEN_SQL_NUDGE                       # the query in the text, its figures (or its rows) made up
     if not trace:
         return NO_TOOL_NUDGE
     if RESULT_CLAIM.search(answer or "") and not done & set(QUERY_TOOLS):
@@ -1141,6 +1210,9 @@ def unsupported_note(answer: str, trace: list[dict]) -> str:
 
 SAVING_TOOLS = {"generate_chart", "update_chart", "generate_dashboard", "add_chart_to_existing_dashboard",
                 "save_sql_query", "create_virtual_dataset", "create_report", "update_chart_preview"}
+CALLS_AT_ONCE = 8          # tool calls run from one message of the model (the others are sent back)
+PER_DAY = 3                # the third query of an answer that differs from earlier ones only by its dates is sent back
+DAY_LITERAL = re.compile(r"'(?:\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?|\d{8}|[DWMY]-\d{1,3})'", re.I)
 REPEAT_NOTE = ("You already made exactly this call in this answer and its result is above: the same call gives the "
                "same result. Use it: answer the user, or make a different call.")
 # an answer that ends by announcing a step instead of taking it ("Let me run the query.")
@@ -1175,10 +1247,34 @@ PREAMBLE = re.compile(r"\b(let me|i will|i'll|now i will|now i'll)\s+(now\s+)?(w
                       r"format|give|provide|summari[sz]e)\b", re.I)
 
 
+ANNOUNCED = re.compile(
+    r"(?:^|(?<=[.!?:\n]))[^\n.!?]{0,160}\b(?:let me|i will|i'll|now i will|now i'll|je vais|laissez-moi)\s+"
+    r"(?:now\s+|maintenant\s+)?(?:write|present|put together|compose|compile|prepare|formulate|draft|give|provide|"
+    r"summari[sz]e|r[ée]diger|pr[ée]senter|donner|r[ée]sumer)\b[^\n.!?]{0,120}\b(?:answer|summary|response|findings?|conclusions?|report|"
+    r"r[ée]ponse|synth[èe]se|r[ée]sum[ée]|what i(?:'ve| have) found)\b[^\n.!?]{0,60}[.:!]?[ \t]*\n"
+    r"|(?:^|(?<=[.!?:\n]))[ \t]*(?:here(?:'s| is)|voici)\s+(?:the|my|la|ma)\s+(?:(?:corrected|final|revised|updated|"
+    r"complete|full)\s+)?(?:answer|response|r[ée]ponse)(?:\s+(?:corrig[ée]e|finale|compl[èe]te))?\s*[.:][ \t]*\n", re.I)
+ALOUD = re.compile(r"\b(?:let me (?:now |first |also |just )?(?:check|verify|look|see|query|run|confirm|compare|examine|"
+                   r"re-?examine|re-?check|reconsider|double-check|review)|"
+                   r"now i have|i (?:now )?have (?:all|the complete|enough|the full)|perfect[.!]|good[.!]|great[.!]|i see\b|"
+                   r"i need to|je vais (?:maintenant )?(?:v[ée]rifier|regarder|comparer)|j'ai maintenant|parfait[.!])", re.I)
+ANSWER_LABEL = re.compile(r"^\s*(?:#{1,4}\s*)?\*{0,2}(?:final\s+)?(?:answer|r[ée]ponse(?:\s+finale)?)\s*:?\*{0,2}\s*:?\s*\n", re.I)
+
+
 def without_preamble(answer: str) -> str:
     """The model's words about writing the answer before it ("Now I have all the numbers. Let me write the
-    summary:" and a rule): not for the user. Only a short first paragraph with no figure in it."""
+    summary:" and a rule): not for the user. A short first paragraph with no figure in it; or everything before
+    the last announcement of the answer ("Let me now write the complete answer."), when what comes before it
+    is the work said aloud ("Let me check...", "Now I have...") and a full answer follows it. An answer that
+    announces one of its own parts ("I'll give the breakdown by region:") keeps everything."""
     text = (answer or "").lstrip()
+    said = [m for m in ANNOUNCED.finditer(text)]
+    if said and ALOUD.search(text[:said[-1].end()]):
+        rest = text[said[-1].end():].lstrip("\n")
+        rest = re.sub(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*\n", "", rest).lstrip()
+        rest = ANSWER_LABEL.sub("", rest, count=1).lstrip()
+        if len(rest) >= 400 and len(rest) >= 0.25 * len(text):        # a full answer follows
+            return rest
     m = re.match(r"(.{1,300}?)(\n\s*\n|\n(?=\s*(?:-{3,}|\*{3,}|_{3,})\s*\n))", text, flags=re.S)
     if not m or re.search(r"\d", m.group(1)) or not PREAMBLE.search(m.group(1)):
         return answer
@@ -1402,6 +1498,11 @@ class Agent:
         moa = getattr(self, "moa", None)
         return set(ROUTE_INTENTS.get(moa.route, set())) if moa is not None and moa.active else set()
 
+    def _investigating(self, question: str) -> bool:
+        """The question asks what is wrong and why (its words, or the router's route): the investigation's
+        instructions, tools, system picture and calls."""
+        return "investigation" in (intents(getattr(self, "intent_text", None) or question) | self._route_intents())
+
     def after_saved(self, message_id: int) -> None:
         """The runner saved the answer: its route row knows its message (Helpful then teaches the router)."""
         route_id = getattr(self, "route_id", None)
@@ -1429,6 +1530,7 @@ class Agent:
             {"charts"} if self.wants_saved_chart else set())
         if not self.rich:
             found |= {"files", "images"}
+        found |= self._route_intents() & {"investigation"}      # the router read it as one
         for k in ("charts", "status", "sqllab", "investigation", "files", "images", "usual"):
             if k in found and not (k == "usual" and ("investigation" in found or "status" in found)):
                 text += SECTIONS[k]
@@ -1494,6 +1596,14 @@ class Agent:
         except Exception:  # pylint: disable=broad-except
             log.warning("supagent: the team's words: not given", exc_info=True)
         self.people_words = text                        # the memory, the rules, the glossary: what people said
+        try:                                            # the parts the question names, and for an investigation
+            from supagent.knowledge.brief import brief_block   # what they depend on and where they are in the data
+
+            # (the whole picture for an investigation and a question of how the system works; for any other
+            # question only what it names: a follow-up on a server's load needs no map of the platform)
+            text += brief_block(question, full=self._investigating(question) or bool(self._route_intents() & {"system"}))
+        except Exception:  # pylint: disable=broad-except
+            log.warning("supagent: the system around the question: not given", exc_info=True)
         try:
             from supagent.knowledge.resolve import where_block
 
@@ -1519,6 +1629,13 @@ class Agent:
                                         prefer=ROUTE_KINDS.get(moa.route) if moa is not None and moa.active else None)
             except Exception:  # pylint: disable=broad-except
                 log.warning("supagent: knowledge found: not given", exc_info=True)
+        if self._investigating(question):                # the paths the team validated for such problems
+            try:
+                from supagent.knowledge.paths import paths_block
+
+                text += paths_block(question, shown)
+            except Exception:  # pylint: disable=broad-except
+                log.warning("supagent: the investigation paths: not given", exc_info=True)
         if recipes:
             text += ("\n\nWays that answered similar questions before (helpful = marked Helpful by a user, "
                      "confirmed = also approved by an admin). Start "
@@ -1528,8 +1645,14 @@ class Agent:
             for r in recipes:
                 where = f" on database id {r['database_id']}" if r.get("database_id") else ""
                 speed = f", {r['seconds']:.1f} s" if r.get("seconds") is not None else ""
+                if r["tool"] == "path":                  # no query to run again: the checks that answered it
+                    text += (f"\n- Q: {r['question'][:240]}\n  the way it was answered ({r['status']}, used "
+                             f"{r['uses']} time(s)): " + " ".join(r["query"].split())[:900])
+                    continue
                 text += (f"\n- Q: {r['question'][:240]}\n  {r['tool']}{where} ({r['status']}, used {r['uses']} "
                          f"time(s){speed}): {r['query'][:900]}")
+                if r.get("path"):                        # the data it used and its steps (0.9)
+                    text += f"\n  its path: {r['path']}"
         return text.strip()
 
     def _call(self, name: str, args: dict) -> tuple[str, str]:
@@ -1703,6 +1826,7 @@ class Agent:
         self.guard.saved = {}
         self.redirected_chart = False
         self.refused: set[str] = set()                 # calls sent back before running: they run if sent again
+        self._shapes: dict[str, set[str]] = {}         # the queries of this answer, their dates left out
         failed: dict[str, str] = {}
         charts: list[str] = []
         emailed: list[str] = []
@@ -1710,7 +1834,7 @@ class Agent:
         asked_at = self._asked_at = len(messages)      # what the LLM was given, before its own words
         trace: list[dict] = []
         nudged = announced = numbers_asked = rules_asked = count_asked = looped = limit_asked = notes_asked = False
-        named_asked = carry_asked = False
+        named_asked = carry_asked = tie_asked = False
         about_notes = notes_request(getattr(self, "intent_text", None) or question)
         done: set[str] = set()                         # identical successful calls: not run twice
         saved_calls: set[str] = set()                   # identical saving calls: not run again either
@@ -1720,15 +1844,17 @@ class Agent:
         specs = self._specs_for(question)
         building = "charts" in intents(question) or self.wants_saved_chart
         steps = self.max_steps * (2 if building else 1)   # several charts and a dashboard: more calls
-        if not building and len(re.findall(r",|;|\band\b|\bet\b", question or "")) >= MANY_PARTS:
+        if not building and self._investigating(question):
+            steps = self.max_steps * INVESTIGATION_STEPS   # the facts, where, why, the check: more calls
+        elif not building and len(re.findall(r",|;|\band\b|\bet\b", question or "")) >= MANY_PARTS:
             steps = int(steps * 1.5)                   # a report of many figures: more calls
-        unreadable = 0
+        unreadable = full = 0
         for i in range(steps):
             self._check_stop()
             if i == steps - 2 and steps >= 4 and trace:   # the answer before the calls run out, not after
                 messages.append({"role": "user", "content": LAST_CALLS})
             try:
-                msg = self.llm.chat(messages, tools=specs, max_tokens=self._answer_tokens())
+                msg = self.llm.chat(messages, tools=specs, max_tokens=self._answer_tokens(short=bool(unreadable)))
             except EmptyAnswer:
                 add_usage(self.usage, self.llm.last_usage)
                 fallback = self._empty_fallback(trace)
@@ -1736,6 +1862,13 @@ class Agent:
                     raise
                 return fallback + self._marks(fallback, trace), trace
             except LLMError as ex:
+                if CONTEXT_FULL.search(str(ex)) and full < len(SHRUNK) and trace:
+                    n = shortened(messages, SHRUNK[full], KEPT_WHOLE if full == 0 else 1)
+                    full += 1
+                    log.info("supagent: the context was full: %d older tool results shortened", n)
+                    if full == len(SHRUNK) or not n:
+                        messages.append({"role": "user", "content": CONTEXT_FULL_NUDGE})
+                    continue
                 if not BAD_TOOL_CALL.search(str(ex)) or unreadable >= 2:
                     if unreadable and trace:           # it did things before: say what, not an error
                         return self._out_of_steps(messages, trace), trace
@@ -1816,6 +1949,14 @@ class Agent:
                     messages.append({"role": "user", "content": NAMED_NUDGE.format(value=gap[0], field=gap[1],
                                                                                    table=gap[2])})
                     continue
+                loose = None if tie_asked else self._untied(question, answer, trace)
+                if loose:                              # once: a cause that nothing ties to the question's parts
+                    tie_asked = True
+                    self.usage["nudges"] = self.usage.get("nudges", 0) + 1
+                    log.info("supagent: answer sent back (a cause not tied to the question's parts: %s)", loose[0])
+                    messages.append({"role": "user", "content": TIE_NUDGE.format(
+                        names=loose[0], scope=loose[1], it="them" if "," in loose[0] else "it")})
+                    continue
                 unknown = self._ungrounded(answer, messages[:asked_at] + [
                     m if m["role"] == "tool" else {"role": "assistant", "tool_calls": m["tool_calls"]}
                     for m in messages[asked_at:-1] if m["role"] == "tool" or m.get("tool_calls")])
@@ -1839,7 +1980,7 @@ class Agent:
                     messages.append({"role": "user", "content": COUNT_NUDGE})
                     continue
                 if nudged or announced or numbers_asked or rules_asked or count_asked or looped or limit_asked or \
-                        notes_asked or named_asked or carry_asked:
+                        notes_asked or named_asked or carry_asked or tie_asked:
                     answer = without_apology(answer)   # written again after a check the user never saw
                 answer = without_preamble(answer)
                 missing = [c for c in charts if c.splitlines()[-1].strip() not in answer]
@@ -1870,14 +2011,22 @@ class Agent:
                 still = self._unnamed(question, trace) if named_asked else None
                 if still:                              # still not in the queries after asking: marked
                     note += NAMED_NOTE.format(value=still[0], field=still[1])
+                loose = self._untied(question, answer, trace) if tie_asked else None
+                if loose:                              # still blamed after asking: marked
+                    note += TIE_NOTE.format(names=loose[0], scope=loose[1], it="them" if "," in loose[0] else "it")
                 note += self._marks(answer, trace, conditions_only=True)
                 if cut is not None:
                     note += LOOP_NOTE
                 return (answer + claims_check(answer, trace) + honesty_note(answer, trace) + note +
                         self._other_reading(answer, trace)), trace
-            for tc in calls:
+            for at, tc in enumerate(calls):
                 self._check_stop()
                 name = tc["function"]["name"]
+                if at >= CALLS_AT_ONCE:                # a flood of calls in one message: the first ones only
+                    messages.append({"role": "tool", "tool_call_id": tc.get("id", name), "content": (
+                        f"tool error (not run): {CALLS_AT_ONCE} calls at most in one message. Read the results above "
+                        "first; then make the calls that are still needed, one question each.")})
+                    continue
                 try:
                     args = json.loads(tc["function"].get("arguments") or "{}")
                 except json.JSONDecodeError:
@@ -1910,7 +2059,7 @@ class Agent:
                     refused = self._refusal(name, args)
                     again = call_key in self.refused
                     if refused and again and "(not run: another database)" not in refused \
-                            and "(not run: confirmation)" not in refused:
+                            and "(not run: confirmation)" not in refused and "(not run: one query per day)" not in refused:
                         refused = None                 # sent again unchanged: the period, a rule, a count may be meant
                     if refused:                        # another database: never (the question did not name it)
                         if again:                      # a third time: "you already made this call and it failed"
@@ -1987,13 +2136,17 @@ class Agent:
         return (text + claims_check(text, trace) + self._marks(text, trace, given=given) +
                 (LOOP_NOTE if cut is not None else "") + "\n\n(Stopped: the tool calls of one answer were used up.)")
 
-    def _answer_tokens(self) -> int | None:
+    def _answer_tokens(self, short: bool = False) -> int | None:
         """The most tokens one LLM answer may have (llm.max_answer_tokens; with thinking, four times as
-        many: the reasoning counts too): a model repeating itself stops there."""
+        many: the reasoning counts too): a model repeating itself stops there. `short`: the step after a tool
+        call the server could not read (a call that ran on to the limit): a quarter of it, so that a second one
+        does not take as many minutes again."""
         try:
             cap = int(settings.get("llm.max_answer_tokens") or 0)
         except Exception:  # pylint: disable=broad-except
             return None
+        if short:
+            cap = min(cap or RETRY_TOKENS, max(RETRY_TOKENS, (cap or 0) // 4))
         if cap and getattr(getattr(self.llm, "cfg", None), "thinking", False):
             cap *= 4
         return cap or None
@@ -2071,6 +2224,20 @@ class Agent:
             log.warning("supagent: the check of named values failed", exc_info=True)
             return None
 
+    def _untied(self, question: str, answer: str, trace: list[dict]) -> tuple[str, str] | None:
+        """An investigation's answer blames parts of the system that nothing ties to the question's parts (the
+        system map, the results of its own queries): (their names, the question's parts), else None."""
+        if not self._investigating(question):
+            return None
+        try:
+            from supagent.knowledge.leads import untied
+
+            names, scope = untied(getattr(self, "intent_text", None) or question, answer, trace)
+        except Exception:  # pylint: disable=broad-except   (a check never breaks an answer)
+            log.warning("supagent: the check of the cause: not done", exc_info=True)
+            return None
+        return (", ".join(names[:6]), scope) if names else None
+
     def _refusal(self, name: str, args: dict) -> str | None:
         """Why this call is sent back before it runs (once), every reason at once: it reads a table in
         another database than the one the question or its charts name, it misses the question's period,
@@ -2089,6 +2256,7 @@ class Agent:
                 return delete_refusal(getattr(self, "raw_question", ""), getattr(self, "chat_history", []), args)
             reasons = [refusal(self.scope, name, args) if self.scope is not None else None,
                        period_refusal(getattr(self, "period_text", None) or question, name, args),
+                       self._day_by_day(name, args),
                        self._counted_samples(name, args, question),
                        None if getattr(self, "open_question", False) else
                        condition_refusal(getattr(self, "support", None), name, args)]
@@ -2115,6 +2283,28 @@ class Agent:
             except Exception:  # pylint: disable=broad-except
                 pass
             return None
+
+    def _day_by_day(self, name: str, args: dict) -> str | None:
+        """The same query once per day: it differs from two earlier ones of this answer only by its dates (a
+        date, a time, a business-date label). Fifteen calls for fifteen days is one query grouped by day, or one
+        compare_groups; the calls of an answer are for what is not yet known."""
+        if name != "execute_sql":
+            return None
+        req = args.get("request") if isinstance(args.get("request"), dict) else args
+        sql = " ".join(str(req.get("sql") or "").split())
+        if not sql or not DAY_LITERAL.search(sql):
+            return None
+        seen = getattr(self, "_shapes", None)
+        if seen is None:
+            seen = self._shapes = {}
+        same = seen.setdefault(DAY_LITERAL.sub("'?'", sql), set())
+        same.add(sql)
+        if len(same) < PER_DAY:
+            return None
+        return ("tool error (not run: one query per day): this query differs from " + str(len(same) - 1) + " earlier "
+                "ones only by its dates. Do not ask day by day. One query over the whole range grouped by day (GROUP BY "
+                "DATE_TRUNC('day', the time field), or by the business date) gives every day at once; compare_groups "
+                "compares a day with the earlier ones in one call (measure = the figure, e.g. \"avg(FIELD)\").")
 
     def _other_reading(self, answer: str, trace: list[dict]) -> str:
         """A value the question named that is also in data the answer did not read nor mention (BILLING_API's

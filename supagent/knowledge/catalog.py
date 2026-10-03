@@ -36,7 +36,8 @@ TTL = 60.0
 
 CLASSIFICATIONS = {
     "glossary": "Business terms: YAML  term: definition",
-    "index": "One or more indices: YAML  index-name: {description, time_field, fields, relationships}",
+    "index": "One or more indices: YAML  index-name: {description, time_field, fields, relationships}; a field "
+             "that holds the usual value of another says so: usual_of: <that field>",
     "metrics": "Metrics: YAML  tables: {metric: {description, unit, labels, sql, saved_metrics}}, and optionally "
                "database, description, label_relationships",
     "relationships": "How metric labels match index fields: YAML list of {label, index, field, description}",

@@ -135,6 +135,9 @@ def test_memory_signals_approval_and_prompt(clean_knowledge):
     assert (m.scope, m.status, m.kind) == ("team", "proposed", "rule")      # waits for an admin
     block = prompt_block(alice)
     assert "Show durations in minutes" in block and "UAT" not in block
+    # 0.9: a memory that says when it applies is no filter for the other questions ("show only BILLING data" was
+    # applied to "How many jobs failed yesterday?")
+    assert 'one that says when it applies ("when the user says X", "for the desk Y") applies only then' in block
     m.status = "active"
     db.session.commit()
     assert "Exclude the UAT environment" in prompt_block(sm.find_user(username="bob").id)

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any
 
@@ -266,16 +267,17 @@ def learn(databases: tuple[str, ...], no_llm: bool, minutes: int | None, plan: b
 @click.option("--build", is_flag=True, help="Build it now: the facts pages, and the summary pages whose sources changed")
 @click.option("--no-llm", is_flag=True, help="Only the facts pages (no LLM call)")
 @click.option("--force", is_flag=True, help="Write the summary pages again even when their sources did not change")
+@click.option("--no-classify", is_flag=True, help="Not the classification after it (context.classify_after)")
 @with_appcontext
-def context(build: bool, no_llm: bool, force: bool) -> None:
+def context(build: bool, no_llm: bool, force: bool, no_classify: bool) -> None:
     from superset.extensions import db
 
     from supagent.models import ContextPage
 
     if build:
-        from supagent.knowledge.context import build_context
+        from supagent.knowledge.context import build_context, build_then_classify
 
-        out = build_context(reason="cli", llm=not no_llm, force=force)
+        out = (build_context if no_classify else build_then_classify)(reason="cli", llm=not no_llm, force=force)
         click.echo(json.dumps(out, indent=2, default=str))
         if out.get("status") == "error":
             sys.exit(1)
@@ -435,11 +437,27 @@ def index(refresh_docs: bool) -> None:
 @click.option("--limit", default=400, show_default=True, type=int)
 @with_appcontext
 def classify(minutes: int, limit: int) -> None:
-    from supagent.knowledge.facets import classify as run, review_counts
+    from supagent.knowledge.facets import review_counts
+    from supagent.knowledge.learner import run_classification
+
+    out = run_classification(reason="cli", minutes=minutes, limit=limit)     # a run: listed in Settings with its steps
+    out["waiting_for_review"] = review_counts()
+    click.echo(json.dumps(out, indent=2, default=str))
+
+
+@supagent.command(help="Read the documents, guides, Context pages and team notes for the interactions between "
+                  "parts of the system they state, and propose them for the System map (To review), now")
+@click.option("--minutes", default=15, show_default=True, type=int)
+@click.option("--limit", default=200, show_default=True, type=int, help="Texts read at most")
+@click.option("--again", is_flag=True, help="Read every text again (after many new category values)")
+@with_appcontext
+def interactions(minutes: int, limit: int, again: bool) -> None:
+    from supagent.knowledge.facets import review_counts
+    from supagent.knowledge.interactions import run
     from supagent.llm import LLM, llm_task
 
-    with llm_task("classify"):
-        out = run(LLM(), seconds=minutes * 60.0, limit=limit)
+    with llm_task("interactions"):
+        out = run(LLM(), seconds=minutes * 60.0, limit=limit, again=again)
     out["waiting_for_review"] = review_counts()
     click.echo(json.dumps(out, indent=2, default=str))
 
@@ -565,6 +583,83 @@ def check_knowledge(as_json: bool) -> None:
         for line in out["problems"]:
             click.echo(f"- {line}")
     if out["problems"]:
+        raise SystemExit(1)
+
+
+@supagent.command("check-system", help="What the agent knows of the system for an investigation (the parts, what "
+                  "they are part of, their interactions, where they are in the data, the joins, the usual values, "
+                  "the health checks, the validated paths) and what is missing; --question: what it is given for "
+                  "that question. Nothing is called (no LLM), nothing is changed")
+@click.option("--question", default=None, help="A question as a user would write it")
+@click.option("--user", default=None, help="As this Superset user (the data they may read)")
+@click.option("--json", "as_json", is_flag=True, help="The whole report as JSON")
+@with_appcontext
+def check_system(question: str | None, user: str | None, as_json: bool) -> None:
+    from supagent.knowledge.learner import learning_username
+    from supagent.knowledge.readiness import report, text
+    from supagent.security import acting_as
+
+    with acting_as(user or learning_username()):
+        out = report(question)
+    click.echo(json.dumps(out, indent=2, default=str) if as_json else text(out))
+
+
+@supagent.command(help="Save the whole knowledge in one file now (the categories and the System map, the catalog, the "
+                  "memory, the documents, the notes, the Context, the learned answers and paths, the descriptions "
+                  "of the data, the settings; no secret), in backup.dir; the daily one is made by the workers' beat")
+@click.option("--vectors/--no-vectors", default=None, help="With the vectors of the search pieces (default: backup.vectors)")
+@with_appcontext
+def backup(vectors: bool | None) -> None:
+    from supagent.knowledge.backup import run_backup
+
+    out = run_backup(reason="cli", vectors=vectors)
+    click.echo(json.dumps(out, indent=2, default=str))
+    if out.get("status") not in ("done",):
+        raise SystemExit(1)
+
+
+@supagent.command(help="The backups of the knowledge on this server, the latest first")
+@with_appcontext
+def backups() -> None:
+    from supagent.knowledge.backup import directory, listing
+
+    files = listing()
+    click.echo(f"{len(files)} backup(s) in {directory()}")
+    for f in files:
+        parts = ", ".join(f"{p} {n}" for p, n in (f.get("parts") or {}).items())
+        click.echo(f"{f['name']}  {f['bytes'] / 1e6:.1f} MB  {f.get('created_at') or ''}  {f.get('reason') or ''}"
+                   + (f"  [{parts}]" if parts else "") + (f"  {f['error']}" if f.get("error") else ""))
+
+
+@supagent.command(help="Put back the knowledge of a backup, whole or by part: the present rows of each part asked are "
+                  "replaced by the backup's (the present state is saved first in a backup of its own)")
+@click.argument("name")
+@click.option("--parts", default="", help="Comma separated: categories, catalog, memory, documents, notes, context, "
+              "learned, dictionary, settings, vectors (default: every part of the backup)")
+@click.option("--yes", is_flag=True, help="Do it (without: what would be restored is listed)")
+@with_appcontext
+def restore(name: str, parts: str, yes: bool) -> None:
+    from supagent.knowledge import backup as B
+
+    name = os.path.basename(name)
+    try:
+        manifest = B.manifest_of(B.path_of(name))
+    except (ValueError, OSError) as ex:
+        raise click.ClickException(str(ex)) from ex
+    wanted = [p.strip() for p in parts.split(",") if p.strip()]
+    have = manifest.get("parts") or {}
+    unknown = [p for p in wanted if p not in have]
+    if unknown:
+        raise click.ClickException(f"not in this backup: {', '.join(unknown)} (it has: {', '.join(have)})")
+    click.echo(f"{name}: made {manifest.get('created_at')} by supagent {manifest.get('supagent')} ({manifest.get('reason')})")
+    for p in (wanted or list(have)):
+        click.echo(f"  {p}: " + ", ".join(f"{t} {n}" for t, n in have[p].items()))
+    if not yes:
+        click.echo("Nothing was changed: add --yes to put these back (the present state is saved first).")
+        return
+    out = B.run_restore(name, wanted or None, by="cli")
+    click.echo(json.dumps(out, indent=2, default=str))
+    if out.get("status") != "done":
         raise SystemExit(1)
 
 

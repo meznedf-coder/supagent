@@ -148,7 +148,7 @@ def _field_line(f: KObject) -> str:
             line += f", avg {_num(st.get('avg'))}"
     if st.get("filled_pct") is not None and st["filled_pct"] < 99.5:
         line += f" (filled in {st['filled_pct']}% of documents)"
-    if st.get("computed"):
+    if st.get("computed") and str(st["computed"]).lower() not in (f.description or "").lower():
         line += f" ({st['computed']})"
     return line
 

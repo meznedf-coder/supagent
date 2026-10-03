@@ -203,8 +203,8 @@ def kept_questions(text: str, database_id: int | None, exclude: int | None = Non
     ws = words(text)
     if not ws or not database_id:
         return []
-    q = db.session.query(Recipe.id, Recipe.question, Recipe.words).filter(Recipe.database_id == database_id,
-                                                                          Recipe.status.in_(USED))
+    q = db.session.query(Recipe.id, Recipe.question, Recipe.words).filter(
+        Recipe.database_id == database_id, Recipe.status.in_(USED), Recipe.tool != "investigation")
     if generic_only:
         q = q.filter(Recipe.generic.is_(True))
     scored = sorted(((len(ws & set((w or "").split())), i, question) for i, question, w in q.limit(5000)
@@ -243,11 +243,17 @@ def record_recipe(message_id: int, user_id: int, question: str, trace: list[dict
     sig = signature(f"{tool}:{pattern}")
     ws = " ".join(sorted(words(question)))
     is_generic = bool(generic and generic.get("generic"))
+    from supagent.knowledge.paths import used
+
+    args = {**args, "_path": used(trace)}             # what the answer used and in which order (0.9)
     same = db.session.get(Recipe, generic["same_as"]) if is_generic and generic.get("same_as") else None
     if same is not None and (same.status not in USED or same.database_id != database_id
                              or (same.status == "confirmed" and same.signature != sig)):
         same = None               # a way an admin confirmed is only changed by an admin
     if same is not None and same.signature != sig:      # the same question, answered another way: the newest
+        said = ((same.args or {}).get("_path") or {}).get("text") if isinstance(same.args, dict) else None
+        if said:                                         # an admin's own words on its path stay
+            args["_path"] = {**args["_path"], "text": said}
         same.tool, same.query, same.signature, same.args, same.target = tool, query, sig, args, target[:512]
         same.rows, same.steps = _rows_of(final), len(trace)
     old = same or (db.session.query(Recipe).filter(Recipe.signature == sig, Recipe.status.in_(USED))
@@ -340,8 +346,30 @@ def _learn_from_helpful(message_id: int, llm: Any = None) -> int | None:
         return None
     trace = trace_of(m)
     tool, query = final_query(trace)
+    from supagent.knowledge import paths
+
+    if not query and not paths.is_investigation(said[-1], message_id):
+        # no query to keep (a check of the health, a comparison with usual): the way it went is what is learned
+        steps = paths.path_text(paths.used(trace))
+        if not steps:
+            return None
+        with acting_as(user.username):
+            kept = kept_questions(" ".join(said[-3:]), final_database(trace))
+            db.session.commit()
+            generic = generalize(said[-1], said[:-1], steps, paths.PLAIN, llm=llm, kept=kept)
+            m = db.session.get(Message, message_id)
+            if m is None or m.feedback != 1:
+                return None
+            r = paths.record_plain(message_id, conv.user_id, said[-1], trace, generic=generic)
+            return r.id if r is not None else None
     if not query:
         return None
+    if paths.is_investigation(said[-1], message_id):     # an investigation: its path, not its last query
+        with acting_as(user.username):
+            answer = m.content or ""
+            db.session.commit()                          # no metadata connection held during the LLM call
+            r = paths.record(message_id, conv.user_id, said[-1], answer, trace, llm=llm)
+            return r.id if r is not None else None
     with acting_as(user.username):
         kept = kept_questions(" ".join(said[-3:]), final_database(trace))
         db.session.commit()                              # no metadata connection held during the LLM call
@@ -510,6 +538,10 @@ def check_recipe_query(r: Recipe, query: str) -> dict[str, Any]:
     if not query:
         raise RecipeError("the query is empty")
     t0 = time.time()
+    if r.tool == "investigation":                        # a path is read by people and by the agent, not run
+        return {"ok": True, "rows": 0, "columns": [], "sample": [], "note": "an investigation path: nothing to run"}
+    if r.tool == "path":
+        return {"ok": True, "rows": 0, "columns": [], "sample": [], "note": "a path: nothing to run"}
     if r.tool in ("generate_chart", "update_chart"):
         try:
             json.loads(query)
@@ -546,13 +578,20 @@ def check_recipe_query(r: Recipe, query: str) -> dict[str, Any]:
             "seconds": round(time.time() - t0, 2)}
 
 
-def edit_recipe(r: Recipe, question: str | None, query: str | None, by: str) -> Recipe:
-    """An admin corrects a learned answer: its generic question (its words follow) and/or its query (its signature,
-    its tables and its call follow); the former ones are kept (previous)."""
+def edit_recipe(r: Recipe, question: str | None, query: str | None, by: str, path: str | None = None) -> Recipe:
+    """An admin corrects a learned answer: its generic question (its words follow), its query (its signature,
+    its tables and its call follow) and/or its path (the data it uses and its steps, in the admin's words); the
+    former question and query are kept (previous)."""
     import datetime as _dt
 
     before = {"question": r.question, "query": r.query, "at": _dt.datetime.utcnow().isoformat(timespec="seconds")}
     changed = False
+    if path is not None and r.tool not in ("investigation", "path"):
+        from supagent.knowledge.paths import of_recipe, path_text, set_text
+
+        if str(path).strip() != path_text(of_recipe(r)):
+            set_text(r, path)
+            changed = True
     if question is not None:
         question = " ".join(str(question).split())[:2000]
         if not question:
@@ -566,7 +605,9 @@ def edit_recipe(r: Recipe, question: str | None, query: str | None, by: str) -> 
             raise RecipeError("the query is empty")
         if query != (r.query or "").strip():
             tool = r.tool or "execute_sql"
-            if tool in ("generate_chart", "update_chart"):
+            if tool in ("investigation", "path"):        # the path's text, as the admin wrote it
+                pattern = " ".join(sorted(words(r.question or "")))
+            elif tool in ("generate_chart", "update_chart"):
                 try:
                     json.loads(query)
                 except ValueError as ex:
@@ -615,8 +656,8 @@ def recipes_for(question: str, limit: int = 3) -> list[dict[str, Any]]:
     ws = words(question)
     if not ws:
         return []
-    rows = (db.session.query(Recipe).filter(Recipe.status.in_(USED))
-            .order_by(Recipe.last_used_at.desc()).limit(2000).all())
+    rows = (db.session.query(Recipe).filter(Recipe.status.in_(USED), Recipe.tool != "investigation")
+            .order_by(Recipe.last_used_at.desc()).limit(2000).all())      # the paths: knowledge.paths gives them
     scored = []
     from supagent.knowledge.describe import stem
 
@@ -645,8 +686,11 @@ def recipes_for(question: str, limit: int = 3) -> list[dict[str, Any]]:
             allowed[r.database_id] = d is not None and can_use_database(d)
         if not allowed[r.database_id]:
             continue
+        from supagent.knowledge.paths import of_recipe, path_brief
+
         out.append({"id": r.id, "question": r.question, "tool": r.tool, "database_id": r.database_id, "query": r.query,
-                    "seconds": r.seconds, "rows": r.rows, "status": r.status, "uses": r.uses, "steps": r.steps})
+                    "seconds": r.seconds, "rows": r.rows, "status": r.status, "uses": r.uses, "steps": r.steps,
+                    "path": path_brief(of_recipe(r))})
         if len(out) >= limit:
             break
     return out

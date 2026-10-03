@@ -16,13 +16,33 @@
   <section class="card" id="sec-learn">
     <div class="sec-head"><h2>Daily learning</h2><button type="button" class="info" aria-controls="x-learn" aria-label="About the daily learning">i</button></div>
     <div class="explain" id="x-learn">Every day at the chosen hour, the metrics (promagg) and the indices (osagg) are read as the learning
-      user: types, units, values, series, time ranges, relations, and what changed since the day before.</div>
+      user: types, units, values, series, time ranges, relations, and what changed since the day before. The runs are
+      listed below, each with its steps (when, how long, what it counted) and what it asked of the LLM: the daily
+      learning, the Context builds and the classifications (Classify now, or superset supagent classify: the
+      categories only, which the daily learning also does at its end).</div>
     <div class="fields" data-group="learn context"></div>
     <div class="actions"><button type="button" class="btn primary" data-save="learn context">Save</button>
       <button type="button" class="btn" id="learn-now">Learn now</button>
-      <button type="button" class="btn stop" id="learn-stop" hidden>Stop learning</button><span id="learn-result" class="result"></span></div>
+      <button type="button" class="btn" id="classify-now" title="The categories only: the values read in the data's fields, the knowledge items that changed classified by the LLM, the interactions the documents state">Classify now</button>
+      <button type="button" class="btn stop" id="learn-stop" hidden>Stop</button><span id="learn-result" class="result"></span></div>
     <div class="table-wrap"><table class="grid" id="runs"><thead><tr><th>Run</th><th>Why</th><th>Started</th><th>Duration</th><th>Status</th><th class="num">Changes</th><th>Summary</th></tr></thead><tbody></tbody></table></div>
     <div class="pager" id="runs-pager" hidden></div>
+  </section>
+  <section class="card" id="sec-backup">
+    <div class="sec-head"><h2>Backups of the knowledge</h2><button type="button" class="info" aria-controls="x-backup" aria-label="About the backups">i</button></div>
+    <div class="explain" id="x-backup">One file a day holds the whole knowledge as it is: the categories with the System map, the
+      catalog and its versions, the team memory, the documents, the notes, the Context, the learned answers and
+      paths, the descriptions of the data, the settings (never a secret; not the chats). The last ones are kept: the
+      history to go back to. Restore puts back the parts you choose as they were in a backup, in place of the present
+      ones, after saving the present state in a backup of its own, so a restore can be undone. The files are on the
+      server, in the directory below; with several servers, give them a directory they share. Download keeps one
+      elsewhere. Without the workers' beat, plan <code>superset supagent backup</code> yourself.</div>
+    <div class="fields" data-group="backup"></div>
+    <div class="actions"><button type="button" class="btn primary" data-save="backup">Save</button>
+      <button type="button" class="btn" id="backup-now">Back up now</button>
+      <span id="backup-result" class="result" role="status" aria-live="polite"></span></div>
+    <p class="muted" id="backup-dir"></p>
+    <div class="table-wrap"><table class="grid" id="backups"><thead><tr><th>Backup</th><th>Made</th><th class="num">Size</th><th>Why</th><th>What it holds</th><th></th></tr></thead><tbody></tbody></table></div>
   </section>
   <section class="card" id="sec-agent">
     <h2>Agent</h2>

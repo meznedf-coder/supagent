@@ -1,5 +1,203 @@
 # Changes
 
+## 0.9.0 — 3 Oct 2026
+
+Investigations: a question that asks what is wrong and why ("today the night batch of the billing applications is
+far behind, the runs take longer than usual: why?") is answered by finding what is really off, where, what that
+depends on and what changed, and by checking the cause before naming it: the tables compared with their usual in
+one call (`compare_groups`), the logs too (`compare_logs`: what they say that they do not usually), the System map
+followed with each interaction explained (what to do when following it), the cause checked against the same rows
+and the same time. See *Investigations* in the README.
+
+* **The system around the question** is given with it, built without the LLM from the team's categories, the
+  interactions of the System map and the catalog: the parts the question names, what each consists of, what they
+  depend on, run on, read from, send data to and call (one step further for what they wait for), where each kind
+  of part is in the data (the fields and metric labels of its category), how the tables join, which field holds
+  the usual value of a measure, the health checks. A plain question that names a family gets what the family
+  consists of (its applications), so that it is counted on the right values.
+* **`compare_groups`** (new tool): what is unusual in a table, and where. One call compares **every measure** of
+  the table over the question's scope with the same time of the 8 previous days that have data, in total and value
+  by value for each field of few values (the ones asked, then the table's others): the rows, each duration against
+  the field that holds its usual, each numeric field; for a business date, **the stages of its rows** (the table's
+  time fields in their order: how many had reached each by that time of day, how long after the one before, how
+  many were waiting and since when), the first stage clearly off said first; for each measure that is off, the
+  field whose values hold most of the change on the fewest rows; and **the latest records of the related tables**
+  (the catalog's joins: the changes of that application, the alerts of those servers; else the records that
+  mention the value). Noise is kept out (small counts, averages over two rows, a status, a field the runs not
+  started do not have yet); a new version is read against the history of the one it replaces. A business-date
+  label of the scope (or the date itself) is read for each earlier day as that day's own business date, a weekend
+  once. One measure can still be asked alone.
+* **The days your team compares with** (`agent.compare_against`: yesterday, 1 week ago, 4 weeks ago; change them
+  in the settings: N days, weeks or months ago, 1 year ago): `compare_groups` gives each figure that stands out
+  on those days, says when a figure is as usual against the last days but far from an older reference day (a
+  change older than a week: where, and since which day to look), and compares in full with the days a question
+  names (`against`: "compared with three months ago"); `compare_to_usual` gives each series on them. Weeks and
+  months are the same weekday; on a Monday, yesterday is the Friday. A figure far from the last days and the
+  same as on the same weekday of the earlier weeks is said to be what that weekday is; and what stands out says
+  since when it has been off (the days before that were already so, or new on this day).
+* **`compare_groups` follows a lead once by itself**: when the rows wait at a stage on one value of a field (the
+  runs of one pool waiting for a slot, the orders of one country not shipped), the same call says **who else is
+  there** (`outside_the_scope`: the rows outside the question's scope that share that value during the window,
+  against the earlier days and by the scope's own fields: more than usual, and whose) and makes **the same
+  comparison over every row that has this value** (`the_rows_there`: what holds it, since when, the related
+  records). `agent.compare_follow` (on). A stage that is off on its own after the first late one (the rows take
+  longer once started) is said separately: a late start does not explain a longer run.
+* **`compare_groups` on any table**: nothing in it is about one kind of system (a table, its time fields, its
+  numeric fields, its fields of few values, the catalog's joins): orders or tickets are compared like runs.
+  One call costs about a hundred small aggregations (about sixty more when it follows a lead), three at a time
+  (`agent.compare_threads`), and stops reading fields after `agent.compare_seconds` (45). A scope written with a
+  time (the rows since 01:00 today) moves with each earlier day; `a OR b AND c` is read with the alternatives of
+  one field together; a condition that holds only while a row is in progress (a status) is left out and said; a
+  reference day the data does not reach is said as such, with no figure of that day; when nothing stands out the
+  result says to answer that.
+* **What the waiting rows wait on is looked for outside the question's own fields**: rows that wait before their
+  last stage (for a slot, a token) and stand out both on the application the question asked about and on a pool
+  are followed on the pool (who else holds it), not on the application (outside the scope on it are only its other
+  rows: a test campaign holding the production pool was never looked at).
+* **The calls of an answer are kept for what is not yet known**: the same query once per day is sent back at the
+  third (one query grouped by day, or `compare_groups`), and eight tool calls at most are run from one message.
+* **A business date is the one of the day asked about**: `compare_groups` on a past day's batch (a window that
+  ended days ago, the scope's label D-1) reads the label as of that day, and each earlier day's own from there.
+  A time field given with the call that the connector computes from the business date is not taken for the time
+  of the rows (the table's own is used, and said).
+* **A column the connector computes is described by the connector**, never by the LLM: a business-date label
+  that the LLM, shown a column with no value of its own, had described as "the status of a run" made the agent
+  filter the label on states. The descriptions the LLM wrote of such columns are replaced at the next learning
+  run (the ones an admin verified stay).
+* **Every interaction of the System map explained, twice**: a short explanation (a few words, shown when the line is
+  clicked: the map draws no text on its lines any more) and a long one, what to do when an investigation follows
+  it (what to check on the other part, what a problem there does here). The LLM writes both with the interactions
+  it reads in the texts (the sentence becomes their evidence) and, in the classification's new step *interactions
+  explained*, for the others (an admin's, the older ones) from the two parts, the sentence and the Context: only
+  what is empty, never over an admin. A click on a line (or its name in a part's panel) opens its panel; admins
+  correct both there, in the new-interaction form and in To review. The agent gets the short ones with the system
+  around a question, the long ones of the question's parts too, both from `system_links`. Schema 15 (`superset
+  supagent init`): the links' long explanation, evidence and author; a sentence kept as an older link's note
+  becomes its evidence.
+* **Interactions the logs show** (`learn.interactions_logs`, on; no LLM): with the classification, the recent lines
+  of each log table are read for the interactions they state ("still waiting for its inputs: A, B", "request to
+  X", "commit to Y"): the part a line comes from (its application) tied to the parts it names, the kind read in its
+  words; a pair seen on 5 lines and 2 days waits in To review with its evidence (lines, days, an example). A kind
+  the map already has ties only the categories it ties there. On a simulated platform, from 14 days of its logs:
+  the 18 real dependencies between its applications found, none wrong.
+* **The classification right after the Context** (`context.classify_after`, on): each Context build (nightly, from
+  the page or `superset supagent context --build`; `--no-classify` to skip) is followed by the classification,
+  which reads what the Context wrote with the documents, the metrics and the data; the nightly learning leaves the
+  categories to it unless a Context was already built that day.
+* **`compare_logs`** (new tool): **what do the logs say that they do not usually?** The lines of a log table
+  (application logs, batch logs, events: any table with a time field and a text field) grouped into patterns (the
+  numbers, times, ids, names and quoted values left out; a list of names is one name), each counted against the
+  same window of the 8 earlier days that have data: the **new** ones (2 lines for an error, 5 for a warning), the
+  ones **far above usual**, the **rare** ones (there on fewer than half the earlier days, with the days they were
+  there), the ones as frequent as usual **whose numbers are far from their usual** (each number by its place,
+  named by the words around it: the same slow write, 40 s tonight against 8 s), what is **gone**, and what comes
+  **every day** (no finding). Where the lines come from (the fields of few values; the names they hold, written
+  back in the pattern when nearly all hold one), when, an example; the errors first, then the most lines. The
+  patterns said are counted line by line in the database, with their first and last line and their places
+  counted by field, so that a burst at the end of the window leans nothing; a big table stops counting after 40 s
+  and says so. Scope and reference days as for `compare_groups`. The picture of a question names the log tables of
+  its parts (*Their logs*), and the investigation steps read the logs of the parts that look wrong.
+* **`system_links`** (new tool): what the System map says of any part: what it is part of and consists of, its
+  interactions both ways, where its kind is in the data.
+* **Five steps** for an investigation (the facts in one call; the reading of the stages: released late, waiting
+  for a slot or running longer; why; the check of the cause; the answer with what was ruled out and what could
+  not be checked) and **twice the calls** of an answer.
+* **What an answer blames is checked**: a part of the system given as the cause must be tied to the question's
+  parts by the System map (two steps) or by a result of the answer's own queries on them; else it is sent back
+  once, then marked under the answer. A bare word of the map (a category of the catalog kept as a subject, with
+  no description, part of nothing and linked to nothing: "memory", "cache") is no part: it is neither checked nor
+  counted among the question's parts.
+* **An answer thought aloud** ("Let me re-examine... Here's the corrected answer:") keeps what follows the last
+  announcement of the answer, when a full answer follows it.
+* **Investigation paths**: an investigation marked Helpful keeps its path (the kind of problem and of cause, the
+  checks in order, what confirms the cause, what was ruled out), written generic by the LLM. It waits in To review
+  with the answers marked Helpful; once an admin confirms it, the next investigations of that kind of problem get
+  it, with the other causes found before for the same problem (one symptom, several known causes: the closest and
+  the most often found with their steps, the others in a line). The last query of an investigation is no longer
+  kept as an example or a learned answer.
+* **Every answer marked Helpful keeps its path**, small request or big one (a count, an extract, a check, a
+  confirmation): the data it used (the tables with the fields its queries name, the metrics with their labels) and
+  its steps in their order, read from the answer itself (no LLM, no value of that one case: the dates, names and
+  numbers of its queries are left out, the failed steps too). It is kept with the learned answer, shown in *To
+  review* and in *Learned by the agent*, and given to the agent with the query for the next similar question. An
+  answer that ran no query to keep (a health check, a comparison with usual, a comparison of groups) used to
+  teach nothing: it is now learned as its path. An admin corrects a path in their own words before confirming it
+  (*Edit*; emptied, it goes back to what the answer did), and what an admin wrote stays when the same question is
+  answered another way. Like every learned answer, a path is given only to who may query its database.
+* **The interactions your documents state are proposed for the System map** (`learn.interactions`, on;
+  `superset supagent interactions`): the LLM reads documents, guides, Context pages and team notes next to the
+  known parts they name and proposes how those interact, each with the sentence that says so, word for word. They
+  wait in To review with their sentence; the map draws, and investigations follow, the approved ones only (the map
+  says how many wait).
+* **What is missing for investigations** (`superset supagent check-system [--question "..."]`, and for admins the
+  System map page): what the agent knows of the system (the parts per category and where each is in the data, the
+  interactions, the joins, the usual values, the health checks, the paths) and, in words, what it does not find;
+  for a question, what the agent is given and the names nothing knows. No LLM, nothing changed.
+* **The System map's display**: a click on a category's name folds its parts into one box and opens them again
+  (the Open / Fold buttons are gone; any category folds); each viewer chooses the categories shown (a switch per
+  category in the legend, a cross in each category's name: only the lines between what is shown are drawn; kept in
+  the browser, for that viewer only); **full screen**. In *Edit*, an admin drags a category's name to move it
+  with its boxes, and puts categories in **groups** drawn as frames (servers, resources and network under one
+  name): display only.
+* **Nothing the learning finds changes the categories before an admin approves it** (`categories.review_all`,
+  on): the values read in the data's category fields and the categories the learning gave to the data's objects
+  now wait in *To review* like the LLM's proposals (each says where it comes from; a category's values found in
+  the data are approved together in one click); the values of what people wrote (a category on a catalog entry or
+  a document) are used at once, as before. No value in use is merged, retired or changed by the learning: a
+  proposed value that has the name of an approved value of another category says so (one click merges it), and a
+  name the team already has under another category is not proposed again as a component. A subject may still
+  share its name with a part. With `categories.review_all` off, the values of the data are approved at once, as
+  before.
+* **What you see on the map is chosen in a box where you type**: several categories and parts (a part with what
+  it is part of, its parts and what it interacts with), in place of the *Everything* list of one part.
+* **What each category is**: a description an admin writes in Categories or on the map, shown with the category
+  and given to the agent (the system picture, `system_links`) and to the router with the parts a question names
+  (`categories.about`).
+* **Parts that look retired are proposed** (*To review*), never retired by the learning: a value read in the data
+  that its category's fields and labels have not shown for `categories.retire_days` (14) days, seen so by two
+  checks; any value, the ones put by hand too, that a text says was retired or decommissioned. *Retire* keeps the
+  value, marked retired; *Keep* declines that reason.
+* **"Part of" is chosen in a box where you type** (several values, the matches listed by the server): no list of
+  thousands is loaded any more.
+* **The classification at the size of a platform**: the values of a category read from the data are read once
+  each, with where each comes from (which field of which indices, which label of which metrics), instead of once
+  per metric that carries the label with a query per value (more than half an hour with thousands of metrics: now
+  a second); such a category is no longer a list the LLM chooses in or adds to. The classification is a run of
+  its own (*Classify now*, `superset supagent classify`) listed in the settings with its steps and its LLM use.
+* **Backups of the knowledge, restored whole or by part**: one zip a day (`backup.enabled`, `backup.hour`, the
+  last `backup.keep` kept, in `backup.dir`) with the categories and the System map, the catalog, the memory, the
+  documents, the notes, the Context, the learned answers and paths, the descriptions of the data, the settings
+  (never a secret; the vectors with `backup.vectors`). *Settings → Backups*: Back up now, Download, Restore… (the
+  parts chosen are put back as they were, after the present state is saved in a backup of its own);
+  `superset supagent backup | backups | restore`. Backups and restores are runs listed with the others.
+* **The catalog**: a field that holds the usual value of another says `usual_of: <that field>` (index entries).
+* **The router**: the *incident* route covers what is wrong now as well as a past period; the *technical* route
+  offers `system_links` and gets the whole system picture. Any other question that names parts of the system gets
+  what it names only (*What the question names*): a follow-up on a server's load needs no map of the platform
+  (given the whole picture, the model answered such follow-ups from it without querying, in the end-to-end suite).
+* **A memory that says when it applies applies only then**: the memories given with a question say that one
+  written as "when the user says X" (or "for the desk Y") is no filter for a question that does not say X (a saved
+  "when the user says BILLING, show only BILLING data" scoped "How many jobs failed yesterday?" to BILLING).
+* **A query written in an answer and not run** is sent back to be run when the answer says what it returned ("the
+  query returned no rows"), not only when it shows figures.
+* **`check_health`: new, or every night?** Each breach says on how many of the seven previous days the same
+  series breached the same check in the same window, is marked usual when it does on most of them, and the new
+  ones come first: an alert that fires every night is not what changed today.
+* **`promql_query`: a level with its usual.** A query of a few series gives each one what it was over the same
+  window of the 7 previous days (`usual_avg`, `usual_max`, `against_usual`) and says in words whether these
+  levels are their usual: a pool that is full every night is not what changed.
+* **System map: the panel of a part with nothing under it** (most applications and servers) stopped halfway since
+  0.8.0 (a page error after "Part of"): its interactions, *What touches it* and the admin's edits are shown again.
+* **A tool call the server could not read** (a call that ran on to the token limit) is followed by a step of a
+  quarter of `llm.max_answer_tokens` (2,048 at least): a second one does not cost as many minutes again.
+* **Metrics**: `compare_to_usual` refuses a counter read as it is (it says to compare its rate or its increase)
+  and says when a value far from its median is within what the earlier weeks differ by; "now" in the metric tools'
+  times follows `agent.now` when an admin pinned it.
+
+From 0.8.x: `pip install` on every host, `superset supagent init` once (schema 14 -> 15: three nullable columns of
+`supagent_link`), restart (INSTALL.txt, *From 0.8 to 0.9.0*: what starts by itself, and the three statements to
+go back to 0.8.2).
+
 ## 0.8.2 — 2 Oct 2026
 
 The Data dictionary, from a first day of review on a real platform:

@@ -204,7 +204,9 @@ def prompt_block(user_id: int | None, shown: set[str] | None = None) -> str:
 
     budget = int(settings.get("memory.prompt_chars") or 0) or 10 ** 9
     gone = gone_names()
-    lines = ["\n\nWhat this user and the team asked to remember (follow it unless the question says otherwise):"]
+    lines = ["\n\nWhat this user and the team asked to remember (follow it unless the question says otherwise; one "
+             "that says when it applies (\"when the user says X\", \"for the desk Y\") applies only then: it is no "
+             "filter for a question that does not say X):"]
     used = 0
     for m in sorted(items, key=lambda m: KIND_ORDER.get(m.kind, 3)):     # stable: mine, then the team's
         if mentions_gone(m.text, gone):                # about a metric or index that no longer exists

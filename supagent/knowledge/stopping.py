@@ -77,7 +77,9 @@ def request_stop() -> int | None:
 
     from supagent.models import Run
 
-    run = (db.session.query(Run).filter(Run.kind.in_(("learn", "context")), Run.status.in_(("running", "stopping")))
+    from supagent.knowledge.learner import KINDS
+
+    run = (db.session.query(Run).filter(Run.kind.in_(KINDS), Run.status.in_(("running", "stopping")))
            .order_by(Run.id.desc()).first())
     if run is None:
         return None

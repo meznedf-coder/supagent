@@ -6,7 +6,7 @@ knowledge and its own confirmed examples.
   functional      the business meaning or the business figures of the data
   technical       how the systems work: applications, components, jobs, data flows, configuration, what a
                   technical field or metric means
-  incident        what went wrong and why over a past period: a failure, a delay, an error spike, a slowdown
+  incident        what went wrong and why, now or over a past period: a failure, a delay, an error spike, a slowdown
   charts          Superset charts and dashboards themselves: find, show, explain, build or change one
   observability   detect issues: is everything normal, anomalies, health, alerts, compared with usual
   infrastructure  servers and services: CPU, memory, disk, network, latency, errors, availability
@@ -44,8 +44,8 @@ DEFINITIONS = {
                   "counts, rates, rankings or comparisons of business entities and processes",
     "technical": "how the systems work: applications, components, jobs and their dependencies, data flows, "
                  "configuration; what a technical field or metric means (an explanation, not figures)",
-    "incident": "what went wrong and why over a past period: explain a failure, a delay, an error spike or a "
-                "slowdown, its cause and its impact, across several sources",
+    "incident": "what went wrong and why, now or over a past period: explain a failure, a delay, an error spike or "
+                "a slowdown, find its cause and its impact, across several sources",
     "charts": "Superset charts and dashboards themselves: find, show, open, explain, build or change a chart or a "
               "dashboard. Asking for figures is not charts, even when a chart shows them; asking whether what a "
               "dashboard shows is normal is observability",
@@ -56,19 +56,20 @@ DEFINITIONS = {
 }
 # what a route adds to the classic agent: tools (by intent), a short instruction, the knowledge given first
 ROUTE_INTENTS = {"charts": {"charts", "read_charts", "sqllab"}, "observability": {"status", "usual"},
-                 "incident": {"investigation", "status", "usual", "read_charts"}, "infrastructure": {"status", "usual"}}
+                 "incident": {"investigation", "status", "usual", "read_charts"}, "infrastructure": {"status", "usual"},
+                 "technical": {"system"}}
 ROUTE_NOTES = {
-    "incident": "(This question asks what happened and why. Investigate: find what failed, was late or changed, "
-                "when and where (the runs and their errors, the servers or services they ran on), follow what "
-                "depends on what (the knowledge says it), check the resources of those servers or services at that "
-                "time and compare with usual; answer with a short timeline and the cause, each point with the "
-                "figure or the record that shows it.)",
+    "incident": "(This question asks what is wrong and why: an investigation. Follow the investigation's steps of "
+                "the instructions in their order: the facts against usual, where it is concentrated, why (what those "
+                "parts depend on, their resources, the changes before it), the check of the cause, then the answer "
+                "with the figure or the record behind each point.)",
     "observability": "(This question asks whether something is abnormal: check the health and the usual levels of "
                      "the period asked, then say what is out of the usual with its figures, or that nothing is.)",
     "infrastructure": "(This question is about servers or services: use their metrics or logs for the period asked "
                       "and name the server or service each figure is about.)",
-    "technical": "(This question asks how the systems work: answer from the knowledge (documents, Context, catalog "
-                 "notes) and name the source; query the data only if it asks for figures.)",
+    "technical": "(This question asks how the systems work: answer from the knowledge (the system picture given, "
+                 "system_links for a part's dependencies, documents, Context, catalog notes) and name the source; "
+                 "query the data only if it asks for figures.)",
     "functional": "(This question is about the business meaning or figures of the data: apply the glossary's "
                   "definitions and the team's rules.)",
     "charts": "(This question is about Superset charts or dashboards: find the one it names or asks for with the "
@@ -173,15 +174,19 @@ def _examples_by_words(question: str, k: int) -> list[dict[str, Any]]:
 ROUTER_SYSTEM = ("You route a question about the data of this platform to the kind of work it needs. The kinds:\n" +
                  "\n".join(f"- {r}: {d}" for r, d in DEFINITIONS.items()) +
                  f"\n- {OTHER}: none of these, or a greeting\n"
-                 "Read what the person wants to get, not only the words. The knowledge found for the question says "
+                 "Read what the person wants to get, not only the words. The parts of the system the question names "
+                 "(when it names some) say what it is about, in the team's own categories; the knowledge found says "
                  "what the platform has (a chart or a dashboard listed there does not make it a charts question). "
                  "The team's questions routed before show how this team names things; they are similar questions, "
                  "not this one: decide from the kinds above. Score how well each kind fits (0 to 100; two kinds may "
                  "both fit), then give the best one as route. Call route_question once.")
 
 
-def messages(question: str, previous: str, found: list[dict[str, Any]], shown: list[dict[str, Any]]) -> list[dict]:
+def messages(question: str, previous: str, found: list[dict[str, Any]], shown: list[dict[str, Any]],
+             names: str = "") -> list[dict]:
     lines = []
+    if names:                                     # the parts of the system the question names, and what they are
+        lines.append(names)
     if found:
         lines.append("Knowledge found for the question (kind: title):")
         lines += [f"- {f['kind']}: {str(f['title'])[:110]}" + (f" [{f['facets']}]" if f.get("facets") else "")
@@ -260,7 +265,8 @@ def decide(question: str, previous: str = "", user_id: int | None = None, llm: A
             from supagent.llm import bounded
 
             with bounded(llm, ROUTE_SECONDS):                  # before every answer: quick, or the normal way
-                msg = llm.chat(messages(question, previous, found, similar), tools=[ROUTE_TOOL], max_tokens=400)
+                msg = llm.chat(messages(question, previous, found, similar, _names(question)), tools=[ROUTE_TOOL],
+                               max_tokens=400)
             d.llm, d.second, d.confidence, d.why, d.scores = parse(msg)
         except Exception as ex:  # pylint: disable=broad-except   (the normal way)
             log.warning("supagent router: the LLM did not route: %s", str(ex)[:200])
@@ -277,6 +283,18 @@ def decide(question: str, previous: str = "", user_id: int | None = None, llm: A
     else:
         d.route, d.by = OTHER, "fallback"
     return d
+
+
+def _names(question: str) -> str:
+    """The parts of the system the question names, with their categories and what the team says those are (0.9):
+    the router sees that "the pool is slow" is about a part of the infrastructure, in the team's own words."""
+    try:
+        from supagent.knowledge.brief import named_line
+
+        return named_line(question)
+    except Exception:  # pylint: disable=broad-except
+        db.session.rollback()
+        return ""
 
 
 def _found(question: str) -> list[dict[str, Any]]:

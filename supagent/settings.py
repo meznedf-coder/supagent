@@ -53,6 +53,21 @@ SPECS: list[Spec] = [
     Spec("llm.extra_headers", {}, "json", "More HTTP headers for the LLM calls (JSON object)"),
     # ---- the agent
     Spec("agent.max_steps", 16, "int", "Tool calls per question at most"),
+    Spec("agent.compare_seconds", 45, "int", "compare_groups (investigations): one call reads about ten small "
+         "aggregations per field of the table (the window and the 8 earlier days); after this many seconds it reads "
+         "no further field and answers with what it has"),
+    Spec("agent.compare_threads", 3, "int", "compare_groups: how many of its queries run at a time on OpenSearch "
+         "(1: one after the other, on a busy cluster)"),
+    Spec("agent.compare_follow", True, "bool", "compare_groups follows a lead once by itself: when the rows wait at "
+         "a stage on one value of a field (a pool, a queue), it makes the same comparison over every row that has "
+         "this value, whatever the question's other conditions (what holds it). About as many queries again; off: "
+         "the agent asks for it when it wants it"),
+    Spec("agent.compare_against", "yesterday, 1 week ago, 4 weeks ago", "str", "The days your team compares with, "
+         "besides the usual (the median of the previous days): compare_groups and compare_to_usual give each figure "
+         "on them too, and say when a figure is as usual but far from an older one (a change older than the last "
+         "days). Any of: yesterday, N days ago, N weeks ago, N months ago, 1 year ago (weeks and months: the same "
+         "weekday), separated by commas; empty: none. A question may name others (\"compared with three months "
+         "ago\")"),
     Spec("governed.use_datasets", True, "bool", "Governed pipeline: a query on a table that has a Superset dataset "
          "runs through the chart data API (the dataset's permissions and row-level security apply); else as "
          "execute_sql"),
@@ -131,6 +146,10 @@ SPECS: list[Spec] = [
     Spec("context.enabled", True, "bool", "Build the Context every night: the system's functional and technical "
          "documentation, from the documents, the catalog, the team memory, the data dictionary and the Helpful answers"),
     Spec("context.hour", 4, "int", "Hour of the nightly Context build (after the day's learning run)"),
+    Spec("context.classify_after", True, "bool", "After each Context build (the nightly one, one asked in the page or "
+         "the command line), the classification runs on what it wrote: the categories of the items, the part-of of "
+         "the values, the interactions the documents and the Context state, each explained. The nightly learning "
+         "then leaves the categories to it"),
     Spec("charts.scan", True, "bool", "With the nightly Context build: look at the team's Superset charts (their last "
          "full day against the same weekday of the 4 weeks before, per series: high, low, data stopped) and write "
          "what each shows; the agent answers \"anything unusual on the dashboard\" from it (chart_anomalies)"),
@@ -151,13 +170,24 @@ SPECS: list[Spec] = [
     Spec("categories.fields", {"application": r"^(application|app|app_name|service|service_name|system|platform)$",
                                "component": r"^(component|components|module)$"}, "json",
          "Where the values of a category are read in the data: category -> a regular expression of field (or "
-         "label) names, e.g. {\"server\": \"^(server|host|hostname|node)$\"}; the values become approved "
-         "values of that category (where they come from is kept), and two such fields of one index tell which "
-         "values go together (proposed as 'part of', to approve)"),
-    Spec("categories.review_all", True, "bool", "Every category the LLM gives an item and every relation it finds "
-         "between items waits for an admin (To review), even the ones it is sure of (the default since 0.7); off: "
-         "those it is sure of (medium, high) are used at once on approved values, as in 0.6. Values and their "
-         "'part of' relations always wait"),
+         "label) names, e.g. {\"server\": \"^(server|host|hostname|node)$\"}; the values found are proposed "
+         "as values of that category, to approve in To review (where they come from is kept; used at once with "
+         "categories.review_all off), and two such fields of one index tell which values go together (proposed "
+         "as 'part of', to approve)"),
+    Spec("categories.about", {}, "json", "What each category is, in a sentence: category -> description, e.g. "
+         "{\"pool\": \"a group of servers that share the same queue of slots\"}. Written in Categories or on the "
+         "System map; shown to people with the category's name and given to the agent and to the router with the "
+         "parts a question names"),
+    Spec("categories.review_all", True, "bool", "Nothing the learning finds changes the categories before an admin "
+         "approves it (To review): the categories the LLM gives an item and the relations it finds, even the ones "
+         "it is sure of, and (0.9) the new values it reads in the data's category fields or infers for the data's "
+         "objects; off: what the LLM is sure of (medium, high) is used at once on approved values and the values "
+         "of the data are approved at once, as in 0.6. The values the LLM proposes, the 'part of' relations and "
+         "the removals always wait"),
+    Spec("categories.retire_days", 14, "int", "A value the learning read in the data that none of its category's "
+         "fields and labels has shown for this many days is proposed for retirement in To review (never retired by "
+         "itself; a value put by hand is only proposed when a text says it was retired or decommissioned); 0: no "
+         "such check"),
     Spec("categories.max_values", 1000, "int", "A field with more values than this is not read as a list of "
          "category values (applications: 60 at most)"),
     Spec("categories.relation_min_docs", 5, "int", "Documents two values must share in an index to be proposed "
@@ -165,6 +195,26 @@ SPECS: list[Spec] = [
     Spec("learn.classify_per_run", 400, "int", "Knowledge items the daily learning classifies at most (their "
          "categories: aspect, subjects, applications, components, and the relations their texts state); the next "
          "run continues"),
+    Spec("learn.interactions_logs", True, "bool", "With the classification, the recent lines of the log tables (a time "
+         "field, a text field, a field of a category's values) are read for the interactions they show (\"still "
+         "waiting for its inputs: A, B\", \"request to X\"): each pair seen on enough lines and days waits in To review "
+         "with its evidence, never drawn nor used before an admin approves it (no LLM)"),
+    Spec("learn.interactions", True, "bool", "The daily learning reads the documents, guides, Context pages and team "
+         "notes for how the parts of the system interact (depends on, runs on, reads from, calls...) and proposes "
+         "what they state for the System map, each with its sentence, word for word; nothing is drawn or used "
+         "before an admin approves it (To review)"),
+    Spec("backup.enabled", True, "bool", "Every day, the whole knowledge is saved in one file (the categories and "
+         "the System map, the catalog, the memory, the documents, the notes, the Context, the learned answers and "
+         "paths, the descriptions of the data, the settings; no secret): the history to go back to. Restored whole "
+         "or by part (Settings, Backups; superset supagent restore)"),
+    Spec("backup.hour", 1, "int", "The hour of the daily backup (the server's clock, 0-23)"),
+    Spec("backup.days", [], "list", "The days of the daily backup (mon, tue...); empty: every day"),
+    Spec("backup.keep", 14, "int", "Backups kept (the oldest are removed)"),
+    Spec("backup.dir", "", "str", "The directory of the server where the backups are written (empty: "
+         "supagent-backups in Superset's home). With several servers: a directory they share, or the backups are "
+         "on the server that made them"),
+    Spec("backup.vectors", False, "bool", "The vectors of the search pieces are saved too: several times bigger "
+         "files, and a full restore needs no embedding (off: they are computed again from the texts)"),
     Spec("learn.agent_catalog", True, "bool", "The agent adds catalog entries when the evidence is certain: "
          "formulas used in answers confirmed as helpful, team rules and facts approved by an admin, definitions "
          "quoted word for word from the documents. Written as (agent): edit one to take it over; delete it and the "

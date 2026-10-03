@@ -28,6 +28,14 @@ indices:
       - to: applications
         keys: {APPLICATION: APPLICATION, ENVIRONMENT_TYPE: ENVIRONMENT_TYPE}
         description: team and tier of the application in that environment
+      # Investigations (0.9): when an application or a server stands out, compare_groups follows these joins and
+      # gives the latest records of the last days about it (a join on one field).
+      - to: changes
+        keys: {APPLICATION: TARGET}
+        description: the changes made to the application (deployments, configuration)
+      - to: alerts
+        keys: {NODE: TARGET}
+        description: the alerts raised on the server
     fields:
       "@timestamp_date":
         label: "Execution time"
@@ -58,6 +66,20 @@ indices:
         unit: "seconds"
         description: "Duration of the run"
         synonyms: [duration, run time, elapsed, how long, latency]
+      # Investigations (0.9): the field that holds the usual value of another says so; a duration is then
+      # compared with its own usual, run by run (compare_groups: the sum of one over the sum of the other).
+      AVG_DURATION_d:
+        label: "Usual duration (s)"
+        unit: "seconds"
+        description: "Mean duration of the last good runs of the same job"
+        usual_of: JOB_DURATION_d
+      # Investigations (0.9): the time fields of a run are its stages. With a description each, compare_groups
+      # says how many runs had reached each stage by this time of day, how long after the stage before, how many
+      # were still waiting, against the previous days; the description says what a late stage waits for.
+      SCHEDULED_TIME: {label: "Scheduled time", description: "Earliest start planned"}
+      READY_TIME: {label: "Ready time", description: "When the feeds and upstream jobs it waits for were done and it was submitted to its pool"}
+      START_TIME: {label: "Start time", description: "When it got a slot of its pool and started"}
+      END_TIME: {label: "End time", description: "When it ended (success or failure)"}
       CPU_COST_H_d:
         label: "CPU cost (h)"
         unit: "CPU hours"
@@ -78,6 +100,22 @@ indices:
         label: "Severity"
         description: "Business importance of the job: LOW, MEDIUM, HIGH, CRITICAL"
         synonyms: [criticality, importance]
+
+  changes:
+    description: Change records, one document per change (deployments with their versions, patches, configuration, maintenance).
+    time_field: "@timestamp_date"
+    fields:
+      TARGET: {description: "The application, the service or the server changed"}
+      CHANGE_TYPE: {description: "DEPLOYMENT, PATCH, CONFIG, MAINTENANCE..."}
+      DESCRIPTION: {description: "What was done", synonyms: [summary]}
+
+  alerts:
+    description: Alerts raised by the monitoring, one document per alert (on servers, pools, services).
+    time_field: "@timestamp_date"
+    fields:
+      TARGET: {description: "The server, the pool or the service the alert is about"}
+      ALERT_NAME: {description: "Name of the alert rule"}
+      SUMMARY: {description: "The alert in words"}
 
   applications:
     description: Applications per environment with their owning team and service tier (small lookup index).

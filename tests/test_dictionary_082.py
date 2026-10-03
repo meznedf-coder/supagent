@@ -102,8 +102,8 @@ def test_a_category_of_ones_own_is_renamed_and_removed_with_what_names_it(world,
         with _client(app, "admin") as c:
             r = c.post(api, json={"name": "Server", "fields": "^(host|node)$"}).get_json()
             server = next(x for x in r["categories"] if x["name"] == "server")
-            assert server == {"name": "server", "builtin": False, "fields": "^(host|node)$", "values": 0, "tags": 0,
-                              "parts": 0, "interactions": 0}
+            assert server == {"name": "server", "builtin": False, "fields": "^(host|node)$", "about": "", "values": 0,
+                              "tags": 0, "parts": 0, "interactions": 0}
             pay = c.post("/supagent/admin/api/facets", json={"facet": "application", "value": "Payments"}).get_json()
             s1 = c.post("/supagent/admin/api/facets", json={"facet": "server", "value": "srv-01", "parents": [pay["id"]]}).get_json()
             s2 = c.post("/supagent/admin/api/facets", json={"facet": "server", "value": "srv-02"}).get_json()

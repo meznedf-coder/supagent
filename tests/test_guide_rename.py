@@ -20,14 +20,14 @@ def test_the_upgrade_renames_the_catalog_notes(ctx):
     db.session.commit()
     try:
         before, after = create_or_upgrade()
-        assert (before, after) == (13, 14)
+        assert (before, after) == (13, 15)
         db.session.expire_all()
         assert db.session.get(Entry, e.id).classification == "guide"
         assert db.session.query(EntryVersion).filter_by(entry_id=e.id).one().classification == "guide"
         assert db.session.query(Chunk).filter_by(ref=f"entry:{e.id}#0").one().kind == "guide"
         assert db.session.query(Chunk).filter_by(ref="note:999#0").one().kind == "teamnote"   # the users' notes stay
         assert store_kinds() == 0                       # no knowledge store on SQLite: nothing to follow
-        assert create_or_upgrade() == (14, 14)          # once
+        assert create_or_upgrade() == (15, 15)          # once
     finally:
         db.session.query(Chunk).filter(Chunk.ref.in_([f"entry:{e.id}#0", "note:999#0"])).delete(
             synchronize_session=False)

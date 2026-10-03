@@ -189,8 +189,12 @@
         <button type="button" class="info" aria-controls="x-recipes" aria-label="About the learned answers">i</button></div>
       <div class="explain" id="x-recipes">Answers marked <strong>Helpful</strong> in the chat, under a short generic question,
         with the way to the result; the most useful first: what people said of the answers each was given to, its query run
-        again and whether it worked. One that people keep saying is wrong is no longer proposed. <strong>helpful</strong>:
-        waiting for an admin, who may correct its question or its query before confirming it (Edit);
+        again and whether it worked. One that people keep saying is wrong is no longer proposed. Small request or big one
+        (a count, an extract, a check, an investigation), each keeps <strong>its path</strong>: the data it used (the
+        tables with their fields, the metrics with their labels) and its steps, without the values of that one case; the
+        agent is given it with the query for the next similar question. An answer that ran no query to keep (a health
+        check, a comparison with usual) is learned as its path. <strong>helpful</strong>:
+        waiting for an admin, who may correct its question, its query or its path before confirming it (Edit);
         <strong>confirmed</strong>: approved and proposed first; <strong>rejected</strong>: never proposed.</div>
       <div class="filters"><select id="r-status" aria-label="Status"><option value="">All</option>
         <option value="helpful">Helpful, to review</option><option value="confirmed">Confirmed</option>
@@ -264,8 +268,7 @@
         <input id="fac-new-value" type="text" maxlength="128" placeholder="New value, e.g. Pricing" aria-label="New value">
         <input id="fac-new-desc" type="text" placeholder="What it covers (optional)" aria-label="What it covers">
         <input id="fac-new-syn" type="text" placeholder="Also called (comma separated)" aria-label="Also called">
-        <select id="fac-new-parents" multiple size="3" class="facet-parents-select"
-          aria-label="Part of (Ctrl or Cmd + click for several)" title="Part of: Ctrl or Cmd + click for several"></select>
+        <span id="fac-new-parents" class="facet-parents-pick"></span>
         <button type="button" class="btn primary" id="fac-add">Add</button>
         <span id="fac-result" class="result" role="status" aria-live="polite"></span>
       </div>
@@ -297,8 +300,10 @@
         <span id="map-state" class="map-state" role="status" aria-live="polite"></span>
         <span class="grow"></span>
         <span class="map-tools">
-          <select id="map-focus" aria-label="Show"><option value="">Everything</option></select>
+          <span id="map-focus" class="map-pick"></span>
           <button type="button" class="btn small" id="map-fit" title="Fit the map to the window">Fit</button>
+          <button type="button" class="btn small" id="map-full" aria-pressed="false"
+            title="The map on the whole screen (Escape: back)">Full screen</button>
           <button type="button" class="btn small admin-only" id="map-edit" aria-pressed="false"
             title="Move the boxes, add interactions, write what each part does">Edit</button>
           <span class="export-label">Export:</span>
@@ -309,12 +314,19 @@
       <div class="explain" id="x-map">The architecture of the system as the categories describe it: one column per
         category (subjects, applications, components, servers…), each part in its box with what it does (its description,
         else a sentence of the documents that name it), a grey line from a part to what it is part of, and the
-        interactions between parts (depends on, sends data to, calls…) as arrows. A big category is folded into one box:
-        click it to open it. It follows the categories by itself (read again every 20 seconds while you look at it, not
+        interactions between parts (depends on, sends data to, calls…) as arrows. Click the name of a category to fold
+        its parts into one box, and again to open them (a big category starts folded). Choose what you see in the box
+        above the map: type to find categories and parts, choose several (a part comes with what it is part of, what
+        it is made of and what it interacts with; nothing chosen: everything). A category is also switched in the
+        legend, or hidden with the cross in its name (your categories stay in this browser; the lines shown are the
+        ones between what is shown). Full screen puts the map on the whole screen. It follows the
+        categories by itself (read again every 20 seconds while you look at it, not
         after 15 minutes with nobody at the page: a new part or a new "part of" is outlined for a moment) and the data:
         a part whose items are gone says so. It
-        draws the approved values: a proposed one comes once approved in To review. Admins: Edit to move the boxes,
-        draw an interaction (click a box, then another), and write what a part or an interaction is.</div>
+        draws the approved values: a proposed one comes once approved in To review. Admins: Edit to move the boxes
+        and the categories (drag a category's name), to put categories in a group drawn around them (Group
+        categories…: display only), to draw an interaction (click a box, then another), and to write what a part or
+        an interaction is.</div>
       <div id="map-legend" class="map-legend"></div>
       <div class="map-wrap">
         <div id="map-canvas" class="map-canvas" tabindex="0" aria-label="System map"></div>

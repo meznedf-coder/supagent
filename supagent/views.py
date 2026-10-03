@@ -106,10 +106,10 @@ def _ref_titles(refs: Any) -> dict[str, str]:
     """What knowledge refs are, in words (entry:3 -> the entry's title), one query per kind of ref."""
     from superset import db
 
-    from supagent.models import ContextPage, Doc, Entry, KObject, Memory, Recipe
+    from supagent.models import ContextPage, Doc, Entry, Facet, KObject, Memory, Recipe
 
     models = {"entry": Entry, "memory": Memory, "doc": Doc, "context": ContextPage, "recipe": Recipe,
-              "object": KObject}
+              "object": KObject, "facet": Facet}
     out: dict[str, str] = {}
     wanted: dict[str, dict[int, list[str]]] = {}
     for ref in set(refs or ()):
@@ -131,6 +131,8 @@ def _ref_titles(refs: Any) -> dict[str, str]:
                             or getattr(o, "text", "") or "")[:160]
                 if kind == "object" and getattr(o, "parent", None):
                     title = f"{o.parent} › {title}"
+                if kind == "facet":                    # a part of the system: its name and its category
+                    title = f"{o.value} ({o.facet})"
                 for ref in ids.get(o.id, []):
                     out[ref] = title or ref
         except Exception:  # pylint: disable=broad-except
@@ -633,8 +635,12 @@ class ChatView(BaseView):
                                                          Message.id < m.id, Message.role == "user")
                         .order_by(Message.id.desc()).first())
             if sql and question is not None:
+                from supagent.knowledge.paths import is_investigation
+
                 req = (sql[-1].get("args") or {}).get("request") or sql[-1].get("args") or {}
-                if req.get("sql"):
+                # an investigation's last query is one check among many, no example of how to answer it: its
+                # path is kept instead (knowledge.paths)
+                if req.get("sql") and not is_investigation(question.content or "", m.id):
                     db.session.add(Example(question=question.content, sql=req.get("sql"),
                                            database_id=req.get("database_id"), message_id=m.id,
                                            tools=[s.get("tool") for s in m.steps or []]))
@@ -722,10 +728,13 @@ class _RecipesMixin:
         rows = [r for r in q.limit(500) if admin or (r.database_id and r.database_id in visible)]
         use = usefulness([f"recipe:{r.id}" for r in rows])      # what the discussions said of them
         out = []
+        from supagent.knowledge.paths import of_recipe, path_text
+
         for r in rows:
             u = use.get(f"recipe:{r.id}")
             out.append({"id": r.id, "question": r.question, "tool": r.tool, "database_id": r.database_id,
-                        "target": r.target, "query": r.query, "seconds": r.seconds, "rows": r.rows,
+                        "target": r.target, "query": r.query, "path": path_text(of_recipe(r)),
+                        "seconds": r.seconds, "rows": r.rows,
                         "steps": r.steps, "status": r.status, "uses": r.uses, "created_at": r.created_at,
                         "helpful": len(r.confirmations or []), "last_used_at": r.last_used_at,
                         "use": u, "why": reasons(u), "rank": round(adjust(u), 3), "demoted": demoted(u),
@@ -756,13 +765,13 @@ class _RecipesMixin:
         status = str(body.get("status") or "")
         if status and status not in ("helpful", "confirmed", "rejected"):
             return _json({"error": "status: helpful, confirmed or rejected"}, 400)
-        if "question" in body or "query" in body:          # an admin's correction, before confirming it
+        if "question" in body or "query" in body or "path" in body:   # an admin's correction, before confirming it
             from supagent.knowledge.experience import RecipeError, check_recipe_query, edit_recipe
 
             try:
                 if status == "confirmed" and "query" in body and str(body["query"] or "").strip() != (r.query or "").strip():
                     check_recipe_query(r, str(body["query"]))      # a changed query is confirmed only if it runs
-                edit_recipe(r, body.get("question"), body.get("query"), by=g.user.username)
+                edit_recipe(r, body.get("question"), body.get("query"), by=g.user.username, path=body.get("path"))
             except RecipeError as ex:
                 db.session.rollback()
                 return _json({"error": str(ex)}, 400)
@@ -1374,7 +1383,7 @@ class KnowledgeView(_RecipesMixin, BaseView):
 
         busy = running_run()
         if busy is not None:
-            name = "a context build" if busy.kind == "context" else "a learning run"
+            name = {"context": "a context build", "classify": "a classification"}.get(busy.kind, "a learning run")
             return _json({"error": f"{name} is running (run {busy.id}): the Context is built after it"}, 409)
         return _json({"started": dispatch_context("manual")})
 
@@ -1390,8 +1399,9 @@ class KnowledgeView(_RecipesMixin, BaseView):
     @expose("/api/map", methods=("POST",))
     @has_access_api
     def edit_system_map(self) -> Response:
-        """Admins: {"layout": {...}} the places of the boxes; {"interaction": {"a", "b", "kind", "note", "id"?}} draws or
-        changes one; {"remove_interaction": id}; {"describe": {"id", "description"}} what a part is."""
+        """Admins: {"layout": {...}} the places of the boxes; {"interaction": {"a", "b", "kind", "note", "detail"?,
+        "id"?}} draws or changes one (note: its short explanation, detail: its long one); {"remove_interaction": id}; {"describe": {"id", "description"}} what a part is;
+        {"describe_category": {"name", "about"}} what a category is."""
         from superset import db
 
         from supagent.knowledge import sysmap
@@ -1408,7 +1418,8 @@ class KnowledgeView(_RecipesMixin, BaseView):
                 x = body["interaction"]
                 out = sysmap.save_interaction(int(x.get("a") or 0), int(x.get("b") or 0), str(x.get("kind") or ""),
                                               str(x.get("note") or ""), g.user.username,
-                                              link_id=int(x["id"]) if str(x.get("id") or "").isdigit() else None)
+                                              link_id=int(x["id"]) if str(x.get("id") or "").isdigit() else None,
+                                              detail=str(x["detail"]) if x.get("detail") is not None else None)
                 touch()
                 db.session.commit()
                 return _json({"interaction": out})
@@ -1427,10 +1438,16 @@ class KnowledgeView(_RecipesMixin, BaseView):
                 touch()
                 db.session.commit()
                 return _json({"id": f.id, "description": f.description})
+            if isinstance(body.get("describe_category"), dict):   # what a category is, in a sentence
+                from supagent.knowledge.facets import set_about
+
+                name = str(body["describe_category"].get("name") or "")
+                return _json({"name": name, "about": set_about(name, str(body["describe_category"].get("about") or ""),
+                                                               g.user.username)})
         except (ValueError, TypeError) as ex:
             db.session.rollback()
             return _json({"error": str(ex)}, 400)
-        return _json({"error": "layout, interaction, remove_interaction or describe"}, 400)
+        return _json({"error": "layout, interaction, remove_interaction, describe or describe_category"}, 400)
 
     @expose("/api/map/export.pdf", methods=("POST",))
     @has_access_api
@@ -1855,10 +1872,88 @@ class AdminView(BaseView):
         busy = running_run()
         if busy is not None:
             what = "is stopping: try again in a moment" if busy.status == "stopping" else "is still running"
-            name = "context build" if busy.kind == "context" else "learning run"
+            name = {"context": "context build", "classify": "classification"}.get(busy.kind, "learning run")
             return _json({"error": f"{name} {busy.id} {what}", "running": busy.id}, 409)
         databases = _body().get("databases") or None
         return _json({"started": dispatch_learning("manual", databases)})
+
+    @expose("/api/classify", methods=("POST",))
+    @has_access_api
+    def classify_now(self) -> Response:
+        """The categories now, as a run of its own listed with the learning runs (its steps, its counts, its LLM
+        use): the values read in the data's fields, what waits settled, the items that changed classified by the
+        LLM, the interactions the documents state. {"minutes": 15}: the LLM's time at most."""
+        from supagent.knowledge.learner import running_run
+        from supagent.tasks import dispatch_classification
+
+        busy = running_run()
+        if busy is not None:
+            what = "is stopping: try again in a moment" if busy.status == "stopping" else "is still running"
+            name = {"context": "context build", "classify": "classification"}.get(busy.kind, "learning run")
+            return _json({"error": f"{name} {busy.id} {what}", "running": busy.id}, 409)
+        minutes = _body().get("minutes")
+        minutes = max(1, min(int(minutes), 240)) if str(minutes or "").isdigit() else None
+        return _json({"started": dispatch_classification("manual", minutes)})
+
+    @expose("/api/backups", methods=("GET", "POST"))
+    @has_access_api
+    def backups(self) -> Response:
+        """The backups of the knowledge on this server (the latest first, with what each part holds); POST: make
+        one now (a run listed with the others)."""
+        from supagent.knowledge import backup
+        from supagent.knowledge.learner import running_run
+
+        if request.method == "POST":
+            busy = running_run()
+            if busy is not None:
+                return _json({"error": f"run {busy.id} ({busy.kind}) is still {busy.status}: the backup is made after it",
+                              "running": busy.id}, 409)
+            from supagent.tasks import dispatch_backup
+
+            return _json({"started": dispatch_backup(g.user.username)})
+        try:
+            files = backup.listing()
+        except OSError as ex:
+            return _json({"backups": [], "directory": backup.directory(), "error": str(ex)[:300], "parts": list(backup.PARTS)})
+        return _json({"backups": files, "directory": backup.directory(), "parts": list(backup.PARTS)})
+
+    @expose("/api/backups/<name>", methods=("GET",))
+    @has_access_api
+    def backup_file(self, name: str) -> Any:
+        """A backup, as a file to keep elsewhere."""
+        from flask import send_file
+
+        from supagent.knowledge import backup
+
+        try:
+            path = backup.path_of(name)
+        except ValueError as ex:
+            return _json({"error": str(ex)}, 404)
+        return send_file(path, mimetype="application/zip", as_attachment=True, download_name=name)
+
+    @expose("/api/backups/<name>/restore", methods=("POST",))
+    @has_access_api
+    def backup_restore(self, name: str) -> Response:
+        """{"parts": ["categories", "catalog"]} put back as they were in that backup (none given: all of it). The
+        present state is saved first in a backup of its own. A run listed with the others."""
+        from supagent.knowledge import backup
+        from supagent.knowledge.learner import running_run
+
+        try:
+            path = backup.path_of(name)
+            have = list((backup.manifest_of(path).get("parts") or {}))
+        except (ValueError, OSError, KeyError) as ex:
+            return _json({"error": str(ex)[:300]}, 404)
+        parts = [str(p) for p in (_body().get("parts") or [])]
+        unknown = [p for p in parts if p not in have]
+        if unknown:
+            return _json({"error": f"not in this backup: {', '.join(unknown)} (it has: {', '.join(have)})"}, 400)
+        busy = running_run()
+        if busy is not None:
+            return _json({"error": f"run {busy.id} ({busy.kind}) is still {busy.status}: restore after it", "running": busy.id}, 409)
+        from supagent.tasks import dispatch_restore
+
+        return _json({"started": dispatch_restore(name, parts or None, g.user.username), "parts": parts or have})
 
     @expose("/api/learn/stop", methods=("POST",))
     @has_access_api
@@ -2030,8 +2125,11 @@ class AdminView(BaseView):
         memories = [{"id": m.id, "text": m.text, "kind": m.kind, "category": m.category, "source": m.source,
                      "created_at": m.created_at} for m in mem_q.order_by(Memory.id.desc()).limit(limit)]
         rec_q = db.session.query(Recipe).filter(Recipe.status == "helpful")
+        from supagent.knowledge.paths import of_recipe, path_text
+
         recipes = [{"id": r.id, "question": r.question, "tool": r.tool, "target": r.target,
-                    "query": (r.query or "")[:1500], "uses": r.uses, "created_at": r.created_at}
+                    "query": (r.query or "")[:1500], "path": path_text(of_recipe(r)), "uses": r.uses,
+                    "created_at": r.created_at}
                    for r in rec_q.order_by(Recipe.id.desc()).limit(limit)]
         # (the AI-written descriptions of the data are not listed here: tens of thousands on a platform, nobody
         # approves them one by one; Data -> Browse shows them, to correct the ones that matter)
@@ -2055,7 +2153,11 @@ class AdminView(BaseView):
 
         values = [{"id": f.id, "facet": f.facet, "value": f.value, "description": f.description,
                    "synonyms": list(f.synonyms or []), "items": n_items.get(f.id, 0), "parents": brief(f.parents),
+                   "source": f.source, "origins": list(f.origins or [])[:3],
                    "same_as": (brief([(f.suggested or {}).get("same_as")]) or [None])[0]} for f in vals]
+        # the values the learning read in the data's category fields, per category: approved together in one click
+        found = {c: int(n) for c, n in db.session.query(Facet.facet, func.count(Facet.id)).filter(
+            Facet.status == "proposed", Facet.source == "data").group_by(Facet.facet)}
         relations = [{"id": f.id, "facet": f.facet, "value": f.value, "parents": brief(f.parents),
                       "suggested": brief((f.suggested or {}).get("parents")),
                       "from": [t for t in ((f.suggested or {}).get("from") or {}).values()][:5]} for f in rel_rows]
@@ -2072,16 +2174,22 @@ class AdminView(BaseView):
         tags = [{"id": t.id, "ref": t.ref, "title": titles.get(t.ref, t.ref), "facet": f.facet, "value": f.value,
                  "confidence": t.confidence} for t, f in tag_rows]
         links = [{"id": x.id, "a": x.a_ref, "a_title": titles.get(x.a_ref, x.a_ref), "b": x.b_ref,
-                  "b_title": titles.get(x.b_ref, x.b_ref), "kind": x.kind, "confidence": x.confidence}
+                  "b_title": titles.get(x.b_ref, x.b_ref), "kind": x.kind, "confidence": x.confidence,
+                  "note": x.note or "", "detail": x.detail or "", "evidence": x.evidence or "",
+                  "parts": x.a_ref.startswith("facet:") and x.b_ref.startswith("facet:")}
                  for x in link_rows]
         routes = [{"id": r.id, "question": r.question, "route": r.moa, "by": r.moa_by, "signal": r.signal,
                    "at": r.signal_at} for r in route_rows]
+        from supagent.knowledge.retire import waiting as retire_waiting
+
+        retire, n_retire = retire_waiting(limit)         # parts that look retired: proposed, never done alone
         counts = {"memory": mem_q.count(), "recipes": rec_q.count(),
                   "values": val_q.count(), "relations": len(rel_all), "tags": tag_q.count(), "links": link_q.count(),
-                  "routes": route_q.count()}
-        return _json({"memory": memories, "recipes": recipes, "values": values,
+                  "retire": n_retire, "routes": route_q.count()}
+        return _json({"memory": memories, "recipes": recipes, "values": values, "found": found, "retire": retire,
                       "relations": relations, "tags": tags, "links": links, "routes": routes, "counts": counts,
-                      "waiting": sum(counts[k] for k in ("memory", "recipes", "values", "relations", "tags", "links"))})
+                      "waiting": sum(counts[k] for k in ("memory", "recipes", "values", "relations", "tags", "links",
+                                                         "retire"))})
 
     @expose("/api/facets", methods=("GET",))
     @has_access_api
@@ -2098,19 +2206,30 @@ class AdminView(BaseView):
             q = q.filter(Facet.facet == request.args["facet"])
         if request.args.get("status"):
             q = q.filter(Facet.status == request.args["status"])
-        if request.args.get("q"):
-            q = q.filter(Facet.value.ilike(f"%{request.args['q'][:100]}%"))
         if request.args.get("brief"):
-            # the lists of what a value can be part of: the names only, every category, the wider ones first (the
-            # full list stops at 1,000 values in the order of the categories' names: with a big category read from
-            # the data, the subjects were not in it, and saving an edit then took a value's subjects away)
+            # the choices of what a value can be part of: the names only, every category, the wider ones first.
+            # ?q= the words typed (in the name or in another name of the value: the names that start with them
+            # first), ?limit= how many are listed (the page shows the first ones and says how many more)
             from supagent.knowledge.facets import editable
 
             place = {c: i for i, c in enumerate(editable())}
-            found = [r for r in q.with_entities(Facet.id, Facet.facet, Facet.value, Facet.status).all() if r[1] in place]
-            found.sort(key=lambda r: (place[r[1]], r[2].lower()))
-            return _json({"facets": [{"id": i, "facet": c, "value": v, "status": st} for i, c, v, st in found[:BRIEF_VALUES]],
-                          "capped": len(found) > BRIEF_VALUES})
+            text = " ".join(str(request.args.get("q") or "").lower().split())[:100]
+            found = []
+            for i, c, v, status, syn in q.with_entities(Facet.id, Facet.facet, Facet.value, Facet.status, Facet.synonyms):
+                if c not in place:
+                    continue
+                if text and text not in v.lower() and not any(text in str(x).lower() for x in (syn or [])):
+                    continue
+                found.append((i, c, v, status))
+            found.sort(key=lambda r: (bool(text) and not r[2].lower().startswith(text), place[r[1]], r[2].lower()))
+            try:
+                limit = min(max(int(request.args.get("limit") or BRIEF_VALUES), 1), BRIEF_VALUES)
+            except ValueError:
+                limit = BRIEF_VALUES
+            return _json({"facets": [{"id": i, "facet": c, "value": v, "status": st} for i, c, v, st in found[:limit]],
+                          "capped": len(found) > limit, "total": len(found)})
+        if request.args.get("q"):
+            q = q.filter(Facet.value.ilike(f"%{request.args['q'][:100]}%"))
         rows = q.order_by(Facet.facet, Facet.value).limit(1000).all()
         ids = [f.id for f in rows] or [-1]
         n_items = dict(db.session.query(Tag.facet_id, func.count(Tag.id)).filter(
@@ -2175,6 +2294,39 @@ class AdminView(BaseView):
         db.session.commit()
         return _json({"id": f.id, "facet": f.facet, "value": f.value, "status": f.status})
 
+    @expose("/api/facets/approve-found", methods=("POST",))
+    @has_access_api
+    def approve_found(self) -> Response:
+        """{"facet": "server"}: every value of that category the learning read in the data and that waits is
+        approved (one click for a category read from a field: its servers, its applications)."""
+        import datetime as dt
+
+        from superset import db
+
+        from supagent.knowledge.facets import CONFIDENT, editable, review_all
+        from supagent.knowledge.freshness import touch
+        from supagent.models import Facet, Tag
+
+        facet = str(_body().get("facet") or "").strip().lower()
+        if facet not in editable():
+            return _json({"error": "choose the category: " + ", ".join(editable())}, 400)
+        rows = db.session.query(Facet).filter(Facet.facet == facet, Facet.status == "proposed",
+                                              Facet.source == "data").all()
+        now = dt.datetime.utcnow()
+        for f in rows:
+            f.status, f.reviewed_by, f.reviewed_at = "approved", g.user.username, now
+        if rows and not review_all():                 # their confident tags are used at once
+            ids = [f.id for f in rows]
+            for i in range(0, len(ids), 500):
+                db.session.query(Tag).filter(Tag.facet_id.in_(ids[i:i + 500]), Tag.status == "proposed",
+                                             Tag.confidence >= CONFIDENT).update({Tag.status: "approved"},
+                                                                                 synchronize_session=False)
+        db.session.commit()
+        if rows:
+            touch()
+            db.session.commit()
+        return _json({"approved": len(rows), "facet": facet})
+
     @expose("/api/facets/categories", methods=("GET", "POST"))
     @has_access_api
     def facet_categories(self) -> Response:
@@ -2212,6 +2364,11 @@ class AdminView(BaseView):
                     name = rename_category(name, str(body["rename"]), g.user.username)
                 except ValueError as ex:
                     return _json({"error": str(ex)}, 400)
+            if "about" in body:                       # what the category is, in a sentence
+                from supagent.knowledge.facets import editable, set_about
+
+                if name in editable():
+                    set_about(name, str(body.get("about") or ""), g.user.username)
             if name not in BUILTIN and name not in [str(x).lower() for x in settings.get("categories.custom") or []]:
                 settings.set_value("categories.custom", list(settings.get("categories.custom") or []) + [name],
                                    by=g.user.username)
@@ -2248,6 +2405,14 @@ class AdminView(BaseView):
         if f is None:
             abort(404)
         body = _body()
+        if "retire" in body:                           # the answer to a proposed retirement: retire it, or keep it
+            from supagent.knowledge.retire import decide
+
+            status = decide(f, bool(body.get("retire")), g.user.username)
+            db.session.commit()
+            touch()
+            db.session.commit()
+            return _json({"id": f.id, "status": status})
         if body.get("merge_into"):
             to = db.session.get(Facet, int(body["merge_into"]))
             if to is None or to.facet != f.facet or to.id == f.id:
@@ -2390,10 +2555,22 @@ class AdminView(BaseView):
         x = db.session.get(Link, lid)
         if x is None:
             abort(404)
-        if _body().get("status") in ("approved", "rejected"):
-            x.status, x.reviewed_by = _body()["status"], g.user.username
+        body = _body()
+        if "note" in body or "detail" in body:          # the explanations, corrected by the admin who approves
+            for key, size in (("note", 500), ("detail", 2000)):
+                if key in body:
+                    setattr(x, key, str(body.get(key) or "").strip()[:size] or None)
+            x.explained_by = g.user.username
+        if body.get("status") in ("approved", "rejected") or "note" in body or "detail" in body:
+            if body.get("status") in ("approved", "rejected"):
+                x.status, x.reviewed_by = body["status"], g.user.username
             db.session.commit()
-        return _json({"id": x.id, "status": x.status})
+            if x.a_ref.startswith("facet:"):           # an interaction of the System map: the map and the agent follow
+                from supagent.knowledge.freshness import touch
+
+                touch()
+                db.session.commit()
+        return _json({"id": x.id, "status": x.status, "note": x.note or "", "detail": x.detail or ""})
 
     @expose("/api/routes/<int:rid>", methods=("POST",))
     @has_access_api

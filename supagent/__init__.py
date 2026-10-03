@@ -24,7 +24,7 @@ import logging
 import os
 from typing import Any, Callable
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 
 log = logging.getLogger(__name__)
 HERE = os.path.dirname(os.path.abspath(__file__))

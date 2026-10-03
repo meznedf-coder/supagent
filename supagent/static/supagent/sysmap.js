@@ -1,8 +1,11 @@
 /* supagent Data dictionary: the System map (0.8). The architecture of the system as the categories describe it: one
    column per category (subjects, applications, components, the deployment's own), a box per part with what it does
    (its description, else a sentence of the documents that name it) and its items, a grey line from a part to what
-   it is part of, the interactions an admin drew as arrows. A big category is folded into one box (click it to open
-   it). Admins: Edit to move the boxes, draw an interaction (a box, then another), write what a part is, hide a part.
+   it is part of, the interactions an admin drew as arrows. A category folds into one box and opens again with a
+   click on its name (a big one starts folded); each viewer chooses the categories shown (the legend, or the cross
+   in a category's name: kept in the browser); the map can take the whole screen. Admins: Edit to move the boxes
+   and the categories (drag a category's name), put categories in a group drawn around them (display only), draw an
+   interaction (a box, then another), write what a part is, hide a part.
    Exports: SVG, PNG, PDF. Drawn in SVG by hand: Superset's pages allow no external script. */
 (function () {
   "use strict";
@@ -13,8 +16,36 @@
   var FOLD_AT = 18, FOLD_ALWAYS = 60;   // a category read from the data with more parts than 18 is folded into one
                                         // box (servers...), any category with more than 60
   var BOX_W = 224, GAP = 14, COL_GAP = 96, PAD = 28, HEAD_H = 40, LINE = 16;
-  var st = { data: null, edit: false, open: {}, focus: "", sel: null, from: null, view: { x: 0, y: 0, k: 1 },
-             boxes: {}, saveTimer: null, fitted: false, seq: 0, sig: "", fresh: null, freshTimer: null, autoAt: 0, note: "", freshAt: -1, freshCats: [], inputAt: Date.now() };
+  /* What this viewer sees: `cats` the categories chosen (none: every category; kept in the browser), `parts` the
+     parts chosen (none: every part of those categories; each chosen part comes with what it is part of, what it
+     is made of and what it interacts with). Both are chosen in the box above the map; the legend and the cross
+     in a category's name change `cats` too. */
+  var st = { data: null, edit: false, open: {}, sel: null, from: null, view: { x: 0, y: 0, k: 1 },
+             boxes: {}, saveTimer: null, fitted: false, seq: 0, sig: "", fresh: null, freshTimer: null, autoAt: 0, note: "", freshAt: -1, freshCats: [], inputAt: Date.now(),
+             cols: {}, groups: [], cats: readCats(), parts: [], full: false, pick: null };
+  var CATS_KEY = "supagent.map.categories";      // the categories this viewer chose (this browser only)
+  var GROUP_PAD = 12, GROUP_HEAD = 22, PICK_PARTS = 80;
+  function readCats() {
+    try {
+      var v = JSON.parse(window.localStorage.getItem("supagent.map.categories") || "[]");
+      return Array.isArray(v) ? v.map(String) : [];
+    } catch (e) { return []; }                    // no storage (a private window): the choice lasts as long as the page
+  }
+  function saveCats() {
+    try { window.localStorage.setItem(CATS_KEY, JSON.stringify(st.cats)); } catch (e) { /* kept for this page only */ }
+  }
+  function isOff(c) { return st.cats.length > 0 && st.cats.indexOf(c) < 0; }
+  function allCats() { return st.data.categories.map(function (c) { return c.name; }); }
+  /* a category shown or hidden: with none chosen every one is shown, so hiding one chooses all the others; the
+     last one cannot be hidden (the choice is emptied: everything again) */
+  function showCat(c, on) {
+    var all = allCats(), now = st.cats.length ? st.cats.filter(function (x) { return all.indexOf(x) >= 0; }) : all.slice();
+    if (on && now.indexOf(c) < 0) now.push(c);
+    if (!on) now = now.filter(function (x) { return x !== c; });
+    st.cats = !now.length || now.length === all.length ? [] : all.filter(function (x) { return now.indexOf(x) >= 0; });
+    saveCats();
+    syncPick();
+  }
   var AUTO_MS = 20000, FRESH_MS = 20000;   // read again every 20 s while it is looked at; what is new stays outlined 20 s
   var IDLE_MS = 15 * 60000;                // nobody at the page for 15 minutes: it stops reading (the session may end)
   var OTHERS_MS = 60000;                   // who is not an admin: read again once a minute
@@ -66,7 +97,7 @@
      and every 20 seconds while it is looked at (quietly: drawn again only when something changed, never while an
      admin edits it). While it is read the page says so; what a reading brought (a new part, a new "part of") is
      outlined for a moment and said next to the title. */
-  function signature(d) { return JSON.stringify([d.values, d.links, d.categories, d.proposed, d.layout && [d.layout.positions, d.layout.hidden, d.layout.folded]]); }
+  function signature(d) { return JSON.stringify([d.values, d.links, d.categories, d.proposed, d.proposed_interactions, d.missing, d.layout && [d.layout.positions, d.layout.hidden, d.layout.folded, d.layout.columns, d.layout.groups]]); }
   function setState(text, cls) {
     var box = $("map-state");
     if (!box) return;
@@ -167,7 +198,11 @@
       st.positions = lay.positions || {};
       st.hidden = lay.hidden || [];
       st.folded = lay.folded || {};
-      focusOptions();
+      st.cols = lay.columns || {};
+      st.groups = lay.groups || [];
+      st.cats = st.cats.filter(function (c) { return allCats().indexOf(c) >= 0; });   // a category removed since
+      st.parts = st.parts.filter(function (i) { return !!st.byId[i]; });
+      syncPick();
       draw();
       if (!st.fitted) { fit(true); st.fitted = true; }
       st.freshAt = -1;
@@ -193,61 +228,133 @@
     st.autoAt = Date.now();
     load(true);
   }
-  function focusOptions() {
-    var sel = $("map-focus"), keep = sel.value;
-    sel.innerHTML = "";
-    sel.appendChild(el("option", { value: "", text: "Everything" }));
+  /* The box above the map: the categories and the parts to show, several at once, found by typing. Nothing
+     chosen: everything. A part with parts says how many (choose it to see them). */
+  function pickLabel(c) { return catLabel(c.name, 2) + " (" + S.num(c.count) + ")"; }
+  function pickLoad(words) {
+    var q = words.toLowerCase(), items = [], more = 0;
     st.data.categories.forEach(function (c) {
-      var vals = st.data.values.filter(function (v) { return v.facet === c.name; })
-        .sort(function (a, b) { return a.value.localeCompare(b.value); });
-      if (!vals.length) return;
-      sel.appendChild(el("optgroup", { label: catLabel(c.name, 2) + " (" + c.count + ")" }, vals.map(function (v) {
-        return el("option", { value: String(v.id), text: v.value }); })));
+      if (!c.count) return;
+      var label = catLabel(c.name, 2);
+      if (!q || label.toLowerCase().indexOf(q) >= 0 || c.name.indexOf(q) >= 0) {
+        items.push({ id: "cat:" + c.name, label: label, group: "Categories", cls: "cat", hint: S.num(c.count) + " part" + (c.count > 1 ? "s" : "") });
+      }
     });
-    sel.value = keep && st.byId[keep] ? keep : "";
-    st.focus = sel.value;
+    var n = 0;
+    st.data.categories.forEach(function (c) {
+      st.data.values.filter(function (v) { return v.facet === c.name; })
+        .sort(function (a, b) { return a.value.localeCompare(b.value); }).forEach(function (v) {
+          if (q && v.value.toLowerCase().indexOf(q) < 0 &&
+              !(v.synonyms || []).some(function (x) { return String(x).toLowerCase().indexOf(q) >= 0; })) return;
+          if (++n > PICK_PARTS) { more++; return; }
+          var kids = (st.kids[v.id] || []).length;
+          items.push({ id: String(v.id), label: v.value, group: catLabel(c.name, 2), hint: kids ? S.num(kids) + " part" + (kids > 1 ? "s" : "") : "" });
+        });
+    });
+    return { items: items, more: more };
   }
-  /* the parts shown: every part (the hidden ones aside), or the part in focus with what it is part of, what is
-     part of it and what it interacts with */
+  function pickChosen() {
+    var by = {};
+    st.data.categories.forEach(function (c) { by[c.name] = c; });
+    return st.cats.filter(function (c) { return by[c]; }).map(function (c) {
+      return { id: "cat:" + c, label: catLabel(c, 2), group: "Categories", cls: "cat" }; })
+      .concat(st.parts.filter(function (i) { return st.byId[i]; }).map(function (i) {
+        return { id: String(i), label: st.byId[i].value, group: catLabel(st.byId[i].facet, 2) }; }));
+  }
+  function syncPick() {
+    if (!st.data) return;
+    if (!st.pick) {
+      st.pick = S.picker({ load: pickLoad, chosen: pickChosen(), placeholder: "Everything: choose categories or parts…",
+        label: "Show: categories and parts", wait: 0, onchange: function (chosen) {
+          var all = allCats();
+          var cats = chosen.filter(function (x) { return String(x.id).indexOf("cat:") === 0; }).map(function (x) { return String(x.id).slice(4); });
+          st.cats = cats.length === all.length ? [] : all.filter(function (c) { return cats.indexOf(c) >= 0; });
+          st.parts = chosen.filter(function (x) { return String(x.id).indexOf("cat:") !== 0; }).map(function (x) { return +x.id; });
+          saveCats();
+          unselect();
+          draw();
+          fit(true);
+        } });
+      var host = $("map-focus");
+      host.innerHTML = "";
+      host.appendChild(st.pick.el);
+    } else st.pick.set(pickChosen());
+  }
+  /* the parts shown: every part of the categories chosen (the hidden ones aside); with parts chosen, each of them
+     with what it is part of, what is part of it and what it interacts with */
   function shownIds() {
     var ids = {};
-    if (st.focus && st.byId[st.focus]) {
-      var f = +st.focus, todo = [f];
-      ids[f] = true;
-      while (todo.length) {                                   // what it is part of, all the way up
-        var v = st.byId[todo.pop()];
-        (v.parents || []).forEach(function (p) { if (st.byId[p] && !ids[p]) { ids[p] = true; todo.push(p); } });
-      }
-      var level = [f];
-      for (var depth = 0; depth < 2; depth++) {               // what is part of it, two levels down
-        var nxt = [];
-        level.forEach(function (i) { (st.kids[i] || []).forEach(function (k) { if (!ids[k]) { ids[k] = true; nxt.push(k); } }); });
-        level = nxt;
-      }
-      st.data.links.forEach(function (x) { if (x.a === f) ids[x.b] = true; if (x.b === f) ids[x.a] = true; });
+    if (st.parts.length) {
+      st.parts.forEach(function (f) {
+        if (!st.byId[f]) return;
+        var todo = [f];
+        ids[f] = true;
+        while (todo.length) {                                 // what it is part of, all the way up
+          var v = st.byId[todo.pop()];
+          (v.parents || []).forEach(function (p) { if (st.byId[p] && !ids[p]) { ids[p] = true; todo.push(p); } });
+        }
+        var level = [f];
+        for (var depth = 0; depth < 2; depth++) {             // what is part of it, two levels down
+          var nxt = [];
+          level.forEach(function (i) { (st.kids[i] || []).forEach(function (k) { if (!ids[k]) { ids[k] = true; nxt.push(k); } }); });
+          level = nxt;
+        }
+        st.data.links.forEach(function (x) { if (x.a === f) ids[x.b] = true; if (x.b === f) ids[x.a] = true; });
+      });
+      Object.keys(ids).forEach(function (i) {                 // of the categories chosen (a chosen part is always shown)
+        if (st.parts.indexOf(+i) < 0 && isOff(st.byId[i].facet)) delete ids[i];
+      });
       return ids;
     }
-    st.data.values.forEach(function (v) { if (st.hidden.indexOf(v.id) < 0) ids[v.id] = true; });
+    st.data.values.forEach(function (v) { if (st.hidden.indexOf(v.id) < 0 && !isOff(v.facet)) ids[v.id] = true; });
     return ids;
+  }
+  /* the categories in the order of their columns: the wider first, the members of a group side by side (at the
+     place of its first one) */
+  function groupOf(c) {
+    for (var i = 0; i < st.groups.length; i++) if ((st.groups[i].categories || []).indexOf(c) >= 0) return st.groups[i];
+    return null;
+  }
+  function catOrder() {
+    var cats = st.data.categories.map(function (c) { return c.name; }), out = [], used = {};
+    cats.forEach(function (c) {
+      if (used[c]) return;
+      var g = groupOf(c);
+      (g ? cats.filter(function (x) { return g.categories.indexOf(x) >= 0; }) : [c]).forEach(function (x) {
+        if (!used[x]) { used[x] = true; out.push(x); }
+      });
+    });
+    return out;
   }
 
   // ------------------------------------------------------------------ the layout: columns, an order with few crossings
   function layout(ids) {
-    var cats = st.data.categories.map(function (c) { return c.name; });
+    var cats = catOrder();
     var cols = {}, nodes = {};
     Object.keys(ids).forEach(function (i) {
       var v = st.byId[i];
       (cols[v.facet] = cols[v.facet] || []).push(v);
     });
     var C = colors(), titleFont = "600 13.5px " + C.font, textFont = "12px " + C.font;
-    var none = !!st.data.is_admin && !st.focus;              // an admin: a category with no value yet has its column
-    cats.forEach(function (c) { if (none && !cols[c]) cols[c] = []; });
+    var none = !!st.data.is_admin && !st.parts.length;       // an admin: a category with no value yet has its column
+    cats.forEach(function (c) { if (none && !cols[c] && !isOff(c)) cols[c] = []; });
     var order = cats.filter(function (c) { return cols[c] && (cols[c].length || none); });
+    /* the place of each column when every category is shown: a box an admin placed there keeps its place next to
+       its column when a viewer shows fewer categories (the columns close up) */
+    var has = {};
+    st.data.values.forEach(function (v) { if (st.hidden.indexOf(v.id) < 0) has[v.facet] = true; });
+    var full = cats.filter(function (c) { return has[c] || !!st.data.is_admin; });
+    var shift = {};
+    order.forEach(function (c, ci) {
+      var fi = full.indexOf(c);
+      shift[c] = fi < 0 ? 0 : (ci - fi) * (BOX_W + COL_GAP);
+    });
     var folded = {};
     order.forEach(function (c) {
       var fromData = cols[c].filter(function (v) { return v.source === "data"; }).length * 2 >= cols[c].length;
-      var big = !st.focus && (cols[c].length > FOLD_ALWAYS || (cols[c].length > FOLD_AT && fromData));
-      folded[c] = big && (st.open[c] === undefined ? st.folded[c] !== false : !st.open[c]);
+      var big = cols[c].length > FOLD_ALWAYS || (cols[c].length > FOLD_AT && fromData);
+      var usual = st.folded[c] === undefined ? big : !!st.folded[c];      // as an admin left it, else a big one is folded
+      folded[c] = !st.parts.length && cols[c].length > 0 && (st.open[c] === undefined ? usual : !st.open[c]);
     });
     var rankOf = {};                                          // a part's place in its column (the previous pass)
     order.forEach(function (c, ci) {
@@ -268,17 +375,21 @@
     }
     var heads = [];
     order.forEach(function (c, ci) {
-      var x = PAD + ci * (BOX_W + COL_GAP), y = PAD + HEAD_H;
-      heads.push({ cat: c, x: x, n: cols[c].length, color: C.series[st.data.categories.map(function (k) { return k.name; }).indexOf(c) % 8] });
+      var off = st.cols[c] || [0, 0];                         // where an admin moved the category
+      var x = PAD + ci * (BOX_W + COL_GAP) + (+off[0] || 0), top = PAD + (+off[1] || 0), y = top + HEAD_H;
+      var info = st.data.categories.filter(function (k) { return k.name === c; })[0] || {};
+      heads.push({ cat: c, x: x, y: top, n: cols[c].length, folded: !!folded[c], shift: shift[c], about: info.about || "",
+                   fields: info.fields || "",
+                   color: C.series[st.data.categories.map(function (k) { return k.name; }).indexOf(c) % 8] });
       if (!cols[c].length) {                                  // no value yet: said in its column
-        nodes["none:" + c] = { id: "none:" + c, none: c, x: x, y: y, w: BOX_W, h: 58 };
+        nodes["none:" + c] = { id: "none:" + c, none: c, cat: c, x: x, y: y, w: BOX_W, h: 58 };
         return;
       }
       if (folded[c]) {
         var names = cols[c].slice(0, 6).map(function (v) { return v.value; }).join(", ") + (cols[c].length > 6 ? "…" : "");
         var lines = wrap(names, textFont, BOX_W - 24, 3);
-        var h = 52 + lines.length * LINE;
-        nodes["cat:" + c] = { id: "cat:" + c, fold: c, x: x, y: y, w: BOX_W, h: h, title: [catLabel(c, cols[c].length) + " · " +
+        var h = 36 + lines.length * LINE;
+        nodes["cat:" + c] = { id: "cat:" + c, fold: c, cat: c, x: x, y: y, w: BOX_W, h: h, title: [catLabel(c, cols[c].length) + " · " +
           S.num(cols[c].length)], lines: lines, members: cols[c].map(function (v) { return v.id; }) };
         cols[c].forEach(function (v) { nodes[v.id] = { alias: "cat:" + c }; });
         return;
@@ -290,12 +401,29 @@
         var items = v.gone ? "its items are gone" : v.items ? S.num(v.items) + " item" + (v.items > 1 ? "s" : "") : "no item yet";
         var h = 16 + title.length * 17 + (about.length ? 4 + about.length * LINE : 0) + (v.hint && !v.description ? LINE : 0) + 22;
         var p = st.positions[v.id];
-        nodes[v.id] = { id: v.id, v: v, x: p ? p[0] : x, y: p ? p[1] : y, w: BOX_W, h: h, title: title, about: about,
+        nodes[v.id] = { id: v.id, v: v, cat: c, x: p ? p[0] + shift[c] : x, y: p ? p[1] : y, w: BOX_W, h: h, title: title, about: about,
                         items: items, hintFrom: v.hint && !v.description ? v.hint.from : null, moved: !!p };
         y += h + GAP;
       });
     });
-    return { nodes: nodes, heads: heads, folded: folded };
+    /* the groups an admin made (display only): a frame around the columns of their categories that are shown */
+    var frames = [];
+    st.groups.forEach(function (g, gi) {
+      var mine = heads.filter(function (h) { return (g.categories || []).indexOf(h.cat) >= 0; });
+      if (!mine.length) return;
+      var x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      mine.forEach(function (h) {
+        x0 = Math.min(x0, h.x); y0 = Math.min(y0, h.y); x1 = Math.max(x1, h.x + BOX_W); y1 = Math.max(y1, h.y + HEAD_H);
+      });
+      Object.keys(nodes).forEach(function (k) {
+        var n = nodes[k];
+        if (n.alias || (g.categories || []).indexOf(n.cat) < 0) return;
+        x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y - HEAD_H); x1 = Math.max(x1, n.x + n.w); y1 = Math.max(y1, n.y + n.h);
+      });
+      frames.push({ name: g.name, index: gi, x: x0 - GROUP_PAD, y: y0 - GROUP_HEAD, w: x1 - x0 + 2 * GROUP_PAD,
+                    h: y1 - y0 + GROUP_HEAD + GROUP_PAD });
+    });
+    return { nodes: nodes, heads: heads, folded: folded, frames: frames, shift: shift };
   }
   function bary(v, rankOf) {
     var ps = (v.parents || []).filter(function (p) { return rankOf[p] !== undefined; });
@@ -334,15 +462,19 @@
     root.appendChild(defs);
     var vp = svg("g", { class: "map-viewport" });
     root.appendChild(vp);
-    var gHeads = svg("g", {}), gEdges = svg("g", {}), gLinks = svg("g", {}), gNodes = svg("g", {});
-    [gHeads, gEdges, gLinks, gNodes].forEach(function (g) { vp.appendChild(g); });
-    L.heads.forEach(function (h) {
-      gHeads.appendChild(svg("rect", { x: h.x, y: PAD, width: BOX_W, height: 4, rx: 2, fill: h.color }));
-      var t = svg("text", { x: h.x, y: PAD + 24, fill: C.ink2, "font-family": C.font, "font-size": "13", "font-weight": "600",
-                            "letter-spacing": ".04em" });
-      t.textContent = catLabel(h.cat, h.n).toUpperCase() + "  ·  " + S.num(h.n);
-      gHeads.appendChild(t);
+    var gFrames = svg("g", {}), gHeads = svg("g", {}), gEdges = svg("g", {}), gLinks = svg("g", {}), gNodes = svg("g", {});
+    [gFrames, gEdges, gLinks, gNodes, gHeads].forEach(function (g) { vp.appendChild(g); });
+    L.frames.forEach(function (f) {                           // a group of categories: a frame around their columns
+      var g = svg("g", { class: "map-group", "data-group": String(f.index) });
+      g.appendChild(svg("rect", { x: f.x, y: f.y, width: f.w, height: f.h, rx: 12, fill: C.bg, stroke: C.axis,
+                                  "stroke-width": "1.2", "stroke-dasharray": "6 4" }));
+      var t = svg("text", { x: f.x + 12, y: f.y + 15, fill: C.ink2, "font-family": C.font, "font-size": "12",
+                            "font-weight": "700", "letter-spacing": ".06em" });
+      t.textContent = String(f.name || "").toUpperCase();
+      g.appendChild(t);
+      gFrames.appendChild(g);
     });
+    L.heads.forEach(function (h) { gHeads.appendChild(headView(h, C)); });
     var drawn = {};
     st.data.values.forEach(function (v) {                      // what each part is part of
       if (!ids[v.id]) return;
@@ -364,42 +496,23 @@
         (e.a.v ? e.a.v.value : e.a.title[0]) + (e.n > 1 ? " (" + e.n + " parts)" : ""))]));
       gEdges.appendChild(line);
     });
-    var placed = [];                                           // the labels drawn: the next ones avoid them and the boxes
-    var boxes = Object.keys(L.nodes).map(function (k) { return L.nodes[k]; }).filter(function (n) { return !n.alias; });
-    var clear = function (x, y, w) {
-      return !placed.some(function (r) { return Math.abs(r.y - y) < 20 && x < r.x + r.w + 6 && r.x < x + w + 6; }) &&
-        !boxes.some(function (n) { return x < n.x + n.w + 4 && n.x < x + w + 4 && y - 11 < n.y + n.h && n.y < y + 11; });
-    };
-    var free = function (mx, my, w) {                         // on the curve, else beside it; then below, above, further...
-      var xs = [mx - w / 2, mx + 4, mx - w - 4];
-      for (var tries = 0; tries < 13; tries++) {
-        var y = my + (tries % 2 ? 1 : -1) * 22 * Math.ceil(tries / 2);
-        for (var i = 0; i < xs.length; i++) {
-          if (clear(xs[i], y, w)) { placed.push({ x: xs[i], y: y, w: w }); return { x: xs[i], y: y }; }
-        }
-      }
-      placed.push({ x: xs[0], y: my, w: w });
-      return { x: xs[0], y: my };
-    };
     st.data.links.forEach(function (x) {                       // the interactions an admin drew
       if (!ids[x.a] || !ids[x.b]) return;
       var a = real(L.nodes, x.a), b = real(L.nodes, x.b);
       if (!a || !b || a === b) return;
       var path = curve(a, b, true);
-      var g = svg("g", { class: "map-link", "data-a": String(a.id), "data-b": String(b.id) });
+      // no text on the graph: the arrow, and a wider invisible line to click; a click shows what it is (its short
+      // explanation) and, folded, what to do when following it
+      var g = svg("g", { class: "map-link", "data-a": String(a.id), "data-b": String(b.id), "data-link": String(x.id),
+                         tabindex: "0", role: "button",
+                         "aria-label": (a.v ? a.v.value : "") + " " + x.label + " " + (b.v ? b.v.value : "") + ": details" });
+      g.appendChild(svg("path", { d: path.d, fill: "none", stroke: "transparent", "stroke-width": "12", class: "map-link-hit",
+                                  "pointer-events": "stroke" }));
       g.appendChild(svg("path", { d: path.d, fill: "none", stroke: C.accent, "stroke-width": "2", "marker-end": "url(#map-arrow)" }));
-      var label = x.label + (x.note ? ": " + x.note : "");
-      var short = label.length > 34 ? label.slice(0, 33) + "…" : label;
-      measure.font = "11.5px " + C.font;
-      var w = measure.measureText(short).width + 10;
-      var at = free(path.mx, path.my, w);
-      g.appendChild(svg("rect", { x: at.x, y: at.y - 9, width: w, height: 18, rx: 9, fill: C.panel,
-                                  stroke: C.accent, "stroke-width": "1" }));
-      var t = svg("text", { x: at.x + w / 2, y: at.y + 4, "text-anchor": "middle", fill: C.accent, "font-family": C.font,
-                            "font-size": "11.5" });
-      t.textContent = short;
-      g.appendChild(t);
-      g.appendChild(svg("title", {}, [document.createTextNode((a.v ? a.v.value : "") + " " + label + " " + (b.v ? b.v.value : ""))]));
+      g.appendChild(svg("title", {}, [document.createTextNode((a.v ? a.v.value : "") + " " + x.label + " " + (b.v ? b.v.value : ""))]));
+      var open = function (ev) { if (ev) { ev.stopPropagation(); ev.preventDefault(); } linkPanel(x); };
+      g.addEventListener("click", open);
+      g.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") open(ev); });
       gLinks.appendChild(g);
     });
     Object.keys(L.nodes).forEach(function (k) {
@@ -414,6 +527,76 @@
     legend(C);
     if (st.sel && L.nodes[st.sel]) select(st.sel, true);
   }
+  /* The name of a category on the map: a click folds its parts into one box or opens them again; its cross hides
+     the category for this viewer (the legend shows it again); in Edit an admin drags it to move the category. */
+  function headView(h, C) {
+    var label = catLabel(h.cat, h.n);
+    var g = svg("g", { class: "map-head" + (h.folded ? " folded" : ""), transform: "translate(" + h.x + "," + h.y + ")",
+                       "data-cat": h.cat, tabindex: "0", role: "button", "aria-expanded": String(!h.folded),
+                       "aria-label": label + ", " + S.num(h.n) + (h.n ? (h.folded ? ": open" : ": fold into one box") : "") });
+    g.appendChild(svg("rect", { x: -6, y: -4, width: BOX_W + 12, height: HEAD_H - 2, rx: 6, fill: C.panel, "fill-opacity": "0",
+                                "pointer-events": "all", class: "map-head-hit" }));
+    g.appendChild(svg("rect", { x: 0, y: 0, width: BOX_W, height: 4, rx: 2, fill: h.color }));
+    if (h.n) g.appendChild(svg("path", { d: h.folded ? "M2,13 L8,18 L2,23 z" : "M0,15 L10,15 L5,21 z", fill: C.ink2, class: "map-chevron" }));
+    var t = svg("text", { x: h.n ? 16 : 0, y: 24, fill: C.ink2, "font-family": C.font, "font-size": "13", "font-weight": "600",
+                          "letter-spacing": ".04em" });
+    t.textContent = label.toUpperCase() + "  ·  " + S.num(h.n);
+    g.appendChild(t);
+    if (h.about) {                                            // what the category is, in a line under its name
+      measure.font = "11px " + C.font;
+      var line = h.about;
+      while (measure.measureText(line).width > BOX_W - 4 && line.length > 4) line = line.slice(0, -2);
+      var sub = svg("text", { x: 0, y: 37, fill: C.muted, "font-family": C.font, "font-size": "11", class: "map-about" });
+      sub.textContent = line === h.about ? line : line.replace(/\s*\S*$/, "") + "…";
+      g.appendChild(sub);
+    }
+    g.appendChild(svg("title", {}, [document.createTextNode((h.about ? label + ": " + h.about + "\n" : "") +
+      (h.n ? (h.folded ? "Open: every " + label.toLowerCase() : "Fold into one box") +
+      (st.edit ? " (drag: move the category)" : "") : label))]));
+    var about = svg("g", { class: "map-info", transform: "translate(" + (BOX_W - 42) + ",8)", tabindex: "0", role: "button",
+                           "aria-label": "What " + label.toLowerCase() + " are" + (st.data.is_admin ? ": read or write it" : "") });
+    about.appendChild(svg("rect", { x: -3, y: -3, width: 22, height: 22, rx: 5, fill: C.panel, "fill-opacity": "0", "pointer-events": "all" }));
+    about.appendChild(svg("circle", { cx: 8, cy: 8, r: 7, fill: "none", stroke: C.muted, "stroke-width": "1.4" }));
+    about.appendChild(svg("path", { d: "M8,7 L8,12 M8,4 L8,4.6", stroke: C.muted, "stroke-width": "1.8", "stroke-linecap": "round", fill: "none" }));
+    about.appendChild(svg("title", {}, [document.createTextNode("What this category is")]));
+    var openAbout = function (ev) { ev.stopPropagation(); ev.preventDefault(); categoryPanel(h.cat); };
+    about.addEventListener("pointerdown", function (ev) { ev.stopPropagation(); });
+    about.addEventListener("click", openAbout);
+    about.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") openAbout(ev); });
+    g.appendChild(about);
+    var hide = svg("g", { class: "map-hide", transform: "translate(" + (BOX_W - 18) + ",8)", tabindex: "0", role: "button",
+                          "aria-label": "Hide " + label.toLowerCase() + " (the legend shows them again)" });
+    hide.appendChild(svg("rect", { x: -3, y: -3, width: 22, height: 22, rx: 5, fill: C.panel, "fill-opacity": "0", "pointer-events": "all" }));
+    hide.appendChild(svg("path", { d: "M3,3 L13,13 M13,3 L3,13", stroke: C.muted, "stroke-width": "1.8", "stroke-linecap": "round", fill: "none" }));
+    hide.appendChild(svg("title", {}, [document.createTextNode("Hide this category (the legend shows it again)")]));
+    var hideIt = function (ev) {
+      ev.stopPropagation();
+      ev.preventDefault();
+      showCat(h.cat, false);
+      unselect();
+      draw();
+    };
+    hide.addEventListener("pointerdown", function (ev) { ev.stopPropagation(); });
+    hide.addEventListener("click", hideIt);
+    hide.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") hideIt(ev); });
+    g.appendChild(hide);
+    var toggle = function () {
+      if (!h.n) return;
+      st.open[h.cat] = h.folded;                              // folded: open it; open: fold it
+      if (st.edit && st.data.is_admin) { st.folded[h.cat] = !h.folded; saveLayout(); }   // an admin: for everyone
+      unselect();
+      draw();
+    };
+    g.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (g._dragged) { g._dragged = false; return; }
+      toggle();
+    });
+    g.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggle(); } });
+    g.addEventListener("pointerdown", function (ev) { ev.stopPropagation(); });        // not a pan of the map
+    if (st.edit && st.data.is_admin) dragColumn(g, h);
+    return g;
+  }
   function curve(a, b, interaction) {
     var ax, ay = a.y + a.h / 2, bx, by = b.y + b.h / 2;
     if (b.x > a.x + a.w / 2) { ax = a.x + a.w; bx = b.x; }
@@ -426,7 +609,7 @@
     return { d: d, mx: (ax + 3 * c1x + 3 * c2x + bx) / 8, my: (ay + by) / 2 };
   }
   function noneView(n, C) {                                   // a category with no value yet (admins): where to add one
-    var g = svg("g", { class: "map-none", transform: "translate(" + n.x + "," + n.y + ")", tabindex: "0", role: "button",
+    var g = svg("g", { class: "map-none", transform: "translate(" + n.x + "," + n.y + ")", "data-cat": n.cat, tabindex: "0", role: "button",
                        "aria-label": catLabel(n.none, 2) + ": no value yet, add one in Categories" });
     g.appendChild(svg("rect", { width: n.w, height: n.h, rx: 8, fill: "none", stroke: C.axis, "stroke-width": "1.2",
                                 "stroke-dasharray": "5 4", "pointer-events": "all" }));     // the whole box takes the click
@@ -451,7 +634,7 @@
     var color = C.series[(catIdx < 0 ? 0 : catIdx) % 8];
     var isNew = !!st.fresh && (n.fold ? n.members.some(function (i) { return st.fresh.ids[i]; }) : !!st.fresh.ids[n.id]);
     var g = svg("g", { class: "map-node" + (n.fold ? " map-fold" : "") + (n.v && n.v.gone ? " map-gone" : "") + (isNew ? " map-new" : ""),
-                       transform: "translate(" + n.x + "," + n.y + ")", "data-id": String(n.id), tabindex: "0",
+                       transform: "translate(" + n.x + "," + n.y + ")", "data-id": String(n.id), "data-cat": n.cat, tabindex: "0",
                        role: "button", "aria-label": n.fold ? n.title[0] + ": open" : n.v.value });
     g.appendChild(svg("rect", { width: n.w, height: n.h, rx: 8, fill: C.panel, stroke: n.v && n.v.gone ? C.warn : C.line,
                                 "stroke-width": "1.2", "stroke-dasharray": n.v && n.v.gone ? "5 4" : null }));
@@ -468,9 +651,7 @@
         var t = svg("text", { x: 14, y: y + 2, fill: C.ink2, "font-family": C.font, "font-size": "12" });
         t.textContent = line; g.appendChild(t); y += LINE;
       });
-      var o = svg("text", { x: 14, y: n.h - 10, fill: C.accent, "font-family": C.font, "font-size": "12", "font-weight": "600" });
-      o.textContent = "Open: every one";
-      g.appendChild(o);
+      g.appendChild(svg("title", {}, [document.createTextNode("Open: every one (a click here, or on the category's name)")]));
     } else {
       if (n.about.length) y += 4;
       n.about.forEach(function (line) {
@@ -501,29 +682,144 @@
   function legend(C) {
     var box = $("map-legend");
     box.innerHTML = "";
+    /* the categories: each key shows or hides its category on this viewer's map (kept in the browser) */
     st.data.categories.forEach(function (c, i) {
-      box.appendChild(el("span", { class: "map-key" }, [el("i", { style: "background:" + C.series[i % 8] }),
-        document.createTextNode(catLabel(c.name, c.count) + " " + S.num(c.count))]));
+      var on = !isOff(c.name);
+      box.appendChild(el("button", { type: "button", class: "map-key map-cat" + (on ? "" : " off"), "aria-pressed": String(on),
+        title: on ? "Shown: click to hide this category" : "Hidden: click to show this category",
+        onclick: function () { showCat(c.name, !on); unselect(); draw(); } },
+        [el("i", { style: "background:" + C.series[i % 8] }),
+         document.createTextNode(catLabel(c.name, c.count) + " " + S.num(c.count))]));
     });
+    var hiddenCats = st.data.categories.filter(function (c) { return isOff(c.name); });
+    if (hiddenCats.length) box.appendChild(el("button", { type: "button", class: "chip", id: "map-all-cats",
+      text: "Show the " + (hiddenCats.length > 1 ? hiddenCats.length + " hidden categories" : "hidden category"),
+      onclick: function () { st.cats = []; saveCats(); syncPick(); draw(); fit(true); } }));
     box.appendChild(el("span", { class: "map-key" }, [el("i", { class: "line" }), document.createTextNode("is part of")]));
     if (st.data.links.length) box.appendChild(el("span", { class: "map-key" }, [el("i", { class: "arrow" }),
       document.createTextNode("interaction")]));
     if (st.data.values.some(function (v) { return v.gone; })) box.appendChild(el("span", { class: "map-key" }, [
       el("i", { class: "gone" }), document.createTextNode("its items are gone")]));
-    Object.keys(st.layout.folded).forEach(function (c) {
-      if (!st.focus && (st.layout.folded[c] || st.open[c])) {
-        box.appendChild(el("button", { type: "button", class: "chip", text: (st.layout.folded[c] ? "Open " : "Fold ") +
-          catLabel(c, 2).toLowerCase(), onclick: function () { st.open[c] = !!st.layout.folded[c]; draw(); } }));
-      }
-    });
-    if (st.focus) box.appendChild(el("button", { type: "button", class: "chip", text: "Show everything",
-      onclick: function () { $("map-focus").value = ""; st.focus = ""; draw(); fit(true); } }));
+    if (st.edit && st.data.is_admin) box.appendChild(el("button", { type: "button", class: "chip", id: "map-groups",
+      title: "Put categories in a group drawn around them (display only: nothing changes for the agent)",
+      text: st.groups.length ? "Groups (" + st.groups.length + ")…" : "Group categories…", onclick: groupsPanel }));
+    if (st.parts.length) box.appendChild(el("button", { type: "button", class: "chip", id: "map-all-parts",
+      text: "Show every part", title: "The map no longer narrowed to the parts chosen",
+      onclick: function () { st.parts = []; syncPick(); draw(); fit(true); } }));
     if (st.data.proposed) box.appendChild(el("button", { type: "button", class: "chip",
       title: "The map draws the approved values: a proposed one comes once approved",
       text: S.num(st.data.proposed) + " proposed value" + (st.data.proposed > 1 ? "s wait" : " waits") + " in To review",
       onclick: function () { D.show("review"); } }));
+    if (st.data.proposed_interactions) box.appendChild(el("button", { type: "button", class: "chip",
+      title: "Interactions your documents state, read by the LLM: each is drawn once approved",
+      text: S.num(st.data.proposed_interactions) + " proposed interaction" + (st.data.proposed_interactions > 1 ? "s wait" : " waits") + " in To review",
+      onclick: function () { D.show("review"); } }));
+    if ((st.data.missing || []).length) box.appendChild(el("button", { type: "button", class: "chip", id: "map-missing",
+      title: "What an investigation follows and does not find yet: parts not in the data, parts with no interaction, joins, usual values",
+      text: S.num(st.data.missing.length) + " point" + (st.data.missing.length > 1 ? "s" : "") + " to complete for investigations",
+      onclick: missing }));
     if (st.hidden.length && st.data.is_admin) box.appendChild(el("button", { type: "button", class: "chip",
       text: "Show the " + st.hidden.length + " hidden", onclick: function () { st.hidden = []; saveLayout(); draw(); } }));
+  }
+  /* A category's panel: what it is (an admin writes it; the agent and the router are given it with the parts a
+     question names), how many parts it has, the fields its values are read from. */
+  function categoryPanel(cat, note) {
+    unselect();
+    var c = st.data.categories.filter(function (k) { return k.name === cat; })[0];
+    if (!c) return;
+    var box = $("map-side");
+    box.innerHTML = "";
+    box.hidden = false;
+    box.appendChild(el("button", { type: "button", class: "close", "aria-label": "Close", text: "×", onclick: unselect }));
+    box.appendChild(el("div", { class: "muted", text: "Category" + (c.builtin ? " (built in)" : "") }));
+    box.appendChild(el("h3", { text: catLabel(c.name, 2) }));
+    box.appendChild(c.about ? el("p", { text: c.about }) : el("p", { class: "muted", text: "Nobody wrote what this category is yet." }));
+    box.appendChild(el("div", { class: "muted", text: S.num(c.count) + " part" + (c.count === 1 ? "" : "s") + " on the map" +
+      (c.fields ? " · its values are read from the fields " + c.fields : " · its values are added by hand or proposed by the LLM") }));
+    var g = groupOf(c.name);
+    if (g) box.appendChild(el("div", { class: "muted", text: "Drawn in the group “" + g.name + "”." }));
+    if (st.data.is_admin) {
+      var ta = el("textarea", { rows: "3", maxlength: "300", "aria-label": "What this category is",
+                                placeholder: "What this category is, in a sentence (a pool: a group of servers that share the same queue of slots)" });
+      ta.value = c.about || "";
+      var res = el("span", { class: "result" + (note ? " good" : ""), text: note || "" });
+      box.appendChild(el("div", { class: "map-edit" }, [el("strong", { text: "What it is (admins)" }), ta,
+        el("div", { class: "actions" }, [el("button", { type: "button", class: "btn small primary", text: "Save", onclick: function () {
+          S.dict("POST", "map", { describe_category: { name: c.name, about: ta.value } }).then(function (r) {
+            if (r.error) { res.textContent = r.error; res.className = "result bad"; return; }
+            if (D.saved) D.saved();
+            c.about = r.about || "";                           // at once; the reading below brings the same
+            draw();
+            categoryPanel(c.name, "saved: people, the agent and the router read it");
+            load();
+          });
+        } }), res])]));
+    }
+    box.appendChild(el("div", { class: "actions" }, [
+      el("button", { type: "button", class: "btn small", text: "Show this category only", onclick: function () {
+        st.cats = [c.name]; saveCats(); syncPick(); unselect(); draw(); fit(true); } })]));
+  }
+  /* Groups of categories (admins, in Edit): a frame drawn around the columns of the categories of a group, which
+     are put side by side. Display only: the agent, the categories and their values do not know them. */
+  function groupsPanel() {
+    unselect();
+    var box = $("map-side");
+    box.innerHTML = "";
+    box.hidden = false;
+    box.appendChild(el("button", { type: "button", class: "close", "aria-label": "Close", text: "×", onclick: unselect }));
+    box.appendChild(el("div", { class: "muted", text: "Display" }));
+    box.appendChild(el("h3", { text: "Groups of categories" }));
+    box.appendChild(el("p", { class: "muted", text: "A group is a frame around the columns of its categories, put side by side (servers, resources and network under “Infrastructure”). It only changes how the map looks." }));
+    var cats = st.data.categories.map(function (c) { return c.name; });
+    var form = function (g, gi) {
+      var name = el("input", { type: "text", maxlength: "40", placeholder: "Name of the group", "aria-label": "Name of the group" });
+      name.value = g ? g.name : "";
+      var boxes = cats.map(function (c) {
+        var cb = el("input", { type: "checkbox", value: c });
+        cb.checked = !!g && (g.categories || []).indexOf(c) >= 0;
+        var other = groupOf(c);
+        return el("label", { class: "map-group-cat" }, [cb, document.createTextNode(" " + catLabel(c, 2) +
+          (other && other !== g ? " (in “" + other.name + "”)" : ""))]);
+      });
+      var res = el("span", { class: "result" });
+      var save = el("button", { type: "button", class: "btn small primary", text: g ? "Save" : "Add the group", onclick: function () {
+        var chosen = boxes.map(function (l) { return l.firstChild; }).filter(function (cb) { return cb.checked; }).map(function (cb) { return cb.value; });
+        var label = name.value.trim();
+        if (!label || !chosen.length) { res.textContent = "a name and one category at least"; res.className = "result bad"; return; }
+        var next = st.groups.map(function (x, i) {                 // a category is in one group: taken from the others
+          return i === gi ? null : { name: x.name, categories: (x.categories || []).filter(function (c) { return chosen.indexOf(c) < 0; }) };
+        }).filter(function (x) { return x && x.categories.length; });
+        next.splice(g ? Math.min(gi, next.length) : next.length, 0, { name: label, categories: chosen });
+        st.groups = next;
+        saveLayout(); draw(); fit(true); groupsPanel();
+      } });
+      var acts = [save];
+      if (g) acts.push(el("button", { type: "button", class: "btn small", text: "Remove the group", onclick: function () {
+        st.groups = st.groups.filter(function (x, i) { return i !== gi; });
+        saveLayout(); draw(); fit(true); groupsPanel();
+      } }));
+      acts.push(res);
+      return el("fieldset", { class: "map-group-form" }, [el("legend", { text: g ? g.name : "A new group" }), name,
+        el("div", { class: "map-group-cats" }, boxes), el("div", { class: "actions" }, acts)]);
+    };
+    st.groups.forEach(function (g, gi) { box.appendChild(form(g, gi)); });
+    box.appendChild(form(null, -1));
+  }
+  /* what the agent would follow in an investigation and does not find yet (admins): the same list as
+     "superset supagent check-system" */
+  function missing() {
+    unselect();
+    var box = $("map-side");
+    box.innerHTML = "";
+    box.hidden = false;
+    box.appendChild(el("button", { type: "button", class: "close", "aria-label": "Close", text: "×", onclick: unselect }));
+    box.appendChild(el("div", { class: "muted", text: "For investigations" }));
+    box.appendChild(el("h3", { text: "To complete" }));
+    box.appendChild(el("p", { class: "muted", text: "An investigation follows the parts of this map, where each is in the data, how the tables join and which field holds a usual value. What it does not find yet:" }));
+    var ul = el("ul", { class: "map-links" });
+    st.data.missing.forEach(function (x) { ul.appendChild(el("li", {}, [el("span", { text: x })])); });
+    box.appendChild(ul);
+    box.appendChild(el("p", { class: "muted small-note", text: "The same list, and what the agent is given for a question: superset supagent check-system --question \"...\"" }));
   }
 
   // ------------------------------------------------------------------ the side panel: a part, what it does, its edits
@@ -581,8 +877,7 @@
         return el("button", { type: "button", class: "linkish", text: x.value + (i < Math.min(vals.length, 40) - 1 ? "," : ""),
           onclick: function () { focusOn(x.id); } }); }).concat(vals.length > 40 ? [document.createTextNode(" … (" + vals.length + ")")] : []))]);
     };
-    box.appendChild(list("Part of:", parts));
-    box.appendChild(list("Made of:", kids));
+    [list("Part of:", parts), list("Made of:", kids)].forEach(function (x) { if (x) box.appendChild(x); });   // (none: no line)
     var kinds = Object.keys(v.kinds || {}).map(function (k) { return S.num(v.kinds[k]) + " " + k; });
     box.appendChild(el("div", { class: "muted", text: v.gone ? "Its items are gone (the data or texts it was about no longer exist)." :
       v.items ? S.num(v.items) + " item" + (v.items > 1 ? "s" : "") + " about it: " + kinds.join(", ") : "No item about it yet." }));
@@ -593,7 +888,9 @@
       mine.forEach(function (x) {
         var other = st.byId[x.a === v.id ? x.b : x.a];
         var text = x.a === v.id ? x.label + " " + (other ? other.value : "?") : (other ? other.value : "?") + " " + x.label + " it";
-        ul.appendChild(el("li", {}, [el("span", { text: text + (x.note ? " (" + x.note + ")" : "") }),
+        ul.appendChild(el("li", {}, [el("button", { type: "button", class: "linkish", text: text,
+                                                    onclick: function () { linkPanel(x); } }),
+          x.note ? el("span", { class: "muted", text: ": " + x.note }) : null,
           admin ? S.sureButton("×", function () {
             S.dict("POST", "map", { remove_interaction: x.id }).then(function (r) { if (!r.error) load(); });
           }, { cls: "linkish", aria: "Remove this interaction", ask: "Remove “" + text + "”?", yes: "Remove" }) : null]));
@@ -632,12 +929,66 @@
     }
     if (!quiet) box.scrollTop = 0;
   }
+  /* An interaction clicked on the map: what it is (its short explanation), what to do when following it (the long
+     one, folded), where it was said; admins correct both, or remove it. */
+  function linkPanel(x) {
+    var a = st.byId[x.a], b = st.byId[x.b], admin = st.data.is_admin;
+    if (!a || !b) return;
+    st.sel = null;
+    st.svg.querySelectorAll(".map-node, .map-edge, .map-link").forEach(function (n) { n.classList.remove("dim", "on"); });
+    st.svg.querySelectorAll(".map-node, .map-edge, .map-link").forEach(function (n) {
+      var mine = n.classList.contains("map-link") ? n.dataset.link === String(x.id) :
+        n.classList.contains("map-node") ? (n.dataset.id === String(x.a) || n.dataset.id === String(x.b)) : false;
+      n.classList.toggle("on", mine);
+      n.classList.toggle("dim", !mine);
+    });
+    var box = $("map-side");
+    box.innerHTML = "";
+    box.hidden = false;
+    box.appendChild(el("button", { type: "button", class: "close", "aria-label": "Close", text: "×", onclick: unselect }));
+    box.appendChild(el("div", { class: "muted", text: "Interaction" }));
+    box.appendChild(el("h3", {}, [el("button", { type: "button", class: "linkish", text: a.value, onclick: function () { select(a.id); } }),
+      document.createTextNode(" " + x.label + " "),
+      el("button", { type: "button", class: "linkish", text: b.value, onclick: function () { select(b.id); } })]));
+    box.appendChild(x.note ? el("p", { class: "map-link-short", text: x.note }) :
+      el("p", { class: "muted", text: "Not explained yet (the next classification writes it, or an admin below)." }));
+    if (x.detail) box.appendChild(el("details", { class: "map-link-long" }, [el("summary", { text: "What to do when following it" }),
+      el("p", { text: x.detail })]));
+    var who = x.explained_by === "llm" ? "Explained by the AI" : x.explained_by ? "Explained by " + x.explained_by : "";
+    var from = x.source === "admin" ? "drawn by an admin" : x.source === "llm" ? "read in a text, approved" : x.source ? "from " + x.source : "";
+    if (who || from) box.appendChild(el("div", { class: "muted small-note", text: [who, from].filter(Boolean).join(" · ") }));
+    if (x.evidence) box.appendChild(el("div", { class: "muted small-note", text: "Said in: " + x.evidence }));
+    if (!admin) return;
+    var shortIn = el("input", { type: "text", maxlength: "500", value: x.note || "", "aria-label": "Short explanation",
+                                placeholder: "In a few words: what it waits for, reads, sends, uses" });
+    var longIn = el("textarea", { rows: "4", maxlength: "2000", "aria-label": "Long explanation",
+                                  placeholder: "What to do when following it: what to check on the other part, what a problem there does here" });
+    longIn.value = x.detail || "";
+    var res = el("span", { class: "result" });
+    box.appendChild(el("details", { class: "map-edit", open: st.edit ? "open" : null }, [el("summary", { text: "Edit (admins)" }),
+      shortIn, longIn,
+      el("div", { class: "actions" }, [
+        el("button", { type: "button", class: "btn small primary", text: "Save", onclick: function () {
+          S.dict("POST", "map", { interaction: { id: x.id, a: x.a, b: x.b, kind: x.kind, note: shortIn.value, detail: longIn.value } }).then(function (r) {
+            res.textContent = r.error || "saved"; res.className = "result " + (r.error ? "bad" : "good");
+            if (!r.error) { if (D.saved) D.saved(); load(); }
+          });
+        } }),
+        S.sureButton("Remove", function () {
+          S.dict("POST", "map", { remove_interaction: x.id }).then(function (r) { if (!r.error) { unselect(); load(); } });
+        }, { cls: "btn small", aria: "Remove this interaction", ask: "Remove “" + a.value + " " + x.label + " " + b.value + "”?", yes: "Remove" }),
+        res])]));
+  }
   function focusOn(id) {
-    $("map-focus").value = String(id);
-    st.focus = String(id);
+    st.parts = [+id];
+    syncPick();
     st.sel = id;
     draw();
     fit(true);
+  }
+  function around() {                                         // the parts the map is narrowed to, for a title
+    var names = st.parts.filter(function (i) { return st.byId[i]; }).map(function (i) { return st.byId[i].value; });
+    return names.length ? ": around " + names.slice(0, 3).join(", ") + (names.length > 3 ? " and " + (names.length - 3) + " more" : "") : "";
   }
   function connectTo(id) {
     var a = st.byId[st.from], b = st.byId[id];
@@ -649,15 +1000,19 @@
     box.innerHTML = "";
     var kind = el("select", { "aria-label": "Kind of interaction" }, Object.keys(st.data.interactions).map(function (k) {
       return el("option", { value: k, text: st.data.interactions[k] }); }));
-    var note = el("input", { type: "text", maxlength: "500", placeholder: "In a few words (optional): what, how often…", "aria-label": "Note" });
+    var note = el("input", { type: "text", maxlength: "500", placeholder: "In a few words: what it waits for, reads, sends, uses",
+                             "aria-label": "Short explanation" });
+    var detail = el("textarea", { rows: "3", maxlength: "2000", "aria-label": "Long explanation",
+                                  placeholder: "What to do when following it (optional): what to check on the other part, what a problem there does here" });
     var res = el("span", { class: "result" });
     box.appendChild(el("button", { type: "button", class: "close", "aria-label": "Close", text: "×", onclick: unselect }));
     box.appendChild(el("h3", { text: "A new interaction" }));
     box.appendChild(el("p", {}, [el("strong", { text: a.value }), document.createTextNode(" "), kind,
       document.createTextNode(" "), el("strong", { text: b.value })]));
     box.appendChild(note);
+    box.appendChild(detail);
     box.appendChild(el("div", { class: "actions" }, [el("button", { type: "button", class: "btn small primary", text: "Save", onclick: function () {
-      S.dict("POST", "map", { interaction: { a: a.id, b: b.id, kind: kind.value, note: note.value } }).then(function (r) {
+      S.dict("POST", "map", { interaction: { a: a.id, b: b.id, kind: kind.value, note: note.value, detail: detail.value } }).then(function (r) {
         if (r.error) { res.textContent = r.error; res.className = "result bad"; return; }
         if (D.saved) D.saved();
         st.sel = a.id;
@@ -674,10 +1029,15 @@
   function bbox() {
     var ns = st.layout ? Object.keys(st.layout.nodes).map(function (k) { return st.layout.nodes[k]; }).filter(function (n) { return !n.alias; }) : [];
     if (!ns.length) return { x: 0, y: 0, w: 400, h: 300 };
-    var x0 = Math.min.apply(null, ns.map(function (n) { return n.x; })), y0 = 0;
-    var x1 = Math.max.apply(null, ns.map(function (n) { return n.x + n.w; })) + 90;
-    var y1 = Math.max.apply(null, ns.map(function (n) { return n.y + n.h; }));
-    return { x: x0 - PAD, y: y0, w: x1 - x0 + 2 * PAD, h: y1 + PAD };
+    // the boxes, the names of the categories (a category an admin moved up or left), the frames of the groups
+    var all = ns.map(function (n) { return { x: n.x, y: n.y, w: n.w, h: n.h }; })
+      .concat(st.layout.heads.map(function (h) { return { x: h.x, y: h.y, w: BOX_W, h: HEAD_H }; }))
+      .concat(st.layout.frames || []);
+    var x0 = Math.min.apply(null, all.map(function (n) { return n.x; }));
+    var top = Math.min(0, Math.min.apply(null, all.map(function (n) { return n.y; })) - 8);
+    var x1 = Math.max.apply(null, all.map(function (n) { return n.x + n.w; })) + 90;
+    var y1 = Math.max.apply(null, all.map(function (n) { return n.y + n.h; }));
+    return { x: x0 - PAD, y: top, w: x1 - x0 + 2 * PAD, h: y1 - top + PAD };
   }
   /* Fit: the whole map in the window; the first view: as wide as the window at most (readable), from the top */
   function fit(readable) {
@@ -701,7 +1061,7 @@
       apply();
     }, { passive: false });
     c.addEventListener("pointerdown", function (ev) {
-      if (ev.target.closest && ev.target.closest(".map-node, .map-none")) return;      // a box: its own click
+      if (ev.target.closest && ev.target.closest(".map-node, .map-none, .map-head")) return;   // a box, a category's name: its own click
       drag = { x: ev.clientX, y: ev.clientY, vx: st.view.x, vy: st.view.y, moved: false };
       c.setPointerCapture(ev.pointerId);
     });
@@ -747,7 +1107,8 @@
     });
     g.addEventListener("pointerup", function () {
       if (start && g._dragged) {
-        st.positions[n.id] = [n.x, n.y];
+        // kept as on the map with every category shown (a viewer who shows fewer sees the columns closer)
+        st.positions[n.id] = [n.x - ((st.layout.shift || {})[n.cat] || 0), n.y];
         saveLayout();
         var keep = st.sel;
         draw();
@@ -756,11 +1117,62 @@
       start = null;
     });
   }
+  /* In Edit, the name of a category is dragged: its boxes follow (the ones an admin placed too), the lines are
+     drawn again at the end. A click without a move still folds or opens the category. */
+  function dragColumn(g, h) {
+    var start = null, moving = [];
+    g.addEventListener("pointerdown", function (ev) {
+      if (ev.target.closest && ev.target.closest(".map-hide, .map-info")) return;
+      start = { x: ev.clientX, y: ev.clientY, dx: 0, dy: 0 };
+      moving = Array.prototype.filter.call(st.svg.querySelectorAll(".map-head, .map-node, .map-none"), function (x) {
+        return x.getAttribute("data-cat") === h.cat; }).map(function (x) {
+        var m = /translate\(([-\d.]+),([-\d.]+)\)/.exec(x.getAttribute("transform") || "");
+        return { el: x, x: m ? +m[1] : 0, y: m ? +m[2] : 0 };
+      });
+      g.setPointerCapture(ev.pointerId);
+    });
+    g.addEventListener("pointermove", function (ev) {
+      if (!start) return;
+      var dx = Math.round((ev.clientX - start.x) / st.view.k), dy = Math.round((ev.clientY - start.y) / st.view.k);
+      if (Math.abs(dx) + Math.abs(dy) < 3 && !g._dragged) return;
+      g._dragged = true;
+      start.dx = dx; start.dy = dy;
+      moving.forEach(function (m) { m.el.setAttribute("transform", "translate(" + (m.x + dx) + "," + (m.y + dy) + ")"); });
+    });
+    g.addEventListener("pointerup", function () {
+      if (start && g._dragged) {
+        var off = st.cols[h.cat] || [0, 0];
+        st.cols[h.cat] = [Math.round((+off[0] || 0) + start.dx), Math.round((+off[1] || 0) + start.dy)];
+        st.data.values.forEach(function (v) {                  // the boxes placed by hand keep their place in it
+          var p = st.positions[v.id];
+          if (v.facet === h.cat && p) st.positions[v.id] = [p[0] + start.dx, p[1] + start.dy];
+        });
+        saveLayout();
+        draw();
+      }
+      start = null;
+    });
+  }
   function saveLayout() {
     clearTimeout(st.saveTimer);
     st.saveTimer = setTimeout(function () {
-      S.dict("POST", "map", { layout: { positions: st.positions, hidden: st.hidden, folded: st.folded } });
+      S.dict("POST", "map", { layout: { positions: st.positions, hidden: st.hidden, folded: st.folded,
+                                         columns: st.cols, groups: st.groups } });
     }, 600);
+  }
+  /* The map on the whole screen: the browser's full screen when it allows it, else the whole window. */
+  function setFull(on) {
+    var box = $("sub-map"), btn = $("map-full");
+    st.full = on;
+    box.classList.toggle("map-full", on);
+    btn.classList.toggle("on", on);
+    btn.setAttribute("aria-pressed", String(on));
+    btn.textContent = on ? "Exit full screen" : "Full screen";
+    var p = null;
+    if (on && box.requestFullscreen && !document.fullscreenElement) p = box.requestFullscreen();
+    else if (!on && document.fullscreenElement && document.exitFullscreen) p = document.exitFullscreen();
+    if (p && p.catch) p.catch(function () { /* refused: the map still takes the whole window */ });
+    setTimeout(function () { if (st.svg) fit(true); }, 80);
   }
 
   // ------------------------------------------------------------------ exports: SVG, PNG, PDF
@@ -769,7 +1181,8 @@
     var copy = st.svg.cloneNode(true);
     copy.querySelectorAll(".dim").forEach(function (x) { x.classList.remove("dim"); });
     copy.querySelectorAll(".map-new, .map-edge-new").forEach(function (x) { x.classList.remove("map-new", "map-edge-new"); });
-    copy.querySelectorAll(".map-none").forEach(function (x) { x.remove(); });     // "add one": of the page, not of a file
+    copy.querySelectorAll(".map-none, .map-hide, .map-info, .map-head-hit").forEach(function (x) { x.remove(); });   // the page's buttons: not of a file
+    copy.querySelectorAll(".map-head").forEach(function (g) { g.removeAttribute("tabindex"); g.removeAttribute("role"); g.removeAttribute("aria-expanded"); });
     copy.setAttribute("xmlns", NS);
     copy.setAttribute("width", String(Math.ceil(b.w)));
     copy.setAttribute("height", String(Math.ceil(b.h + 40)));
@@ -778,7 +1191,7 @@
     var bg = svg("rect", { x: b.x, y: b.y - 40, width: b.w, height: b.h + 40, fill: C.panel });
     copy.insertBefore(bg, copy.firstChild.nextSibling);
     var t = svg("text", { x: b.x + PAD, y: b.y - 12, fill: C.ink, "font-family": C.font, "font-size": "16", "font-weight": "700" });
-    t.textContent = title + (st.focus && st.byId[st.focus] ? ": around " + st.byId[st.focus].value : "");
+    t.textContent = title + around();
     copy.appendChild(t);
     copy.querySelectorAll(".map-node").forEach(function (g) { g.removeAttribute("tabindex"); g.removeAttribute("role"); });
     return { text: new XMLSerializer().serializeToString(copy), w: b.w, h: b.h + 40 };
@@ -829,12 +1242,11 @@
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-CSRFToken": csrf },
         body: JSON.stringify({ png: dataUrl, scale: st.pngScale || 2,
-                               title: "System map" + (st.focus && st.byId[st.focus] ? ": around " + st.byId[st.focus].value : "") })
+                               title: "System map" + around() })
       }).then(function (r) { if (!r.ok) throw new Error("PDF: HTTP " + r.status); return r.blob(); });
     }).then(function (blob) { download(blob, "system-map.pdf"); }));
   });
   $("map-fit").addEventListener("click", function () { fit(false); });
-  $("map-focus").addEventListener("change", function () { st.focus = this.value; unselect(); draw(); fit(true); });
   $("map-edit").addEventListener("click", function () {
     st.edit = !st.edit;
     this.classList.toggle("on", st.edit);
@@ -842,7 +1254,16 @@
     $("map-canvas").classList.toggle("editing", st.edit);
     draw();
   });
-  document.addEventListener("keydown", function (ev) { if (ev.key === "Escape" && st.from) { st.from = null; $("map-canvas").classList.remove("connecting"); } });
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Escape") return;
+    if (st.from) { st.from = null; $("map-canvas").classList.remove("connecting"); return; }
+    if (st.full && !document.fullscreenElement) setFull(false);       // the whole window (no real full screen): back
+  });
+  $("map-full").addEventListener("click", function () { setFull(!st.full); });
+  document.addEventListener("fullscreenchange", function () {
+    if (!document.fullscreenElement && st.full) setFull(false);       // Escape, or the browser's own way out
+    else if (st.svg) setTimeout(function () { fit(true); }, 80);
+  });
   if (!S.isAdmin) $("map-edit").hidden = true;
   wire();
   D.register("map", load);
@@ -859,5 +1280,6 @@
   document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible") { st.inputAt = Date.now(); auto(); } });
   window.addEventListener("focus", function () { st.inputAt = Date.now(); auto(); });
   window.supagentMap = { load: load, data: function () { return st.data; }, png: png, standalone: standalone,
+                         layout: function () { return st.layout; }, view: function () { return st.view; },
                          idleFor: function (ms) { st.inputAt = Date.now() - ms; } };       // (the tests: nobody there)
 })();

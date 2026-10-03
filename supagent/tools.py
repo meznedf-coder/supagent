@@ -23,9 +23,12 @@ import datetime as dt
 import decimal
 import html
 import json
+import logging
 import math
 import os
+import queue
 import re
+import statistics
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Literal
@@ -35,6 +38,7 @@ from pydantic import BaseModel, Field
 from supagent.registry import Registry  # noqa: E402
 
 mcp = Registry()
+log = logging.getLogger(__name__)
 XLSX_SHEET_ROWS = 1_048_575
 PROFILE_TTL = 24 * 3600
 EXPORT_BASE_URL = os.environ.get("EXPORT_BASE_URL", "").rstrip("/")
@@ -60,6 +64,10 @@ def _export_max_rows() -> int:
 
 class ToolError(Exception):
     pass
+
+
+class NoEarlierDay(ToolError):
+    """A comparison whose scope has rows in the window asked and in no earlier one."""
 
 
 # --------------------------------------------------------------------------- #
@@ -1480,6 +1488,47 @@ def _metrics_database(ref: str | int | None) -> Any:
     return database
 
 
+def _now_ms(conn: Any) -> int:
+    """Now for the tools' times: the agent's now when an admin pinned it (agent.now, a copy of data that ends
+    in the past), else the clock."""
+    fixed = str(_setting("agent.now", "") or "").strip()
+    if fixed:
+        try:
+            return conn.zone.utc_ms(dt.datetime.fromisoformat(fixed))
+        except Exception:  # pylint: disable=broad-except
+            pass
+    return int(time.time() * 1000)
+
+
+def _local_now(conn: Any) -> dt.datetime:
+    """Now as a user writes a time (local, no zone): the agent's now when an admin pinned it, else the clock in
+    the connection's time zone (osagg, promagg), else the server's."""
+    fixed = str(_setting("agent.now", "") or "").strip()
+    if fixed:
+        try:
+            return dt.datetime.fromisoformat(fixed).replace(tzinfo=None)
+        except ValueError:
+            pass
+    tz = getattr(conn, "tz", None) or getattr(getattr(conn, "zone", None), "tz", None)
+    try:
+        return dt.datetime.now(tz).replace(tzinfo=None) if tz is not None else dt.datetime.now()
+    except Exception:  # pylint: disable=broad-except
+        return dt.datetime.now()
+
+
+RAW_COUNTER = re.compile(r"\b([a-zA-Z_:][a-zA-Z0-9_:]*(?:_total|_count|_sum|_bucket))\b")
+OVER_TIME = re.compile(r"\b(rate|irate|increase|delta|idelta|resets|changes|histogram_quantile)\s*\(")
+
+
+def raw_counter(expr: str) -> str | None:
+    """A counter the expression reads as it is (no rate, increase...): its value only grows, so a level, an
+    average or a comparison of it says nothing. Its name, else None."""
+    names = RAW_COUNTER.findall(expr or "")
+    if not names or OVER_TIME.search(expr or ""):
+        return None
+    return names[0]
+
+
 def _time_arg(conn: Any, value: str | None, default_ms: int) -> int:
     if value in (None, ""):
         return default_ms
@@ -1488,7 +1537,7 @@ def _time_arg(conn: Any, value: str | None, default_ms: int) -> int:
     if m:
         from promagg.timegrid import parse_duration
 
-        return int(time.time() * 1000) - (parse_duration(m.group(1)) if m.group(1) else 0)
+        return _now_ms(conn) - (parse_duration(m.group(1)) if m.group(1) else 0)
     d = dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
     if d.tzinfo is not None:
         return int(d.timestamp() * 1000)
@@ -1513,6 +1562,85 @@ def _series_summary(conn: Any, series: list, max_points: int) -> list[dict]:
     return out
 
 
+USUAL_DAYS = 7                   # a level is given with the same window of this many previous days
+USUAL_SERIES = 12                # ... when the query returns at most this many series
+USUAL_RANGE_DAYS = 2             # ... over at most this long
+USUAL_SECONDS = 20               # ... while there is time
+USUAL_HIGH, USUAL_LOW = 1.3, 0.77
+
+
+def _levels_usual(conn: Any, expr: str, t0: int, t1: int, step_ms: int, items: list[dict]) -> str | None:
+    """Each series of a query gets what it was over the same window of the previous days (the median of their
+    averages and of their highest values): a pool at 40 of 40 slots, a queue of 300 or a CPU at 90% is a finding
+    only when it is not what it is every day at that hour. A line that says so, or None (nothing to compare)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    day = 86_400_000
+    step = max(step_ms, (t1 - t0) // 60 // 15_000 * 15_000, 15_000) if t1 > t0 else 0
+
+    def key(labels: dict) -> tuple:
+        return tuple(sorted((str(k), str(v)) for k, v in (labels or {}).items() if k != "__name__"))
+
+    def one(k: int) -> dict[tuple, tuple[float, float]] | None:
+        try:
+            got = conn.client.query_range(expr, t0 - k * day, t1 - k * day, step) if step else \
+                conn.client.query(expr, t1 - k * day)
+        except Exception:  # pylint: disable=broad-except   (that day is not counted)
+            return None
+        out = {}
+        for s in got:
+            vals = [v for _t, v in s.points if v is not None and not math.isnan(v)]
+            if vals:
+                out[key(s.labels)] = (sum(vals) / len(vals), max(vals))
+        return out or None
+
+    started = time.time()
+    days: list[dict[tuple, tuple[float, float]]] = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for got in pool.map(one, range(1, USUAL_DAYS + 1)):
+            if got is not None:
+                days.append(got)
+            if time.time() - started > USUAL_SECONDS:
+                break
+    if len(days) < 3:
+        return None
+    off, same = [], 0
+    for item in items:
+        if item.get("avg") is None:
+            continue
+        had = [d[key(item["labels"])] for d in days if key(item["labels"]) in d]
+        if len(had) < 3:
+            item["against_usual"] = "no usual: not there on the previous days"
+            continue
+        usual_avg = _median([a for a, _m in had])
+        item["usual_avg"], item["usual_max"] = round(usual_avg, 6), round(_median([m for _a, m in had]), 6)
+        if abs(usual_avg) < 1e-12:
+            ratio = None if abs(item["avg"]) < 1e-12 else math.inf
+        else:
+            ratio = item["avg"] / usual_avg
+        if ratio is None or USUAL_LOW <= ratio <= USUAL_HIGH:
+            item["against_usual"] = "as on the previous days"
+            same += 1
+        else:
+            item["against_usual"] = ("nothing usually" if ratio == math.inf else f"x{ratio:.2f} its usual") + \
+                (": above usual" if ratio > 1 else ": below usual")
+            off.append(", ".join(f"{k}={v}" for k, v in item["labels"].items()) or "the series")
+    compared = same + len(off)
+    if not compared:
+        return None
+    what = f"the same window of the {len(days)} previous days (the median of their averages: usual_avg, usual_max)"
+    if not off:
+        return (f"every series is as on {what}: these levels are their usual, not a change" if compared > 1 else
+                f"the series is as on {what}: this level is its usual, not a change")
+    return f"{len(off)} of {compared} series differ from {what}: {_some(off, 6)}; the others are as usual"
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    return ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+
+
 @mcp.tool
 def promql_query(expr: str, start: str | None = None, end: str | None = None, step: str | None = None,
                  database: str | int | None = None, max_series: int = 50) -> dict:
@@ -1520,7 +1648,9 @@ def promql_query(expr: str, start: str | None = None, end: str | None = None, st
     min / max / avg / last and up to 60 points). `start` / `end`: local times like
     "2026-09-24 02:00" or "now-6h" (end alone or start == end: one instant). `step` like "5m"
     (default: about 200 points). Use for questions SQL cannot express (ratios of two metrics,
-    offsets, label_replace...); the SQL tables of the same database cover the usual cases."""
+    offsets, label_replace...); the SQL tables of the same database cover the usual cases.
+    A query of a few series over at most two days also says what each was over the same window of the
+    previous days (usual_avg, usual_max, against_usual): a level is a finding only when it is not its usual."""
     try:
         with _as_user():
             db_obj = _metrics_database(database)
@@ -1533,7 +1663,7 @@ def promql_query(expr: str, start: str | None = None, end: str | None = None, st
 
                 if len(expr) > 4000:
                     raise ToolError("expression too long (4000 characters max)")
-                now = int(time.time() * 1000)
+                now = _now_ms(conn)
                 t1 = _time_arg(conn, end, now)
                 t0 = _time_arg(conn, start, t1)
                 if t1 < t0:
@@ -1564,12 +1694,19 @@ def promql_query(expr: str, start: str | None = None, end: str | None = None, st
 
                         hint = why_empty_promql(db_obj, expr) or \
                             "no series in this time range (check the dates: describe_data gives the data range)"
+                items = _series_summary(conn, series[:max(1, min(max_series, 200))], 60)
+                usual = None
+                if 0 < total <= USUAL_SERIES and (t1 - t0) <= USUAL_RANGE_DAYS * 86_400_000 and not raw_counter(expr):
+                    try:
+                        usual = _levels_usual(conn, expr, t0, t1, step_ms, items)
+                    except Exception:  # pylint: disable=broad-except   (the query's own answer stands)
+                        log.debug("supagent: the usual of %s not read", expr[:120], exc_info=True)
                 return {"expr": expr, "database": db_obj.database_name, "database_id": db_obj.id,
                         **({"hint": hint} if hint else {}),
                         "start": f"{conn.zone.local(t0):%Y-%m-%d %H:%M}", "end": f"{conn.zone.local(t1):%Y-%m-%d %H:%M}",
                         "step": duration(step_ms) if step_ms else "instant", "series_count": total,
-                        "series": _series_summary(conn, series[:max(1, min(max_series, 200))], 60),
-                        "truncated": total > max_series}
+                        **({"against_usual": usual} if usual else {}),
+                        "series": items, "truncated": total > max_series}
             finally:
                 conn.close()
     except ToolError as ex:
@@ -1625,7 +1762,9 @@ def check_health(start: str, end: str, entities: list[str] | None = None, checks
                  database: str | int | None = None) -> dict:
     """Evaluate the health checks of the data dictionary (CPU saturation, memory pressure, disk
     full, OOM kills, servers down, queue backlog, HTTP errors, latency, licences...) over a time
-    window and list every breach: check, server / application, from, to, minutes, worst value.
+    window and list every breach: check, server / application, from, to, minutes, worst value, and
+    whether the same breach also happened in this window on the previous days (earlier_days;
+    usual: true = on most of them: it does not single out this window). The new ones come first.
     `start` / `end`: local times ("2026-09-24 02:00"); `entities`: only these servers,
     applications or pools (label values, e.g. ["srv-amer-002"]); `checks`: only these checks."""
     try:
@@ -1683,7 +1822,12 @@ def check_health(start: str, end: str, entities: list[str] | None = None, checks
                         found.append({"check": name, "description": c.get("description", ""),
                                       "threshold": f"{op} {thr:g}{c.get('unit', '')}", **b})
                 found.sort(key=lambda b: (b["from"], b["check"]))
+                usual = _breaches_usual(conn, defs, found, t0, t1, step) if found else 0
+                found.sort(key=lambda b: bool(b.get("usual")))       # the new ones first (stable: by time within)
                 note = "no breach" if not found else ""
+                if usual:
+                    note = (f"{usual} of the {len(found)} breach(es) also happen in this window on most of the "
+                            f"previous days (usual: true): they do not single out this window")
                 if not matched:                       # "no breach" would be wrong: nothing was looked at
                     note = (f"entities {sorted(wanted)} match no label value of the checked series (they are not "
                             f"server, application or pool names), so nothing was checked"
@@ -1700,6 +1844,63 @@ def check_health(start: str, end: str, entities: list[str] | None = None, checks
         return {"error": str(ex)}
     except Exception as ex:  # pylint: disable=broad-except
         return {"error": f"{type(ex).__name__}: {str(ex)[:1500]}"}
+
+
+HEALTH_DAYS = 7                  # earlier days a breach is looked for on (the same window; a whole week, so
+                                 # that what happens every working day counts as usual on a Monday too)
+HEALTH_USUAL_CHECKS = 8          # checks with breaches that are compared that way
+HEALTH_USUAL_SHARE = 0.6         # breached on this share of the earlier days (3 at least): usual
+HEALTH_USUAL_SECONDS = 30.0      # spent on it at most (a check over thousands of series is slow): then as before
+
+
+def _breaches_usual(conn: Any, defs: dict[str, Any], found: list[dict], t0: int, t1: int, step: int) -> int:
+    """Each breach gets `earlier_days` (on how many of the previous days the same series breached the same check
+    in the same window) and `usual` when that is most of them: an alert that fires every night is not what
+    changed today. Only the checks that breached are run again; a day with no data does not count. The number
+    of usual breaches."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from promagg.timegrid import parse_duration
+
+    names = list(dict.fromkeys(b["check"] for b in found))[:HEALTH_USUAL_CHECKS]
+    period = max(1, math.ceil((t1 - t0) / 86_400_000)) * 86_400_000
+
+    def key(labels: dict) -> tuple:
+        return tuple(sorted((str(k), str(v)) for k, v in (labels or {}).items()))
+
+    def one(arg: tuple[str, int]) -> tuple[str, int, set | None]:
+        name, k = arg
+        c = defs[name]
+        try:
+            series = conn.client.query_range(_per_tenant(c["promql"]), t0 - k * period + step, t1 - k * period, step)
+        except Exception:  # pylint: disable=broad-except   (that day is not counted)
+            return name, k, None
+        if not series:
+            return name, k, None
+        op = "above" if "above" in c else "below"
+        min_ms = parse_duration(str(c.get("for", "0s"))) if c.get("for") else 0
+        return name, k, {key(b["labels"]) for b in _breaches(conn, series, op, float(c.get(op)), min_ms, step)}
+
+    started = time.time()
+    seen: dict[str, list[set]] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for name in names:                           # a check at a time, while there is time
+            if time.time() - started > HEALTH_USUAL_SECONDS:
+                break
+            for _n, _k, keys in pool.map(one, [(name, k) for k in range(1, HEALTH_DAYS + 1)]):
+                if keys is not None:
+                    seen.setdefault(name, []).append(keys)
+    usual = 0
+    for b in found:
+        had = seen.get(b["check"])
+        if not had:
+            continue
+        n = sum(1 for keys in had if key(b["labels"]) in keys)
+        b["earlier_days"] = f"{n} of the {len(had)} previous days"
+        if len(had) >= 3 and n >= HEALTH_USUAL_SHARE * len(had):
+            b["usual"] = True
+            usual += 1
+    return usual
 
 
 USUAL_MIN_WEEKS = 3              # below this many earlier weeks with data: no verdict
@@ -1727,16 +1928,24 @@ def _usual(now: float | None, before: list[float]) -> dict[str, Any]:
         verdict = "high" if dev > 0 else "low"
     out.update(median=round(med, 6), deviations=round(dev, 1), change_pct=None if math.isinf(change) else
                round(100 * (now - med) / abs(med), 1) if med else None, verdict=verdict)
+    if verdict == "normal" and change >= 0.5 and not math.isinf(change):
+        # far from the median, yet no more than the earlier weeks differ from each other: said, not hidden
+        out["note"] = (f"{out['change_pct']:+g}% against the median, but the earlier weeks vary as much "
+                       f"({min(before):g} to {max(before):g}): not unusual for this series")
     return out
 
 
 @mcp.tool
-def compare_to_usual(promql: str, start: str, end: str, weeks: int = 4, database: str | int | None = None) -> dict:
+def compare_to_usual(promql: str, start: str, end: str, weeks: int = 4, database: str | int | None = None,
+                     against: list[str] | None = None) -> dict:
     """Is a metric unusual for this time? The average of a PromQL expression over start-end
     compared with the same window of each of the previous `weeks` weeks (median and median
     absolute deviation, per series): verdict normal, high, low (or unknown without 3 earlier
     weeks), with the numbers. `start` / `end`: local times ("2026-09-24 02:00"), at most 7 days
-    apart. For "is it unusual / abnormal / higher than usual" questions."""
+    apart. For "is it unusual / abnormal / higher than usual" questions.
+    against: reference days to give each series on too (its average over the same window then):
+    ["yesterday", "1 week ago", "3 weeks ago", "2 months ago", "2026-06-15"]; the team's own reference
+    days when none is given."""
     try:
         with _as_user():
             db_obj = _metrics_database(database)
@@ -1747,6 +1956,11 @@ def compare_to_usual(promql: str, start: str, end: str, weeks: int = 4, database
                 meta.session.commit()        # no connection of Superset's own pool is held while the queries run
                 if len(promql) > 4000:
                     raise ToolError("expression too long (4000 characters max)")
+                counter = raw_counter(promql)
+                if counter:                           # its value only grows: every week looks "normal" or not by chance
+                    raise ToolError(f"{counter} is a counter (its value only grows since the process started): compare "
+                                    f"its rate or its increase, e.g. sum(rate({counter}[5m])) or "
+                                    f"sum(increase({counter}[1h])), with the same labels")
                 t0, t1 = _time_arg(conn, start, 0), _time_arg(conn, end, 0)
                 if t1 <= t0:
                     raise ToolError("end must be after start")
@@ -1779,16 +1993,1640 @@ def compare_to_usual(promql: str, start: str, end: str, weeks: int = 4, database
                 rank = {"high": 0, "low": 0, "normal": 1, "unknown": 2}
                 rows.sort(key=lambda r: (rank[r["verdict"]], -abs(r.get("deviations") or 0)))
                 unusual = sum(1 for r in rows if r["verdict"] in ("high", "low"))
-                return {"database": db_obj.database_name, "from": start, "to": end, "weeks": weeks,
-                        "series_count": len(rows), "unusual": unusual, "series": rows[:30],
-                        "note": (f"{unusual} of {len(rows)} series unusual for this time" if rows else
-                                 "no series in this window (check the expression and the dates)")}
+                out = {"database": db_obj.database_name, "from": start, "to": end, "weeks": weeks,
+                       "series_count": len(rows), "unusual": unusual, "series": rows[:30],
+                       "note": (f"{unusual} of {len(rows)} series unusual for this time" if rows else
+                                "no series in this window (check the expression and the dates)")}
+                refs = _metric_references(against)
+                if refs and rows:                     # each series on the reference days (its average over the window then)
+                    day = 86_400_000
+
+                    def then(ref: Any) -> tuple[str, str, dict[tuple, float]]:
+                        back = ref.days if ref.kind != "date" else \
+                            (conn.zone.local(t0).date() - ref.date).days
+                        if back <= 0:
+                            return ref.label, "not before the window", {}
+                        try:
+                            series = conn.client.query_range(promql, t0 - back * day, t1 - back * day, step)
+                        except Exception:  # pylint: disable=broad-except   (that day is not given)
+                            return ref.label, "not read", {}
+                        got: dict[tuple, float] = {}
+                        for sr in series:
+                            vals = [v for _t, v in sr.points if v is not None and not math.isnan(v)]
+                            if vals:
+                                got[tuple(sorted((k2, v2) for k2, v2 in sr.labels.items() if k2 != "__name__"))] = sum(vals) / len(vals)
+                        return ref.label, f"{conn.zone.local(t0 - back * day):%Y-%m-%d}" if got else "no data that day", got
+
+                    with ThreadPoolExecutor(max_workers=3) as pool:
+                        days = list(pool.map(then, refs))
+                    out["reference_days"] = {label: when for label, when, _got in days}
+                    for item in out["series"]:
+                        key = tuple(sorted(item["labels"].items()))
+                        then_values = {label: round(got[key], 6) for label, _when, got in days if key in got}
+                        if then_values:               # (a day the metrics do not reach has no figure)
+                            item["then"] = then_values
+                return out
             finally:
                 conn.close()
     except ToolError as ex:
         return {"error": str(ex)}
     except Exception as ex:  # pylint: disable=broad-except
         return {"error": f"{type(ex).__name__}: {str(ex)[:1500]}"}
+
+
+def _metric_references(against: list[str] | str | None) -> list[Any]:
+    """The reference days of a comparison of metrics: the ones given, else the team's own (agent.compare_against)."""
+    from supagent.knowledge import groups as G
+
+    if against is not None:
+        try:
+            return G.references(against)
+        except G.GroupsError as ex:
+            raise ToolError(str(ex)) from ex
+    try:
+        return G.references(str(_setting("agent.compare_against", "") or ""))
+    except G.GroupsError:
+        return []
+
+
+GROUP_FIELDS = 9                 # fields compared in one call: the ones asked, then the table's other fields of few values
+GROUP_DAYS = 10                  # earlier days at most
+GROUP_ROWS = 400                 # values of a field read per window
+GROUP_SECONDS = 45               # after this long, no further field is read (agent.compare_seconds)
+GROUP_THREADS = 3                # queries of one call that run at a time (OpenSearch: a connection each;
+                                 # agent.compare_threads)
+GROUP_CHARS = 6500               # a result longer than this gives up what repeats its conclusion
+PAST_HOURS = 30                  # a window that ended this long before now is said to be of another day
+WEEKLY = 1.18                    # within this of the same weekday of the earlier weeks: what that weekday is
+IN_PROGRESS_MINUTES = 60         # a window that ends this close to now (or later) is still in progress
+RELATED_DAYS = 7                 # records of the related tables: this many days before the end of the window
+RELATED_ROWS = 4                 # ... the latest ones
+RELATED_VALUES = 8               # ... about at most this many values that stand out
+FOLLOW_FIELDS = 6                # the comparison made for a lead (every row on what the rows wait for): this many fields
+OUTSIDE_FIELDS = 3               # who else is on what stands out, outside the scope: by this many of the scope's fields
+PRESENT_WAYS = 3.0               # ... a row is there when it came at most this many usual whole ways before the window
+FOLLOW_SHARE = 0.5               # a lead is followed when at most this share of the call's time is spent
+OUTSIDE_LEADS = 2                # ... for this many of the fields the change is concentrated on
+ID_NAME = re.compile(r"(^|_)(ID|UUID|KEY)(_|$)|^_id$", re.I)
+NUMERIC = ("double", "float", "long", "integer", "int", "short", "byte", "half_float", "scaled_float", "bigint",
+           "decimal", "real", "numeric", "smallint", "unsigned_long")
+NO_FILTER_CLAUSE = ("mysql", "mariadb", "mssql", "oracle", "clickhouse")     # no FILTER (WHERE ...) on an aggregate
+
+
+def _table_database(table: str, ref: str | int | None) -> Any:
+    """The database a table is in: the one given, else the one the dictionary learned it in (among those the
+    agent may use), else the first one."""
+    if ref not in (None, ""):
+        return _database(ref)
+    try:
+        from superset.extensions import db
+        from superset.models.core import Database
+
+        from supagent.models import KObject, Source
+        from supagent.security import can_use_database
+
+        ids = [i for (i,) in db.session.query(Source.database_id).join(KObject, KObject.source_id == Source.id).filter(
+            KObject.kind == "index", KObject.name == table, KObject.gone_at.is_(None))]
+        found = agent_databases([d for d in db.session.query(Database).filter(Database.id.in_(ids or [-1]))
+                                 if can_use_database(d)])
+        if found:
+            return found[0]
+    except Exception:  # pylint: disable=broad-except   (no dictionary: the first database)
+        pass
+    return _database(None)
+
+
+def _time_field(table: str, given: str | None) -> str:
+    from supagent.knowledge.groups import GroupsError, name
+
+    if given:
+        return name(given)
+    spec = (_catalog().get("indices") or {}).get(table) or {}
+    if spec.get("time_field"):
+        return str(spec["time_field"])
+    try:
+        from superset.extensions import db
+
+        from supagent.models import KObject
+
+        o = db.session.query(KObject).filter(KObject.kind == "index", KObject.name == table,
+                                             KObject.gone_at.is_(None)).first()
+        if o is not None and (o.stats or {}).get("time_field"):
+            return str(o.stats["time_field"])
+    except Exception:  # pylint: disable=broad-except
+        pass
+    raise GroupsError(f"give time_field: the time field of {table!r} is not known")
+
+
+def _row_time_field(table: str, given: str | None) -> tuple[str, str | None]:
+    """The time field of a comparison: the one asked, unless it is a column the connector computes (the business
+    date's own time is no time of the rows: every earlier day would be read on the wrong rows); then the table's
+    own, and the one that was asked (to say so)."""
+    tf = _time_field(table, given)
+    if not given:
+        return tf, None
+    try:
+        from superset.extensions import db
+
+        from supagent.models import KObject
+
+        o = db.session.query(KObject).filter(KObject.kind == "field", KObject.parent == table, KObject.name == tf,
+                                             KObject.gone_at.is_(None)).first()
+        if o is not None and (o.stats or {}).get("computed"):
+            own = _time_field(table, None)
+            if own != tf:
+                return own, tf
+    except Exception:  # pylint: disable=broad-except   (no dictionary, no time field known: as asked)
+        pass
+    return tf, None
+
+
+def _group_fields(table: str, fixed: set[str], label_column: str | None) -> list[str]:
+    """The fields worth grouping by when none is given: the table's fields of few values (the dictionary), those a
+    category is read from first (application, server...), never an identifier nor a field the scope pins."""
+    from superset.extensions import db
+
+    from supagent.knowledge.facets import field_rules
+    from supagent.models import KObject
+
+    rules = [rx for _c, rx in field_rules()]
+    rows = []
+    for o in db.session.query(KObject).filter(KObject.kind == "field", KObject.parent == table, KObject.gone_at.is_(None)):
+        card = (o.stats or {}).get("cardinality") or len((o.stats or {}).get("values") or [])
+        kind = str(o.data_type or "").lower()
+        if not (2 <= int(card or 0) <= 80) or o.name in fixed or o.name == label_column or ID_NAME.search(o.name) or \
+                kind in ("date", "boolean", "text", "timestamp") or kind in NUMERIC:
+            continue
+        rows.append((not any(rx.match(o.name) for rx in rules), int(card), o.name))
+    return [n for _a, _b, n in sorted(rows)][:GROUP_FIELDS]
+
+
+@contextmanager
+def _closing(connections: list[Any]) -> Iterator[None]:
+    try:
+        yield
+    finally:
+        for c in connections:
+            try:
+                c.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+
+def _many_values(table: str, fields: list[str]) -> dict[str, int]:
+    """The fields asked that have too many values to compare value by value (the dictionary's count): {field: n}."""
+    if not fields:
+        return {}
+    from superset.extensions import db
+
+    from supagent.models import KObject
+
+    out = {}
+    for o in db.session.query(KObject).filter(KObject.kind == "field", KObject.parent == table,
+                                              KObject.name.in_(fields), KObject.gone_at.is_(None)):
+        card = int((o.stats or {}).get("cardinality") or 0)
+        if card > GROUP_ROWS:
+            out[o.name] = card
+    return out
+
+
+def _time_fields(table: str, time_field: str) -> set[str]:
+    """A table's time fields (the dictionary), with the one its window is on."""
+    out = {time_field}
+    try:
+        from superset.extensions import db
+
+        from supagent.models import KObject
+
+        for o in db.session.query(KObject).filter(KObject.kind == "field", KObject.parent == table, KObject.gone_at.is_(None)):
+            if str(o.data_type or "").lower().startswith(("date", "timestamp")):
+                out.add(o.name)
+    except Exception:  # pylint: disable=broad-except   (no dictionary: the window's field)
+        pass
+    return out
+
+
+def _measures(table: str, time_field: str) -> list[Any]:
+    """The measures of a table compared when none is asked: its rows, each field against the field that holds
+    its usual value (the catalog: usual_of), the rows that had reached each of its other time fields by the end
+    of the window (ready, started, ended: where its rows are late), and the average of its other numeric fields
+    (the dictionary; the ones the catalog describes first)."""
+    from superset.extensions import db
+
+    from supagent.knowledge import groups as G
+    from supagent.models import KObject
+
+    spec = ((_catalog().get("indices") or {}).get(table) or {}).get("fields") or {}
+    usual = {name: str(fs["usual_of"]) for name, fs in spec.items() if isinstance(fs, dict) and fs.get("usual_of")}
+    out = [G.Measure("count")] + [G.Measure("ratio", (a, b)) for b, a in usual.items()]
+    numbers, times = [], []
+    try:
+        own = _time_field(table, None)               # (the table's own time field is no stage of its rows)
+    except Exception:  # pylint: disable=broad-except
+        own = time_field
+    for o in db.session.query(KObject).filter(KObject.kind == "field", KObject.parent == table, KObject.gone_at.is_(None)):
+        st = o.stats or {}
+        kind = str(o.data_type or "").lower()
+        described = not isinstance(spec.get(o.name), dict)
+        if kind == "date" and o.name not in (time_field, own, "@timestamp") and not st.get("computed"):
+            times.append((described, o.name))         # what had reached it by the end of the window
+        if kind not in NUMERIC or ID_NAME.search(o.name) or o.name in usual or o.name in usual.values() or \
+                (st.get("min") is not None and st.get("min") == st.get("max")):
+            continue                                  # (a field compared with its usual: the ratio says it)
+        numbers.append((described, o.name))
+    out += [G.Measure("reached", (n,)) for _d, n in sorted(times)[:4]]
+    return (out + [G.Measure("avg", (n,)) for _d, n in sorted(numbers)])[:G.MEASURES]
+
+
+def _neighbours(table: str) -> dict[str, str]:
+    """The tables the catalog relates to a table, within two joins: {table: what the join says}."""
+    cat = _catalog().get("indices") or {}
+    out: dict[str, str] = {}
+
+    def of(t: str) -> list[tuple[str, str]]:
+        found = [(str(r["to"]), str(r.get("description") or "")) for r in (cat.get(t) or {}).get("relationships") or []
+                 if r.get("to")]
+        found += [(src, str(r.get("description") or "")) for src, spec in cat.items()
+                  for r in (spec or {}).get("relationships") or [] if r.get("to") == t]
+        return found
+
+    for other, why in of(table):
+        out.setdefault(other, why)
+    for near in list(out):
+        for other, why in of(near):
+            out.setdefault(other, why)
+    out.pop(table, None)
+    return out
+
+
+def _records(run: Any, other: str, db_obj: Any, where: str, until: dt.datetime) -> dict[str, Any] | None:
+    """The latest records of a related table that satisfy a condition, over the days before `until`."""
+    from superset.extensions import security_manager
+
+    from supagent.knowledge import groups as G
+
+    if _table_database(other, None).id != db_obj.id:
+        return None
+    tf = _time_field(other, None)
+    security_manager.raise_for_access(database=db_obj, sql=f'SELECT COUNT(*) FROM "{G.name(other)}"', schema="default")
+    since = until - dt.timedelta(days=RELATED_DAYS)
+    where = f'{where} AND "{tf}" >= {G.lit(since)} AND "{tf}" < {G.lit(until)}'
+    total = run(f'SELECT COUNT(*) AS n FROM "{other}" WHERE {where}')
+    n = int(total[0][0] or 0) if total else 0
+    out: dict[str, Any] = {"table": other, "since": f"{since:%Y-%m-%d %H:%M}", "records": n}
+    if not n:
+        return out
+    sql = f'SELECT * FROM "{other}" WHERE {where} ORDER BY "{tf}" DESC LIMIT {RELATED_ROWS}'
+    rows, cols = run(sql, described=True)
+    latest = []
+    for r in rows:
+        rec: dict[str, Any] = {}
+        for c, v in zip(cols, r):
+            if v in (None, "") or c.startswith("_") or (c == "@timestamp" and tf != "@timestamp"):
+                continue
+            rec[c] = f"{v:%Y-%m-%d %H:%M}" if isinstance(v, dt.datetime) else (v if isinstance(v, (int, float, bool)) else str(v)[:150])
+        if len({k for k, v in rec.items() if v == rec.get(tf)}) > 1:
+            rec.pop(tf, None)                    # the same time under another name
+        latest.append(dict(list(rec.items())[:9]))
+    out["latest"] = latest
+    out["sql"] = sql
+    return out
+
+
+def _related(run: Any, table: str, db_obj: Any, field: str, values: list[str], until: dt.datetime) -> list[dict]:
+    """What the related tables hold about values that stand out: the catalog's joins on that field (the changes
+    made to an application, the alerts raised on a server), their latest records of the days before the end of
+    the window; for a field nothing joins, the records of the related tables whose text mentions the value (a
+    change that says it concerns that perimeter). A join declared on a field holds for the field of the same
+    name in the table compared."""
+    from superset.extensions import db
+
+    from supagent.knowledge import groups as G
+    from supagent.models import KObject
+
+    cat = _catalog().get("indices") or {}
+    rels: dict[tuple[str, str], str] = {}
+    for src, spec in cat.items():
+        for rel in (spec or {}).get("relationships") or []:
+            keys = rel.get("keys") or {}
+            if len(keys) != 1 or not rel.get("to"):
+                continue
+            (mine, theirs), = keys.items()
+            if mine == field and rel["to"] != table:
+                rels.setdefault((str(rel["to"]), str(theirs)), str(rel.get("description") or ""))
+            elif theirs == field and rel["to"] == table and src != table:      # declared from the other side
+                rels.setdefault((str(src), str(mine)), str(rel.get("description") or ""))
+    values = [str(v) for v in values if str(v) != "(none)"][:RELATED_VALUES]
+    if not values:
+        return []
+    out = []
+    listed = ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+    for (other, key), why in list(rels.items())[:2]:
+        try:
+            found = _records(run, other, db_obj, f'"{G.name(key)}" IN ({listed})', until)
+        except Exception:  # pylint: disable=broad-except   (no such table for this user, no time field: not followed)
+            continue
+        if found is not None:
+            out.append({"about": f'"{key}" = {_some(values, 6)}', "what": why or f'joined on "{field}" = "{key}" (the catalog)',
+                        **found})
+    if rels:
+        return out
+    for other, why in list(_neighbours(table).items())[:6]:          # nothing joins this field: who mentions the value
+        texts = [o.name for o in db.session.query(KObject).filter(
+            KObject.kind == "field", KObject.parent == other, KObject.gone_at.is_(None))
+            if str(o.data_type or "").lower() == "text"][:2]
+        if not texts or len(out) >= 2:
+            continue
+        cond = " OR ".join(f'"{G.name(t)}" LIKE \'%{v.replace(chr(39), "")}%\'' for t in texts for v in values[:3]
+                           if len(v) >= 3 and "%" not in v)       # (an underscore in the value: any one character)
+        if not cond:
+            continue
+        try:
+            found = _records(run, other, db_obj, f"({cond})", until)
+        except Exception:  # pylint: disable=broad-except
+            continue
+        if found is not None and found["records"]:
+            out.append({"about": f"records whose {_some(texts, 2)} mentions {_some(values[:3], 3)}",
+                        "what": why or "related by the catalog", **found})
+    return out
+
+
+def _some(items: list[str], n: int) -> str:
+    return ", ".join(items[:n]) + (f" and {len(items) - n} more" if len(items) > n else "")
+
+
+def _label_now(conn: Any) -> dt.datetime:
+    now = getattr(conn, "label_now", None) or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is not None:
+        tz = getattr(conn, "label_tz", None)
+        now = (now.astimezone(tz) if tz else now.astimezone()).replace(tzinfo=None)
+    return now
+
+
+def _labels_of_dates(conn: Any, dates: list[str], at: dt.datetime | None = None) -> list[str]:
+    """Business dates the scope pins (POSITION_DATE = '20260924'), as their labels (D-1...) on the day `at` (now
+    when not given): the same scope can then be read on the earlier days. [] when one of them is no date of the
+    calendar."""
+    try:
+        from osagg import calendar
+    except ImportError:
+        return []
+    fmt = getattr(conn, "label_date_format", "%Y%m%d")
+    key = calendar.asof_key(at or _label_now(conn), conn.label_cutoff, getattr(conn, "label_years", True))
+    out = []
+    for d in dates:
+        try:
+            label = calendar.label(dt.datetime.strptime(str(d), fmt).strftime("%Y%m%d"), key)
+        except ValueError:
+            return []
+        if not label:
+            return []
+        out.append(label)
+    return list(dict.fromkeys(out))
+
+
+def _earlier_dates(conn: Any, labels: list[str], back: dt.timedelta, at: dt.datetime | None = None) -> str | None:
+    """The business-date labels of the scope, as the dates they were `back` before `at` (now when not given), as
+    a condition on the labels' source field; None when the connection has no such calendar."""
+    try:
+        from osagg import calendar
+    except ImportError:
+        return None
+    src, fmt = getattr(conn, "label_source", None), getattr(conn, "label_date_format", "%Y%m%d")
+    if not src or not labels or not hasattr(conn, "label_cutoff"):
+        return None
+    key = calendar.asof_key((at or _label_now(conn)) - back, conn.label_cutoff, getattr(conn, "label_years", True))
+    dates = calendar.dates_for_labels(labels, key)
+    if not dates:
+        return "1 = 0"
+    values = ", ".join("'" + dt.datetime.strptime(d, "%Y%m%d").strftime(fmt) + "'" for d in dates)
+    return f'"{src}" IN ({values})'
+
+
+class _Comparison:
+    """One call of compare_groups: the windows (now, the earlier days of the usual, the reference days), the
+    queries (one per window and field, every measure at once), the judgments and the result."""
+
+    def __init__(self, conn: Any, db_obj: Any, more: list[Any], table: str, tf: str, t0: dt.datetime,
+                 t1: dt.datetime, where: str, group_by: list[str] | None, measure: str, days: int,
+                 against: list[str] | str | None, inside: "_Comparison | None" = None, cursors: Any = None) -> None:
+        """inside: the comparison this one is made for (a lead it follows): its connections, its time.
+        cursors: the connections of an earlier comparison of the same call."""
+        from supagent.knowledge import groups as G
+
+        self.G, self.conn, self.db, self.more = G, conn, db_obj, more
+        self.inside = inside
+        self.table, self.tf, self.t0, self.t1 = table, tf, t0, t1
+        self.every = str(measure or "all").strip().lower() in ("all", "every", "*", "")
+        self.measures = _measures(table, tf) if self.every else [G.Measure.parse(measure)]
+        self.days = max(2, min(int(days or 8), GROUP_DAYS))
+        label_column = getattr(conn, "label_column", None) if db_obj.backend == "osagg" else None
+        self.cond, self.labels = G.scope(where, label_column)
+        # an instant written in the scope would leave every earlier day empty: a date moves with each earlier day,
+        # anything else (since now minus six hours) is left out, the window gives the time
+        self.times = G.time_columns(self.cond, _time_fields(table, tf))
+        self.cond, self.moving, self.untimed = G.timed(self.cond, self.times)
+        if self.labels and _earlier_dates(conn, self.labels, dt.timedelta(0)) == "1 = 0":
+            raise ToolError(f'where: "{label_column}" = {", ".join(self.labels)}: not a business-date label (D, D-1, '
+                            "D-2, W-1...); a state or another value belongs to its own field")
+        self.moved = label_column                    # the column whose condition moves with the day
+        # a business date is of the day the window ends: asked now about today, today's; asked about last Monday
+        # (a window that ended then), that Monday's, and each earlier day's own from there
+        self.anchor = min(t1, _label_now(conn)) if label_column else t1
+        if not self.labels and label_column and getattr(conn, "label_source", None):
+            pinned = G.literals(self.cond, conn.label_source)        # a business date written as a date
+            self.labels = _labels_of_dates(conn, pinned, self.anchor) if pinned else []
+            self.moved = conn.label_source if self.labels else label_column
+        # a business date in the scope says which rows: each earlier day is one day back, whatever the window's
+        # length (a window that starts the day before does not skip every other day)
+        self.period = dt.timedelta(days=1 if self.labels else max(1, math.ceil((t1 - t0).total_seconds() / 86400)))
+        fixed = G.fixed_fields(self.cond) | {getattr(conn, "label_source", None) or "", label_column or ""}
+        asked = [G.name(f) for f in (group_by or [])]
+        self.dropped = [f for f in asked if f in fixed and f]
+        asked = [f for f in dict.fromkeys(asked) if f not in fixed][:GROUP_FIELDS]
+        self.wide = _many_values(table, asked)       # an identifier, a job name: thousands of values say nothing
+        self.asked = [f for f in asked if f not in self.wide]
+        own = [f for f in _group_fields(table, fixed, label_column) if f not in self.asked]
+        self.fields = (self.asked + own)[:GROUP_FIELDS if inside is None else FOLLOW_FIELDS]
+        if not self.fields:
+            raise ToolError(f"give group_by: the fields to compare (no field of few values is known for {table!r})")
+        self.plan = G.Plan(self.measures, filter_clause=db_obj.backend not in NO_FILTER_CLAUSE)
+        self.cursors: queue.Queue = queue.Queue()
+        threads = 1 if GROUP_THREADS <= 1 else max(1, min(int(_setting("agent.compare_threads", GROUP_THREADS) or 1), 8))
+        self.budget = max(5, int(_setting("agent.compare_seconds", GROUP_SECONDS) or GROUP_SECONDS))
+        if inside is not None:
+            self.cursors, self.budget = inside.cursors, inside.budget
+        elif cursors is not None:
+            self.cursors = cursors
+        else:
+            self.cursors.put(conn.cursor())
+        if db_obj.backend == "osagg" and inside is None and cursors is None:     # a connection per thread (the queries of a field at a time)
+            for _ in range(threads - 1):
+                try:
+                    more.append(_connection(db_obj, False, agent_query=True))
+                    self.cursors.put(more[-1].cursor())
+                except Exception:  # pylint: disable=broad-except   (one connection then)
+                    break
+        # every measure of a business date: its rows as they were at the end of the window on each day (what had
+        # been released, started, ended by then), whatever their own time: a row not started yet, or started
+        # after that time on an earlier day, is in the set the same way on every day
+        self.as_of = bool(self.every and self.labels
+                          and _earlier_dates(conn, self.labels, dt.timedelta(days=1), self.anchor) is not None)   # (a calendar)
+        self.label_moved = False                     # an earlier day was read on its own business date
+        self.now_scope = G.render(self.cond)
+        today = _earlier_dates(conn, self.labels, dt.timedelta(0), self.anchor) if self.labels else None
+        if today and today != "1 = 0":
+            # the business date as its dates, for the window asked as for the earlier days: a past window gets its
+            # own day's, and a date is pushed down where the label (a computed column) may not be
+            self.now_scope = G.render(self.cond, self.moved, today)
+        self.in_progress = t1 >= _local_now(conn) - dt.timedelta(minutes=IN_PROGRESS_MINUTES)
+        self.explicit = against is not None          # reference days asked with the call, or the team's own
+        try:
+            self.refs = G.references(against if self.explicit else str(_setting("agent.compare_against", "") or ""))
+        except G.GroupsError:
+            if self.explicit:
+                raise
+            self.refs = []                           # (a setting nobody can read is no reference)
+        self.began = inside.began if inside is not None else time.time()
+        self.look_far = True                         # (False: a quick look at the last days, to try a scope)
+        self.left_out: str | None = None             # a condition of the scope that holds only now, left out
+        self.journey = 0.0                           # the usual time of the whole way through the stages (seconds)
+        self.stages: list[str] = []                  # the table's time fields, in the order its rows reach them
+        self.over: dict[str, str] = {}               # {measure: the rows it is over}
+        self.errors: dict[str, str] = {}
+        self.renamed: dict[str, dict[str, str]] = {}
+        self.unfilled: set[str] = set()              # fields many rows do not have yet (the server of a row not started)
+        self.chosen: list[tuple[dt.timedelta, str]] = []
+
+    # ------------------------------------------------------------------ queries
+    def run(self, sql: str, described: bool = False, built: bool = False) -> Any:
+        """`built`: a query of this tool's own making (names checked, the scope parsed as one condition): not
+        parsed once more."""
+        cur = self.cursors.get()
+        try:
+            cur.execute(sql if built else _check_select(sql, GROUP_ROWS)[0])
+            rows = cur.fetchall()
+            return (rows, [c[0] for c in (getattr(cur, "description", None) or [])]) if described else rows
+        finally:
+            self.cursors.put(cur)
+
+    def run_all(self, sqls: list[str]) -> list[Any]:
+        if not self.more or len(sqls) < 2:
+            return [self.run(q, built=True) for q in sqls]
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(self.more) + 1) as pool:
+            return list(pool.map(lambda q: self.run(q, built=True), sqls))
+
+    def late(self) -> bool:
+        return time.time() - self.began > self.budget
+
+    def window(self, a: dt.datetime, b: dt.datetime, scope: str) -> str:
+        parts = [f"({scope})"] if scope else []
+        if not self.as_of:
+            parts += [f'"{self.tf}" >= {self.G.lit(a)}', f'"{self.tf}" < {self.G.lit(b)}']
+        return " AND ".join(parts) or "TRUE"
+
+    def scope_at(self, back: dt.timedelta, dates: str | None = None) -> str:
+        """The scope as SQL, `back` earlier: the dates it compares its time fields with moved back as much, its
+        business date as `dates` (None: left out)."""
+        cond = self.G.moved_back(self.cond, self.times, back.days) if self.moving else self.cond
+        return self.G.render(cond, self.moved, dates or "TRUE")
+
+    def scope_back(self, back: dt.timedelta) -> str | None:
+        """The scope as it was `back` earlier (the business date of that day); None: that day is the same business
+        date as the day after it (a weekend: not the day its rows were made)."""
+        if not self.labels:
+            return self.scope_at(back)
+        dates = _earlier_dates(self.conn, self.labels, back, self.anchor)
+        if not dates:
+            return self.scope_at(back) if not self.as_of else None
+        if self.as_of and dates == _earlier_dates(self.conn, self.labels, back - dt.timedelta(days=1), self.anchor):
+            return None
+        self.label_moved = True
+        return self.scope_at(back, dates)
+
+    def has_rows(self, back: dt.timedelta, scope: str) -> bool:
+        n = self.run(f'SELECT COUNT(*) AS n FROM "{self.table}" WHERE {self.window(self.t0 - back, self.t1 - back, scope)}')
+        return bool(n and n[0][0])
+
+    def earlier(self) -> None:
+        """The earlier windows that have data (a weekend, a day off: skipped), the latest first."""
+        if self.inside is not None:                   # (the days of the comparison it is made for)
+            self.chosen = [(back, sc) for back, sc in ((b, self.scope_back(b)) for b, _s in self.inside.chosen) if sc is not None]
+        for k in range(1, (3 * self.days + 8) if self.look_far else 5) if self.inside is None and not self.chosen else []:
+            if len(self.chosen) >= self.days:
+                break
+            back = k * self.period
+            scope = self.scope_back(back)
+            if scope is not None and self.has_rows(back, scope):
+                self.chosen.append((back, scope))
+        if len(self.chosen) < 2:
+            if self.inside is None and self.has_rows(dt.timedelta(0), self.now_scope):
+                raise NoEarlierDay("this scope has rows in the window asked and none on the earlier days: one of its "
+                                   "conditions holds only now (a state that exists only while a row is in progress, a "
+                                   "value that is new). Leave it out: the stages say how many rows wait at each")
+            raise ToolError(f"no row matches this scope, in the window asked or in the {3 * self.days + 7} windows before "
+                            f"it (on {self.tf!r}): check the table, the values of the scope and the dates (start: when "
+                            "the rows looked at began, today's from midnight today; end: now)")
+        self.wins = [(self.now_scope, self.t0, self.t1)] + [(sc, self.t0 - bk, self.t1 - bk) for bk, sc in self.chosen]
+
+    def without_a_condition(self) -> list[tuple[str, str]]:
+        """The scope without one of its conditions on a field, one at a time (the business date and the times kept)."""
+        label_source = getattr(self.conn, "label_source", None) or ""
+        label_column = getattr(self.conn, "label_column", None) or ""
+        return self.G.one_left_out(self.cond, self.times | {label_source, label_column, self.moved or ""})
+
+    def totals_of(self, windows: list[tuple[str, dt.datetime, dt.datetime]]) -> list[tuple[int, list]]:
+        G = self.G
+        got = self.run_all([f'SELECT {self.plan.select(G.lit(b))} FROM "{self.table}" WHERE {self.window(a, b, sc)}'
+                            for sc, a, b in windows])
+        return [(int(rows[0][0] or 0), self.plan.values(rows[0], b)) if rows else (0, [(0, None)] * len(self.measures))
+                for rows, (_sc, _a, b) in zip(got, windows)]
+
+    def by(self, field: str, windows: list[tuple[str, dt.datetime, dt.datetime]]) -> tuple[list[dict], list[dict]]:
+        """A field's values in each window: their rows, and their measures."""
+        G = self.G
+        got = self.run_all([f'SELECT "{field}" AS g, {self.plan.select(G.lit(b))} FROM "{self.table}" WHERE '
+                            f'{self.window(a, b, sc)} GROUP BY "{field}" ORDER BY 2 DESC LIMIT {GROUP_ROWS}'
+                            for sc, a, b in windows])
+
+        def value(r: tuple) -> str:
+            return G.NONE if r[0] is None else str(r[0])
+
+        return ([{value(r): int(r[1] or 0) for r in rows} for rows in got],
+                [{value(r): self.plan.values(r[1:], b) for r in rows} for rows, (_sc, _a, b) in zip(got, windows)])
+
+    # ------------------------------------------------------------------ the stages
+    def find_stages(self) -> None:
+        """The table's time fields in the order its rows reach them (their average on the latest earlier day, over
+        the rows that reached them all), then the time from each to the next and the rows waiting at each."""
+        G = self.G
+        dates = [m.fields[0] for m in self.measures if m.kind == "reached"]
+        if not self.every or len(dates) < 2:
+            return
+        try:
+            if self.inside is not None and self.inside.stages:       # (the order is the table's)
+                self.stages = list(self.inside.stages)
+            else:
+                bk, sc = self.chosen[0]
+                every_date = " AND ".join(f'"{f}" IS NOT NULL' for f in dates)
+                row = self.run("SELECT " + ", ".join(f'AVG("{f}") AS t{i}' for i, f in enumerate(dates))
+                               + f' FROM "{self.table}" WHERE {self.window(self.t0 - bk, self.t1 - bk, sc)} AND {every_date}',
+                               built=True)[0]
+                self.stages = [f for _v, f in sorted((v, f) for v, f in zip(row, dates) if isinstance(v, dt.datetime))]
+        except Exception:  # pylint: disable=broad-except   (no average of a time here: no stages)
+            self.stages = []
+        if len(self.stages) >= 2:
+            pairs = list(zip(self.stages, self.stages[1:]))
+            self.measures = self.measures + [G.Measure("lapse", pr) for pr in pairs] + [G.Measure("age", pr) for pr in pairs]
+            self.plan = G.Plan(self.measures, self.plan.filter_clause)
+
+    def rows_by_then(self) -> None:
+        """A measure only some rows have yet (the duration of the rows that ended): the time field that says
+        when they got it, so that each day's measure is over the rows that had it by the same time of day."""
+        G = self.G
+        if not (self.as_of or self.in_progress):
+            return
+        first = self.totals_of(self.wins[:1])[0]
+        reached = {m.fields[0]: first[1][i][0] for i, m in enumerate(self.measures) if m.kind == "reached"}
+        when: dict[int, str] = {}
+        for i, m in enumerate(self.measures):
+            have = first[1][i][0]
+            if m.kind in ("ratio", "avg", "sum", "max", "min") and 0 < have < first[0]:
+                near = [(abs(r - have), f) for f, r in reached.items() if abs(r - have) <= max(2, 0.01 * have)]
+                if near:
+                    when[i] = min(near)[1]
+                    self.over[m.text()] = (f"the rows that had reached {when[i]} by {self.t1:%H:%M}, on each day alike "
+                                           f"({have} of {first[0]} now)")
+        if when:
+            self.plan = G.Plan(self.measures, self.plan.filter_clause, when)
+
+    # ------------------------------------------------------------------ reading and judging
+    def read_fields(self) -> None:
+        G = self.G
+        self.totals = self.totals_of(self.wins)
+        self.read: dict[str, list[dict]] = {}
+        last = next((i for i, m in enumerate(self.measures) if m.kind == "reached" and self.stages
+                     and m.fields[0] == self.stages[-1]), None)
+        for f in self.fields:
+            if (self.read or self.inside is not None) and self.late():      # (one field at least, whatever it takes,
+                # unless the comparison is made for another's lead: the call's time is the first one's)
+                self.errors[f] = (f"not compared: the call had run for {time.time() - self.began:.0f} s "
+                                  "(agent.compare_seconds); ask it alone in group_by")
+                continue
+            try:
+                counts, values = self.by(f, self.wins)
+            except Exception as ex:  # pylint: disable=broad-except   (one field refused: the others answer)
+                self.errors[f] = str(ex)[:300]
+                continue
+            if (self.as_of or self.in_progress) and self.every and (
+                    G.follows_the_stage({g: (counts[0].get(g, 0), v[last][0]) for g, v in values[0].items()}, counts[1:])
+                    if last is not None else G.state_like(counts[0], counts[1:])):
+                self.errors[f] = ("not compared: its values change as a row advances (a status), and the earlier days "
+                                  "are read as they ended")
+                continue
+            self.renamed[f] = G.replaced(counts[0], counts[1:])
+            self._rename(f, values[1:])
+            if self.as_of and G.unfilled(counts[0], counts[1:]):
+                self.unfilled.add(f)
+            self.read[f] = values
+        if not self.read:
+            raise ToolError("no field could be compared: " + "; ".join(f"{k}: {v}" for k, v in self.errors.items()))
+
+    def _rename(self, field: str, windows: list[dict]) -> None:
+        """A new version is read against the old one's days: the old value's history under the new name."""
+        for new_value, old_value in (self.renamed.get(field) or {}).items():
+            for w in windows:
+                if old_value in w and new_value not in w:
+                    w[new_value] = w.pop(old_value)
+
+    def judge(self, totals: list[tuple[int, list]], read: dict[str, list[dict]]) -> tuple[list[tuple], list[str]]:
+        """Each measure in total against the earlier windows given (the usual's days, or one reference day), and
+        each field's values: [(measure, its total, {field: its summary})], and the time fields every row had
+        reached on every one of those days."""
+        G = self.G
+        judged: list[tuple] = []
+        in_all = (totals[0][0], [t[0] for t in totals[1:]])
+        every_row: list[str] = []
+        ci = next((i for i, m in enumerate(self.measures) if m.kind == "count"), None)
+        sizes: dict[str, dict[str, float]] = {}      # {field: {value: its rows, now or usually}}
+        for f, ws in read.items() if ci is not None else []:
+            sizes[f] = {g: max(float(ws[0].get(g, [(0, None)] * (ci + 1))[ci][0]),
+                               _median([float(w[g][ci][0]) for w in ws[1:] if g in w]) if any(g in w for w in ws[1:]) else 0.0)
+                        for g in set().union(*[set(w) for w in ws])}
+        for i, m in enumerate(self.measures):
+            if m.kind == "reached" and all(t[1][i][0] == t[0] for t in totals):
+                every_row.append(m.fields[0])        # every row had reached it, as on the earlier days
+                continue
+            overall = G.overall(totals[0][1][i], [t[1][i] for t in totals[1:]],
+                                in_all if self.every and m.kind in ("avg", "sum", "max", "min")
+                                and m.text() not in self.over else None)
+            summaries = {f: G.summarize({g: v[i] for g, v in ws[0].items()},
+                                        [{g: v[i] for g, v in w.items()} for w in ws[1:]], m.counting,
+                                        scale=None if m.counting else overall.get("usual"),
+                                        change=G.change(overall, m.counting),
+                                        high=G.AGE_HIGH if m.kind == "age" else G.HIGH,
+                                        above_only=m.kind in ("age", "lapse"), renamed=self.renamed.get(f),
+                                        open_field=f in self.unfilled and m.text() not in self.over
+                                        and m.kind in ("avg", "sum", "max", "min", "ratio"), sizes=sizes.get(f))
+                         for f, ws in read.items()}
+            judged.append((m, overall, summaries))
+        for i, m in enumerate(self.measures):        # the rows at each stage at that time: reached one, not the next
+            if m.kind != "age" or not any(t[1][i][0] for t in totals):
+                continue
+
+            def rows_of(v: tuple[int, float | None]) -> tuple[int, float]:
+                return v[0], float(v[0])
+
+            waiting = G.overall(rows_of(totals[0][1][i]), [rows_of(t[1][i]) for t in totals[1:]])
+            judged.append((G.Measure("between", m.fields), waiting,
+                           {f: G.summarize({g: rows_of(v[i]) for g, v in ws[0].items()},
+                                           [{g: rows_of(v[i]) for g, v in w.items()} for w in ws[1:]], True,
+                                           change=G.change(waiting, True), renamed=self.renamed.get(f),
+                                           sizes=sizes.get(f))
+                            for f, ws in read.items()}))
+        return judged, every_row
+
+    def since(self, name: str, field: str, value: str, usual: float | None, now: float | None) -> str | None:
+        """Since when a value is off: the earlier days of the usual, the latest first, that were off the same way
+        (a change of two days ago is "since" that day; none: new today)."""
+        if not usual or now is None or field not in self.read:
+            return None
+        G = self.G
+        up = now > usual
+        days = []
+        for (back, _sc), w in zip(self.chosen, self.read[field][1:]):
+            v = self.figure(name, w[value]) if value in w else None
+            if v is None:
+                break
+            if (up and v / usual >= G.HIGH) or (not up and v / usual <= G.LOW):
+                days.append(self.t1 - back)
+            else:
+                break
+        if not days:
+            return "new on this day (as usual on the days before)"
+        return (f"off since {days[-1]:%Y-%m-%d} (the {len(days)} day(s) before too)" if len(days) < len(self.chosen)
+                else f"off on every earlier day compared (since {days[-1]:%Y-%m-%d} at least)")
+
+    def figure(self, text: str, values: list[tuple[int, float | None]]) -> float | None:
+        """A measure's figure (by its name in the result) in the values of one window or of one of its groups."""
+        for i, m in enumerate(self.measures):
+            if m.text() == text:
+                return values[i][1]
+            if m.kind == "age" and self.G.Measure("between", m.fields).text() == text:
+                return float(values[i][0])
+        return None
+
+    # ------------------------------------------------------------------ the reference days
+    def reference_window(self, ref: Any) -> tuple[dt.timedelta, str] | None:
+        """The window of a reference day: the same clock window that many days back, on its own business date.
+        "yesterday" with no row (a weekend) is the day before that has some; a week or a month ago with no row
+        (a day off), the week before."""
+        back = (self.t0.date() - ref.date).days if ref.kind == "date" else ref.days
+        if back <= 0:
+            return None
+        tries = [back + i for i in range(7)] if ref.kind == "day" else [back, back + 7] if ref.kind == "week" else [back]
+        for b in tries:
+            delta = dt.timedelta(days=b)
+            scope = self.scope_back(delta)
+            if scope is not None and self.has_rows(delta, scope):
+                return delta, scope
+        return None
+
+    def references(self, res: dict[str, Any], judged: list[tuple]) -> None:
+        """The reference days (yesterday, a week ago, three weeks ago, months ago): each measure's figure then, in
+        total and for the values that stand out; a measure that is as usual and far from an older reference (a
+        change older than the days of the usual) is said, with where; the references asked with the call are each
+        compared in full (what differs from that day, and where)."""
+        G = self.G
+        if not self.refs:
+            return
+        found: list[tuple[Any, dt.timedelta, str]] = []
+        days: dict[str, str] = {}
+        for ref in self.refs:
+            got = None if self.late() else self.reference_window(ref)
+            if got is None:
+                days[ref.label] = "not read: the call's time was up" if self.late() else "no data that day"
+                continue
+            found.append((ref, got[0], got[1]))
+            days[ref.label] = f"{self.t1 - got[0]:%Y-%m-%d}"
+        res["reference_days"] = days
+        # a day the question named and the data does not reach is said, and nothing is compared with it
+        missing = [label for label, when in days.items() if when == "no data that day"] if self.explicit else []
+        nothing = [f"no data on {', '.join(missing)}: nothing to compare with there"] if missing else []
+        if not found:
+            if nothing:
+                res["against_reference_days"] = nothing
+            return
+        windows = [(sc, self.t0 - bk, self.t1 - bk) for _r, bk, sc in found]
+        totals = self.totals_of(windows)
+        then_fields: dict[str, list[dict]] = {}      # {field: its values on each reference day}
+
+        def values_then(field: str) -> list[dict]:
+            if field not in then_fields:
+                _counts, values = self.by(field, windows)
+                self._rename(field, values)
+                then_fields[field] = values
+            return then_fields[field]
+
+        if self.every:
+            listed = list(res["measures"][:4])
+        else:                                        # the one measure asked: its total, the values of its best field
+            m, overall, summaries = judged[0]
+            best = G.localized(summaries)
+            groups = [g for g in (res["fields"].get(best[0]) or {}).get("groups") or [] if g.get("unusual")] if best else []
+            listed = [{"measure": m.text(), "now": overall.get("now"), "field": best[0] if best else None,
+                       "values": groups, "_total": res["total"]}]
+        weekly = {r.label for r, _b, _s in found if r.kind == "week" and r.days % 7 == 0}
+
+        def pattern(now: Any, then: dict[str, Any], usual: Any) -> str:
+            """Off against the last days and the same as on the same weekday of the earlier weeks: a weekly pattern."""
+            same = [then[k] for k in weekly if isinstance(then.get(k), (int, float))]
+            if not same or not isinstance(now, (int, float)) or not isinstance(usual, (int, float)) or not usual:
+                return ""
+            if not (now / usual >= G.HIGH or now / usual <= G.LOW):
+                return ""
+            if all(x and 1 / WEEKLY <= now / x <= WEEKLY for x in same):
+                return " (as on the same weekday of the earlier weeks: what this weekday is, not a change)"
+            return ""
+
+        lines: list[str] = []
+        for e in listed:                             # what stands out: its figure on each reference day
+            name = e["measure"]
+            then = {r.label: _rounded(self.figure(name, t[1])) for (r, _b, _s), t in zip(found, totals)}
+            usual_total = (e.get("_total") or e).get("usual")
+            (e.pop("_total", None) or e)["then"] = then
+            line = (f"{name}: {_plain(e.get('now'))} now, " + ", ".join(f"{_plain(x)} {k}" for k, x in then.items())
+                    + pattern(e.get("now"), then, usual_total))
+            if e.get("field") and e.get("values") and not self.late():
+                try:
+                    per_day = values_then(e["field"])
+                except Exception:  # pylint: disable=broad-except   (the totals of the reference days stand)
+                    per_day = []
+                for v in e["values"][:3] if per_day else []:
+                    v["then"] = {r.label: (_rounded(self.figure(name, day[v["value"]])) if v["value"] in day else None)
+                                 for (r, _b, _s), day in zip(found, per_day)}
+                first = e["values"][0]
+                if first.get("then"):
+                    line = (f'{name}, {e["field"]} = {first["value"]}: {_plain(first.get("now"))} now, '
+                            + ", ".join(f"{_plain(x)} {k}" for k, x in first["then"].items())
+                            + pattern(first.get("now"), first["then"], first.get("usual")))
+            lines.append(line)
+        if lines or nothing:
+            res["against_reference_days"] = lines[:4] + nothing
+        # each reference on its own: what differs from that day, and where. The ones asked with the call: all that
+        # differs. The team's own: only what the usual does not show (a change older than its days).
+        said_already = {e["measure"] for e in listed} if self.every else set()
+        stage_kinds = ("reached", "between", "lapse", "age")
+        apart: list[dict[str, Any]] = []
+        for k, (ref, _bk, _sc) in enumerate(found):
+            if self.late() or (not self.explicit and len(apart) >= 2):
+                break
+            pair = [self.totals[0], totals[k]]
+            in_total, _every = self.judge(pair, {})
+            moved = [e for e in in_total if G.moved(e) and (self.explicit or (
+                e[0].kind not in stage_kinds and e[0].text() not in said_already))]
+            if not moved:
+                continue
+            read = {}
+            for f in self.read:
+                if self.late():
+                    break
+                try:
+                    read[f] = [self.read[f][0], values_then(f)[k]]
+                except Exception:  # pylint: disable=broad-except
+                    continue
+            names = {e[0].text() for e in moved}
+            judged_then, _every = self.judge(pair, read)
+            said = G.survey([e for e in judged_then if e[0].text() in names], shown=3)
+            if said["measures"]:
+                text = said["conclusion"].replace("What stands out, the strongest first: ", "")
+                for usual, then in ((" its usual", " its value then"), (" usually", " then"), ("above usual", "above then"),
+                                    ("below usual", "below then"), ("as usual", "as then")):
+                    text = text.replace(usual, then)
+                apart.append({"reference": f"{ref.label} ({days[ref.label]})", "what_differs": text[:900]})
+        if apart:
+            res["against"] = apart
+            if not self.explicit:
+                res["against_note"] = ("as usual against the last days, but not against these older days: a change "
+                                       "older than the days of the usual (look at what changed since)")
+
+    # ------------------------------------------------------------------ who else is on what stands out
+    def present(self, a: dt.datetime, b: dt.datetime) -> str:
+        """The rows that are there between a and b, whatever the scope. With stages: the rows whose life overlaps
+        the window (their first stage before its end and within a day of its start, their last stage not before
+        its start): the time field of a row moves as the row advances, and would count a day in progress and a
+        day that ended differently. Without stages: the rows of the window by the time field."""
+        G = self.G
+        if len(self.stages) >= 2:
+            first, last = self.stages[0], self.stages[-1]
+            # (rows that came long before the window and never ended are left out: three times the usual way,
+            # a day at least, a month at most)
+            came = dt.timedelta(seconds=min(max(86400.0, PRESENT_WAYS * self.journey), 30 * 86400.0))
+            return (f'"{first}" >= {G.lit(a - came)} AND "{first}" < {G.lit(b)} AND '
+                    f'("{last}" IS NULL OR "{last}" >= {G.lit(a)})')
+        return f'"{self.tf}" >= {G.lit(a)} AND "{self.tf}" < {G.lit(b)}'
+
+    def outside(self, leads: list[tuple[str, list[str]]], waits_on: str | None = None) -> list[dict[str, Any]]:
+        """The rows outside the scope that share the value the change is concentrated on (the other rows on that
+        server, that queue, that pool: who else is on it), during the same window of the same days, by the
+        scope's own fields: more of them than usual, and under which values. Said when there are more (and, for
+        what the scope's rows wait on, also when there are not: nobody else took it). A query per window."""
+        G = self.G
+        label_source = getattr(self.conn, "label_source", None) or ""
+        by = G.conditioned(self.cond, self.times | {self.moved or "", label_source})[:OUTSIDE_FIELDS]
+        if self.inside is not None or (not by and not self.labels):       # no scope: nothing is outside it
+            return []
+        today = _earlier_dates(self.conn, self.labels, dt.timedelta(0), self.anchor) if self.labels else None
+        windows = [(dt.timedelta(0), self.scope_at(dt.timedelta(0), today))] + list(self.chosen)
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for field, values in sorted(leads, key=lambda lead: (lead[0] != waits_on, lead[0] in by)):
+            values = [v for v in values if v != G.NONE][:3]
+            if field in seen or not values or len(seen) >= OUTSIDE_LEADS or self.late():
+                continue
+            seen.add(field)
+            group = [f for f in by if f != field]
+            cols = ", ".join(f'"{f}"' for f in group)
+            on = f'"{field}" IN (' + ", ".join("'" + v.replace("'", "''") + "'" for v in values) + ")"
+            sqls = []
+            for back, scope in windows:
+                where = f"{on} AND {self.present(self.t0 - back, self.t1 - back)} AND NOT ({scope})"
+                sqls.append(f'SELECT {cols + ", " if cols else ""}COUNT(*) AS n FROM "{self.table}" WHERE {where}'
+                            + (f" GROUP BY {cols} ORDER BY {len(group) + 1} DESC LIMIT {GROUP_ROWS}" if cols else ""))
+            got = self.run_all(sqls)
+            rows = [{tuple(G.NONE if x is None else str(x) for x in r[:-1]): int(r[-1] or 0) for r in day} for day in got]
+            found = G.others(field, values, group, rows[0], rows[1:])
+            found["sql"] = sqls[0]
+            if found["more"] or (group and field == waits_on):
+                out.append(found)
+        return out
+
+    def there(self, waits_on: dict[str, Any] | None) -> dict[str, Any] | None:
+        """The lead followed once. The rows wait at a stage where they do not usually, on one value of a field
+        (the rows of one pool waiting for a slot): the same comparison over every row that has this value,
+        whatever the scope's other conditions (its business date kept): what holds what they wait for, rows that
+        last longer than usual there (and where), or rows that are not usually there."""
+        if self.inside is not None or not waits_on or not self.every or \
+                time.time() - self.began > FOLLOW_SHARE * self.budget or not _setting("agent.compare_follow", True):
+            return None
+        G = self.G
+        field, values = waits_on["field"], waits_on["values"]
+        label_column = getattr(self.conn, "label_column", None)
+        label_source = getattr(self.conn, "label_source", None) or ""
+        if not [f for f in G.conditioned(self.cond, self.times | {self.moved or "", label_source}) if f != field]:
+            return None                               # (no other condition to leave out: the same rows again)
+        where = f'"{field}" IN (' + ", ".join("'" + v.replace("'", "''") + "'" for v in values) + ")"
+        if self.labels and label_column:
+            where += f' AND "{label_column}" IN (' + ", ".join("'" + x.replace("'", "''") + "'" for x in self.labels) + ")"
+        inner = _Comparison(self.conn, self.db, self.more, self.table, self.tf, self.t0, self.t1, where, None, "all",
+                            self.days, [], inside=self)
+        got = inner.result()
+        on = f'"{field}" = {values[0]}' if len(values) == 1 else f'"{field}" in ({", ".join(values)})'
+        out: dict[str, Any] = {"rows": f"every row with {on}" + (" of the business date" if self.labels else "")
+                               + f", whatever the scope's other conditions (the scope's rows wait there at "
+                                 f"{waits_on['stage']}): what holds it"}
+        said = getattr(inner, "said", None) or {}
+        if not said.get("lines"):
+            out["what_stands_out"] = ["nothing: each measure is as usual among them, in total and on each field"]
+            return out
+        if said.get("first"):
+            out["stages"] = (f"first clearly off there: {said['first']}"
+                             + (f"; off on its own too: {'; '.join(said['own'][:2])}" if said.get("own") else ""))
+        # what stands out there, the most telling first, each in a line (not what repeats another's values)
+        out["what_stands_out"] = [re.sub(r" \(the same values for: [^)]*\)[^)]*\)", "", line)[:340] for line in said["lines"][:3]]
+        for key in ("since_when", "related"):
+            if got.get(key):
+                out[key] = got[key][:1]
+        return out
+
+    # ------------------------------------------------------------------ the result
+    def result(self) -> dict[str, Any]:
+        G = self.G
+        self.earlier()
+        if self.as_of or self.every:
+            self.find_stages()
+        self.rows_by_then()
+        self.read_fields()
+        judged, every_row = self.judge(self.totals, self.read)
+        self.journey = sum(float(e[1].get("usual") or 0.0) for e in judged if e[0].kind == "lapse")
+        t0, t1 = self.t0, self.t1
+        res: dict[str, Any] = {
+            "table": self.table, "database": self.db.database_name, "database_id": self.db.id,
+            "window": f"{t0:%Y-%m-%d %H:%M} to {t1:%Y-%m-%d %H:%M} on {self.tf}",
+            "compared_with": "the same window on " + ", ".join(f"{t0 - bk:%Y-%m-%d}" for bk, _s in self.chosen)
+                             + " (the usual: their median)"}
+        if self.as_of:
+            res["window"] = (f"the rows of the business date ({', '.join(self.labels)}) as they were on "
+                             f"{t1:%Y-%m-%d} at {t1:%H:%M}")
+            res["compared_with"] = (f"the rows of each earlier day's own business date as they were at {t1:%H:%M} on "
+                                    + ", ".join(f"{t1 - bk:%Y-%m-%d}" for bk, _s in self.chosen) + " (the usual: their median)")
+        if self.every:
+            res["fields_compared"] = list(self.read)
+            spec = ((_catalog().get("indices") or {}).get(self.table) or {}).get("fields") or {}
+            what = {f: str(spec[f]["description"])[:130] for f in self.stages
+                    if isinstance(spec.get(f), dict) and spec[f].get("description")}
+            res.update(G.survey(judged, over=self.over, stages=self.stages, what=what, every_row=every_row,
+                                fixed=set(G.conditioned(self.cond, self.times | {self.moved or ""}))))
+            waits_on = res.pop("waits_on", None)
+            self.said = res.pop("said", None) or {}
+            every_row = [f for f in every_row if f not in self.stages]
+            if every_row:
+                res.setdefault("as_usual", []).append("every row had reached " + ", ".join(every_row)
+                                                      + " by then, as on the earlier days")
+            leads = [(e["field"], [str(v["value"]) for v in e.get("values") or []])
+                     for e in res["measures"][:3] if e.get("field")]
+        else:
+            waits_on = None
+            m, overall, summaries = judged[0]
+            res["measure"] = m.text()
+            res["total"] = overall
+            res["conclusion"] = G.conclusion(summaries)
+            res["fields"] = {f: G.brief(sm, f in self.asked) for f, sm in summaries.items()}
+            first = next(iter(self.read))
+            res["sql_of_the_window"] = (f'SELECT "{first}", {m.select()} FROM "{self.table}" WHERE '
+                                        + " AND ".join(x for x in (self.window(t0, t1, self.now_scope), m.not_null()) if x)
+                                        + f' GROUP BY "{first}"')
+            best = G.localized(summaries)
+            leads = [(best[0], [str(g["value"]) for g in summaries[best[0]]["groups"] if g.get("unusual")])] if best else []
+        when = []                                    # since when what stands out is off (the days of the usual)
+        for e in (res.get("measures") or [])[:3] if self.every else []:
+            if e.get("field") and e.get("values"):
+                v = e["values"][0]
+                said = self.since(e["measure"], e["field"], str(v["value"]), v.get("usual"), v.get("now"))
+                if said:
+                    v["since"] = said
+                    when.append(f'{e["measure"]}, {e["field"]} = {v["value"]}: {said}')
+        if not self.every and leads and leads[0][1]:
+            groups = (res["fields"].get(leads[0][0]) or {}).get("groups") or []
+            if groups and groups[0].get("unusual"):
+                said = self.since(res["measure"], leads[0][0], str(groups[0]["value"]), groups[0].get("usual"), groups[0].get("now"))
+                if said:
+                    groups[0]["since"] = said
+                    when.append(f'{leads[0][0]} = {groups[0]["value"]}: {said}')
+        if when:
+            res["since_when"] = when
+        try:
+            if self.inside is None:
+                self.references(res, judged)
+        except ToolError:
+            raise
+        except Exception:  # pylint: disable=broad-except   (the comparison with the usual stands)
+            log.warning("supagent: the reference days of a comparison were not read", exc_info=True)
+        try:                                         # who else is on what stands out, outside the scope
+            shared = self.outside(leads, (waits_on or {}).get("field"))
+        except Exception:  # pylint: disable=broad-except   (the comparison stands)
+            log.debug("supagent: the rows outside the scope of a comparison were not read", exc_info=True)
+            shared = []
+        try:                                         # the lead followed once: every row on what the rows wait for
+            held = self.there(waits_on)
+        except Exception:  # pylint: disable=broad-except   (the comparison stands)
+            log.debug("supagent: the rows on what a comparison's rows wait for were not read", exc_info=True)
+            held = None
+        if held:
+            res["the_rows_there"] = held
+        if shared:
+            res["outside_the_scope"] = [o["line"] for o in shared]
+            more = next((o for o in shared if o["more"]), None)
+            if more:
+                res["sql_outside_the_scope"] = more["sql"]
+        related: list[dict] = []
+        followed: set[str] = set()
+        for f, values in leads:                      # what the related tables hold about the values that stand out
+            if f in followed or not values or len(related) >= 2 or (self.inside is not None and self.late()):
+                continue
+            followed.add(f)
+            try:
+                related += _related(self.run, self.table, self.db, f, values, t1)
+            except Exception:  # pylint: disable=broad-except
+                log.debug("supagent: related records of %s not read", f, exc_info=True)
+        if related:
+            res["related"] = related[:2]
+        notes = []
+        if self.labels and self.label_moved:
+            notes.append(f"the business date ({', '.join(self.labels)}) was read for each earlier day as that day's own")
+        if self.left_out:
+            notes.append(f"the condition {self.left_out} was left out: no row of the earlier days has it (a state that "
+                         "exists only while a row is in progress, or a value that is new); the stages say how many rows "
+                         "wait at each")
+        if getattr(self, "not_used", None):
+            notes.append(f"time_field {self.not_used} is computed from the business date, not a time of the rows: "
+                         f"{self.tf} was used")
+        if self.moving:
+            notes.append(f"the date the scope compares {', '.join(self.moving)} with was moved back with each earlier "
+                         "day (the same time of day)")
+        if self.untimed:
+            notes.append(f"the condition on {', '.join(self.untimed)} in where was left out: start and end give the time")
+        if self.dropped:
+            notes.append(f"not compared: {', '.join(self.dropped)} (the scope pins it to one value)")
+        if self.wide:
+            notes.append("not compared: " + ", ".join(f"{f} ({n:,} values: too many to say where a change is)"
+                                                      for f, n in self.wide.items()))
+        if self.as_of:
+            notes.append(f"\"then\": at {t1:%H:%M}, on each day alike (the progress at that time of day against "
+                         "usual). Rows pile up at a stage when the stage before released them late, or when the rows "
+                         "of the stage after last longer than usual and hold its capacity: look at both before "
+                         "naming a queue as the cause")
+        elif t1 >= _local_now(self.conn) - dt.timedelta(minutes=IN_PROGRESS_MINUTES):
+            notes.append("this window ends now: what is in progress is counted as it is at this moment, while the "
+                         "earlier days are read as they ended. A state that only exists in progress (not started, "
+                         "waiting, running) has no equivalent on the earlier days, and fewer rows \"done\" than usual "
+                         "may only mean that the day is not over; to compare what was finished by this time of day, "
+                         "call again with time_field = the field of the end time")
+        past = _long_past(self.conn, t1)
+        if past:
+            res["warning"] = past
+        if str(res.get("conclusion") or "").startswith("Nothing stands out") and not res.get("against") and \
+                self.inside is None:                 # nothing to follow: said, so that the answer is not delayed
+            res["next"] = ("Nothing is unusual in these rows: answer that now, with these figures (what is as usual, "
+                           "and the stages when there are some). If the question says something is wrong here, say "
+                           "that the data does not show it. Look at something else only if the question names it "
+                           "(another table, other parts of the system).")
+        if notes:
+            res["note"] = "; ".join(notes)
+        if self.errors:
+            res["not_compared"] = self.errors
+        # what it found first (the conclusion, the related records), then the figures behind it
+        first_keys = ("table", "database", "database_id", "window", "warning", "conclusion", "next", "outside_the_scope",
+                      "the_rows_there", "since_when", "related", "against_reference_days", "against", "against_note",
+                      "stages", "measure", "total", "measures", "as_usual", "not_comparable_yet", "fields")
+        res = {**{k: res[k] for k in first_keys if k in res}, **{k: v for k, v in res.items() if k not in first_keys}}
+        return _fitted(res)
+
+
+def _rounded(v: Any) -> Any:
+    return round(v, 4) if isinstance(v, float) else v
+
+
+def _plain(v: Any) -> str:
+    """A figure in a sentence."""
+    if v is None:
+        return "nothing"
+    if isinstance(v, (int, float)):
+        return f"{v:,.0f}" if abs(v) >= 100 else f"{v:.3g}"
+    return str(v)
+
+
+@mcp.tool
+def compare_groups(table: str, start: str, end: str, group_by: list[str] | None = None, measure: str = "all",
+                   where: str = "", days: int = 8, time_field: str | None = None,
+                   database: str | int | None = None, against: list[str] | None = None) -> dict:
+    """What is unusual in a table, and where is it concentrated? Its measures over the window start-end,
+    compared with the same clock window of each of the previous `days` days that have data (their median: the
+    usual): in total, then value by value for each field of few values (each field on its own). One call instead
+    of one query per day, per measure and per field.
+
+    measure: "all" (the default: the number of rows, each field against the field that holds its usual value,
+    the average of each numeric field, the rows that reached each time field: which measure is off, and where),
+    or one of "count" (rows), "avg(FIELD)", "sum(FIELD)", "max(FIELD)", "ratio(FIELD_A, FIELD_B)" = sum of A /
+    sum of B, for its values in full.
+    where: the scope as SQL conditions, without the time: "ENV" = 'PROD' AND "APP" IN ('A', 'B'); a business-date
+    label (POSITION_LABEL = 'D-1') is moved to each earlier day by itself. start / end: local times
+    ("2026-09-24 00:00"): from the start of what is looked at (today's rows: from midnight today) to now.
+    against: reference days to compare with besides the usual, when the question names them or to see how old a
+    change is: ["yesterday", "1 week ago", "3 weeks ago", "2 months ago", "2026-06-15"] (weeks and months: the
+    same weekday; the team's own reference days are compared when none is given).
+    time_field: the table's time field unless another is meant. group_by: the fields to look at first; the table's
+    other fields of few values are compared too.
+    The result says which measure is off, which field's values stand out and whether the change is concentrated
+    on a few of them (where to look) or spread over all (look upstream), each figure on the reference days, and
+    the latest records of the related tables (changes, alerts...) about what stands out. When the rows wait at a
+    stage on one value (a pool, a queue), it also says who else is there: outside_the_scope (the rows outside
+    the scope on that value, against usual) and the_rows_there (the same comparison over every row there)."""
+    try:
+        with _as_user():
+            from superset.extensions import db as meta, security_manager
+
+            from supagent.knowledge import groups as G
+
+            t0, t1 = G.clock(start), G.clock(end)
+            if t1 <= t0:
+                raise ToolError("end must be after start")
+            table = G.name(table)
+            db_obj = _table_database(table, database)
+            tf, not_used = _row_time_field(table, time_field)
+            security_manager.raise_for_access(database=db_obj, sql=f'SELECT COUNT(*) FROM "{table}"', schema="default")
+            more: list[Any] = []             # the other connections of this call (closed with it)
+            with _db_connection(db_obj, extract=False) as conn, _closing(more):
+                meta.session.commit()        # no connection of Superset's own pool is held while the queries run
+                made = _Comparison(conn, db_obj, more, table, tf, t0, t1, where, group_by, measure, days, against)
+                made.not_used = not_used
+                try:
+                    return made.result()
+                except NoEarlierDay:
+                    # a condition that holds only while a row is in progress (a status) leaves every earlier day
+                    # empty: the scope without it, when that gives the earlier days their rows
+                    for condition, rest in made.without_a_condition():
+                        other = _Comparison(conn, db_obj, more, table, tf, t0, t1, rest, group_by, measure, days, against,
+                                            cursors=made.cursors)
+                        other.not_used, other.look_far = not_used, False
+                        try:
+                            other.earlier()
+                        except ToolError:
+                            continue
+                        other.look_far, other.chosen = True, []
+                        other.left_out = condition
+                        return other.result()
+                    raise
+    except ToolError as ex:
+        return {"error": str(ex)}
+    except Exception as ex:  # pylint: disable=broad-except
+        from supagent.knowledge.groups import GroupsError
+
+        if isinstance(ex, GroupsError):
+            text = str(ex)
+            if "this table's own fields" in text:     # a subquery to another table: what this one has itself
+                try:
+                    from supagent.knowledge.groups import name as field_name
+
+                    with _as_user():
+                        own = _group_fields(field_name(table), set(), None)
+                    text += (f"; {field_name(table)} has: " + ", ".join(own[:12])) if own else ""
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            return {"error": text}
+        if type(ex).__name__ == "PushdownError":      # the scope as written cannot be run by the database
+            return {"error": "where: the database cannot run this scope as written (" + str(ex)[:160].rstrip() + "...). "
+                             "Write plain conditions joined with AND: \"FIELD\" = 'x', \"FIELD\" IN ('a', 'b'), the "
+                             "business-date label as a condition of its own (= 'D-1'); no function, no OR between "
+                             "different fields. Then call compare_groups again"}
+        return {"error": f"{type(ex).__name__}: {str(ex)[:1500]}"}
+
+
+LOG_ROWS = 150                   # compare_logs: lines read of each level in each third of each window
+LOG_LEVELS_QUIET = ("info", "information", "informational", "debug", "trace", "notice", "verbose", "fine", "finer",
+                    "finest", "config", "i", "d", "t", "dbg")
+LOG_FIELDS = 6                   # fields of few values said for where a pattern comes from
+LOG_CHECKED = 8                  # patterns counted line by line in the database (the others: from what was read)
+LOG_SECONDS = 40.0               # ... while the call has run less than this (a big table: the others estimated)
+LOG_OWN = 50                     # lines of a pattern counted read in each third (its names, its wordings)
+
+
+def _message_field(table: str) -> str | None:
+    """The field that holds a log line's text: a text field of many values (the dictionary), the one named like a
+    message first."""
+    from superset.extensions import db
+
+    from supagent.models import KObject
+
+    best: list[tuple[int, int, str]] = []
+    for o in db.session.query(KObject).filter(KObject.kind == "field", KObject.parent == table, KObject.gone_at.is_(None)):
+        kind = str(o.data_type or "").lower()
+        if kind not in ("text", "string", "keyword", "varchar"):
+            continue
+        named = bool(re.search(r"(^|_)(message|msg|log|line|text|event)(_|$)", o.name, re.I))
+        card = int((o.stats or {}).get("cardinality") or 0)
+        if kind == "text" or named:
+            best.append((int(named) + int(kind == "text"), card, o.name))
+    return max(best)[2] if best else None
+
+
+def _level_field(table: str) -> str | None:
+    """The field that holds a log line's level (INFO, WARN, ERROR...): named like one, of few values."""
+    from superset.extensions import db
+
+    from supagent.models import KObject
+
+    for o in db.session.query(KObject).filter(KObject.kind == "field", KObject.parent == table, KObject.gone_at.is_(None)):
+        if re.fullmatch(r"(log_?)?(level|severity|loglevel|lvl|priority_name)", o.name, re.I) and \
+                int((o.stats or {}).get("cardinality") or 0) <= 12:
+            return o.name
+    return None
+
+
+@mcp.tool
+def compare_logs(table: str, start: str, end: str, where: str = "", days: int = 8, levels: list[str] | None = None,
+                 against: list[str] | None = None, time_field: str | None = None, message_field: str | None = None,
+                 database: str | int | None = None) -> dict:
+    """What do the logs say that they do not usually? The lines of a log table (application logs, batch logs,
+    events) over the window start-end, grouped into patterns (their numbers, times, ids and names left out), each
+    counted against the same window of the previous `days` days that have data: the patterns that are new, far
+    more frequent than usual, rare (there on few earlier days), or as frequent with numbers far from their usual
+    (a slow write of 40 s where it is 8 s), most lines first, with where their lines come from (the host, the
+    application, the logger, the names they hold), when (the first and the last line) and an example; what is
+    gone; and the patterns of every day (a warning that comes every night is no finding). One call instead of
+    reading lines.
+
+    where: the scope as SQL conditions, without the time: "APPLICATION" IN ('A', 'B'), "HOST" = 'srv-1' (a
+    business-date label is moved to each earlier day by itself). levels: the levels to read (default: all but
+    INFO and DEBUG, when the table has a level field). against: reference days to count each pattern on too
+    ("1 week ago", "4 weeks ago", "2026-06-15"). start / end: local times ("2026-09-24 00:00")."""
+    began = time.time()
+    try:
+        with _as_user():
+            from superset.extensions import db as meta, security_manager
+
+            from supagent.knowledge import groups as G
+            from supagent.knowledge import logs as L
+
+            t0, t1 = G.clock(start), G.clock(end)
+            if t1 <= t0:
+                raise ToolError("end must be after start")
+            table = G.name(table)
+            db_obj = _table_database(table, database)
+            tf, _computed = _row_time_field(table, time_field)
+            msg = G.name(message_field) if message_field else _message_field(table)
+            if not msg:
+                raise ToolError(f"no field of {table!r} holds the text of a line: give message_field")
+            lvl = _level_field(table)
+            security_manager.raise_for_access(database=db_obj, sql=f'SELECT COUNT(*) FROM "{table}"', schema="default")
+            days = max(2, min(int(days or 8), GROUP_DAYS))
+            try:
+                refs = G.references(against if against is not None else str(_setting("agent.compare_against", "") or ""))
+            except G.GroupsError:
+                if against is not None:
+                    raise
+                refs = []                            # (a setting nobody can read is no reference)
+            with _db_connection(db_obj, extract=False) as conn:
+                meta.session.commit()
+                label_column = getattr(conn, "label_column", None) if db_obj.backend == "osagg" else None
+                cond, labels = G.scope(where, label_column)
+                times = G.time_columns(cond, _time_fields(table, tf))
+                cond, moving, _untimed = G.timed(cond, times)
+                anchor = min(t1, _label_now(conn)) if label_column else t1
+                label_source = getattr(conn, "label_source", None) if label_column else None
+                if labels and _earlier_dates(conn, labels, dt.timedelta(0), anchor) == "1 = 0":
+                    raise ToolError(f'where: "{label_column}" = {", ".join(labels)}: not a business-date label (D, '
+                                    "D-1, D-2, W-1...); a state or another value belongs to its own field")
+                moved = label_column                 # the column whose condition moves with the day
+                if not labels and label_source:      # a business date written as a date: its label, moved too
+                    pinned = G.literals(cond, label_source)
+                    labels = _labels_of_dates(conn, pinned, anchor) if pinned else []
+                    moved = label_source if labels else label_column
+                where_fields = [f for f in _group_fields(table, G.fixed_fields(cond), label_column)
+                                if f not in (lvl, msg, label_source, tf)][:LOG_FIELDS]
+                cur = conn.cursor()
+
+                def run(sql: str) -> list:
+                    cur.execute(sql)
+                    return cur.fetchall()
+
+                def scope_at(back: dt.timedelta) -> str:
+                    dates = _earlier_dates(conn, labels, back, anchor) if labels else None
+                    c = G.moved_back(cond, times, back.days) if moving else cond
+                    sql = G.render(c, moved, dates if dates else "TRUE") if cond is not None else ""
+                    return sql or "TRUE"
+
+                def window(back: dt.timedelta, a: dt.datetime | None = None, b: dt.datetime | None = None) -> str:
+                    a = (a or t0) - back
+                    b = (b or t1) - back
+                    return f'({scope_at(back)}) AND "{tf}" >= {G.lit(a)} AND "{tf}" < {G.lit(b)}'
+
+                def quote(v: Any) -> str:
+                    return "'" + str(v).replace("'", "''") + "'"
+
+                # the earlier windows with lines (a holiday, a weekend without runs: skipped), then the reference days
+                windows: list[dt.timedelta] = [dt.timedelta(0)]
+                for k in range(1, 3 * days + 8):
+                    if len(windows) > days:
+                        break
+                    back = dt.timedelta(days=k)
+                    n = run(f'SELECT COUNT(*) AS n FROM "{table}" WHERE {window(back)}')
+                    if n and n[0][0]:
+                        windows.append(back)
+                if len(windows) < 3:
+                    raise ToolError("no earlier day with lines to compare with: check the table, the scope and the dates")
+                usual_days = len(windows) - 1
+                ref_windows: list[tuple[str, dt.timedelta]] = []
+                for r in refs:
+                    back = dt.timedelta(days=r.days) if r.days else dt.timedelta(days=(t0.date() - r.date).days)
+                    if back.days >= 1:
+                        ref_windows.append((r.label if r.date else f"{r.label} ({t0 - back:%Y-%m-%d})", back))
+                every = windows + [b for _t, b in ref_windows if b not in windows]
+                # the levels (of the window asked and of the day before: a level gone is read too), the quiet ones
+                # (INFO, DEBUG) left out unless asked
+                found_levels: dict[str, int] = {}
+                if lvl:
+                    for back in windows[:2]:
+                        for r in run(f'SELECT "{lvl}", COUNT(*) AS n FROM "{table}" WHERE {window(back)} GROUP BY "{lvl}"'):
+                            if r[0] is not None:
+                                found_levels[str(r[0])] = found_levels.get(str(r[0]), 0) + (int(r[1] or 0) if back == windows[0] else 0)
+                    wanted = [x for x in (levels or [k for k in found_levels if k.lower() not in LOG_LEVELS_QUIET])
+                              if x in found_levels] or list(found_levels)
+                else:
+                    wanted = [None]
+                cols = ", ".join(f'"{c}"' for c in [msg, *where_fields, *([lvl] if lvl else [])])
+                names = [msg, *where_fields, *([lvl] if lvl else []), "_t"]
+                thirds = [(t0 + (t1 - t0) * i / 3, t0 + (t1 - t0) * (i + 1) / 3) for i in range(3)]
+                found: dict[str, dict] = {}
+                per_level: dict[str, list[float]] = {}
+                for level in wanted:
+                    on = f' AND "{lvl}" = {quote(level)}' if lvl else ""
+                    samples, totals = [], []
+                    for back in every:
+                        total = run(f'SELECT COUNT(*) AS n FROM "{table}" WHERE {window(back)}{on}')
+                        totals.append(float(total[0][0] or 0) if total else 0.0)
+                        rows: list[dict] = []
+                        for a, b in thirds:      # each third of the window: the lines are not all of its end
+                            got = run(f'SELECT {cols}, "{tf}" FROM "{table}" WHERE {window(back, a, b)}{on} '
+                                      f'ORDER BY "{tf}" DESC LIMIT {LOG_ROWS}')
+                            rows += [dict(zip(names, r)) for r in got]
+                        samples.append(rows)
+                    per_level[str(level)] = totals
+                    L.merge(found, L.read(samples, totals, msg, where_fields, level=str(level) if lvl else None))
+                # the patterns that will be said, counted line by line in the database (what was read of each window
+                # is a part of it: a burst at one time of a window can crowd the other patterns out of what is read)
+                dates = [f"{t0 - b:%Y-%m-%d}" for b in windows[1:]]
+                said = sorted(found.items(), key=lambda kv: (L.judge(kv[1], usual_days)["verdict"] == "as usual",
+                                                             -kv[1]["counts"][0]))
+                levels_on = (f' AND "{lvl}" IN ({", ".join(quote(x) for x in wanted)})' if lvl else "")
+                checked, used, stopped, uncounted = 0, set(), False, ""
+                for key, p in said:
+                    if checked >= LOG_CHECKED:
+                        break
+                    if time.time() - began > LOG_SECONDS:
+                        stopped = True
+                        break
+                    piece = L.fragment(key)
+                    if piece is None or piece in used or max(p["counts"]) < L.NEW_ERRORS:
+                        continue
+                    used.add(piece)
+                    checked += 1
+                    exact, edges = [], None
+                    try:
+                        for back in every:
+                            first = ', MIN("{0}") AS a, MAX("{0}") AS b'.format(tf) if back == windows[0] else ""
+                            got = run(f'SELECT COUNT(*) AS n{first} FROM "{table}" WHERE {window(back)}{levels_on} '
+                                      f'AND "{msg}" LIKE {quote("%" + piece + "%")}')
+                            exact.append(float(got[0][0] or 0) if got else 0.0)
+                            if first and got and len(got[0]) == 3:
+                                edges = got[0][1:]
+                    except Exception as ex:  # pylint: disable=broad-except   (a text field the database cannot filter so)
+                        uncounted = f"{type(ex).__name__}: {str(ex)[:160]}"
+                        break
+                    if exact[0] or any(exact[1:]):
+                        p["counts"] = exact
+                        p["exact"] = True
+                        if edges and all(isinstance(e, dt.datetime) for e in edges):    # (the window's first and last)
+                            p["first"], p["last"] = edges
+                    if exact[0]:
+                        _own_lines(p, key, run, f"{window(windows[0])}{levels_on} AND \"{msg}\" LIKE {quote('%' + piece + '%')}",
+                                   table, msg, tf, where_fields, [window(windows[0], a, b) for a, b in thirds],
+                                   f"{levels_on} AND \"{msg}\" LIKE {quote('%' + piece + '%')}")
+                if ref_windows:
+                    for p in found.values():
+                        p["on"] = {text: round(p["counts"][every.index(b)]) for text, b in ref_windows}
+                res = L.survey(found, usual_days, where_fields, dates, refs=against is not None)
+                out = {"table": table, "database": db_obj.database_name, "database_id": db_obj.id,
+                       "window": f"{t0:%Y-%m-%d %H:%M} to {t1:%Y-%m-%d %H:%M} on {tf}",
+                       "conclusion": res["conclusion"],
+                       "levels": {str(k): {"now": int(v[0]), "usual": statistics.median(v[1:usual_days + 1])}
+                                  for k, v in per_level.items() if k != "None"},
+                       "patterns": res["patterns"],
+                       "compared_with": "the same window on " + ", ".join(dates) + " (the usual: their median)",
+                       **({"against": [t for t, _b in ref_windows]} if ref_windows else {}),
+                       "read": f"the lines of the levels {', '.join(map(str, wanted))}" if lvl else "every line",
+                       "note": (f"the patterns are counted from up to {3 * LOG_ROWS} lines of each level read in each "
+                                "window (spread over its three thirds), scaled to the lines it has; the ones said "
+                                "\"counted: line by line\" are exact")}
+                if stopped:
+                    out["note"] += f"; the counting line by line stopped after {LOG_SECONDS:g} s (a big table)"
+                if uncounted:
+                    out["note"] += f"; no counting line by line: the database cannot filter {msg} by a piece of text ({uncounted})"
+                past = _long_past(conn, t1)
+                if past:
+                    out["warning"] = past
+                return _fitted_logs(out)
+    except ToolError as ex:
+        return {"error": str(ex)}
+    except Exception as ex:  # pylint: disable=broad-except
+        from supagent.knowledge.groups import GroupsError
+
+        if isinstance(ex, GroupsError):
+            return {"error": str(ex)}
+        return {"error": f"{type(ex).__name__}: {str(ex)[:1500]}"}
+
+
+def _own_lines(p: dict[str, Any], key: str, run: Any, where_now: str, table: str, msg: str, tf: str,
+               fields: list[str], parts: list[str], on: str) -> None:
+    """A pattern counted line by line, where its lines come from counted too (the lines read of a window are its
+    latest of each third: a burst at the end of a third leans them), and its names and wordings from its own
+    lines over the window."""
+    from collections import Counter, defaultdict
+
+    from supagent.knowledge import logs as L
+
+    counted = {}
+    for f in fields:
+        try:
+            got = run(f'SELECT "{f}", COUNT(*) AS n FROM "{table}" WHERE {where_now} GROUP BY "{f}"')
+        except Exception:  # pylint: disable=broad-except   (a field that cannot be grouped: from what was read)
+            continue
+        counted[f] = Counter({str(r[0]): int(r[1] or 0) for r in got if r[0] not in (None, "")})
+    if counted:
+        p["where"] = defaultdict(Counter, {**p["where"], **counted})
+        p["where_counted"] = set(counted)
+    names, wordings = defaultdict(Counter), Counter()
+    for part in parts:
+        try:
+            got = run(f'SELECT "{msg}", "{tf}" FROM "{table}" WHERE {part}{on} ORDER BY "{tf}" DESC LIMIT {LOG_OWN}')
+        except Exception:  # pylint: disable=broad-except
+            return
+        for m, _t in got:
+            s = L.shape(str(m or ""))
+            if s.key != key:
+                continue
+            wordings[s.wording] += 1
+            for k, name in enumerate(s.names):
+                names[k][name] += 1
+    if wordings:
+        p["names"], p["wordings"], p["read"] = names, wordings, sum(wordings.values())
+
+
+def _fitted_logs(res: dict[str, Any], chars: int = GROUP_CHARS) -> dict[str, Any]:
+    """A comparison of logs within the room of a tool result: fewer wordings and examples first, then the patterns
+    of every day, then the least of the others."""
+    def size() -> int:
+        return len(json.dumps(res, default=str))
+
+    for cut in ("wordings", "example", "usual", "where", "patterns"):
+        if size() <= chars:
+            break
+        pats = res.get("patterns") or []
+        for p in pats:
+            if cut == "wordings":
+                p["wordings"] = p.get("wordings", [])[:1]
+            elif cut == "example":
+                p.pop("example", None)
+            elif cut == "where" and p.get("verdict") == "as usual":
+                p.pop("where", None)
+        if cut == "usual":
+            res["patterns"] = [p for p in pats if p.get("verdict") != "as usual"] or pats[:1]
+        elif cut == "patterns":
+            res["patterns"] = pats[:4]
+    return res
+
+
+def _long_past(conn: Any, end: dt.datetime) -> str | None:
+    """A window that ended days ago, said so: a date written one digit off (the 4th for the 8th at 04:40) reads
+    another day's incident as today's."""
+    now = _local_now(conn)
+    if now - end < dt.timedelta(hours=PAST_HOURS):
+        return None
+    days = (now - end).total_seconds() / 86400
+    return (f"this window ended {days:.0f} day(s) before now (now is {now:%A %Y-%m-%d %H:%M}): if the question is about "
+            "today, call again with end = now")
+
+
+def _fitted(res: dict[str, Any], chars: int = GROUP_CHARS) -> dict[str, Any]:
+    """A comparison's result within the room of a tool result: what repeats the conclusion goes first (the other
+    fields a measure is also seen on, the fourth measure's figures, the oldest related records), then what the
+    conclusion already says in words."""
+    def size() -> int:
+        return len(json.dumps(res, default=str))
+
+    held = res.get("the_rows_there") or {}
+    for cut in ("also_on", "then", "sql", "there", "measures", "latest", "against", "fields", "there related",
+                "one record", "one measure", "there short", "reference lines", "stages", "notes"):
+        if size() <= chars:
+            break
+        if cut == "also_on":
+            for e in res.get("measures") or []:
+                e.pop("also_on", None)
+        elif cut == "then":                           # (the lines of against_reference_days say them)
+            for e in res.get("measures") or []:
+                for v in e.get("values") or []:
+                    v.pop("then", None)
+        elif cut == "there":                          # (the lead followed: its records, fewer)
+            for r in held.get("related") or []:
+                r.pop("sql", None)
+                r["latest"] = (r.get("latest") or [])[:2]
+        elif cut == "against":
+            for e in res.get("against") or []:
+                e["what_differs"] = e["what_differs"][:400]
+        elif cut == "sql":
+            res.pop("sql_outside_the_scope", None)
+            for r in res.get("related") or []:
+                r.pop("sql", None)
+        elif cut == "measures" and len(res.get("measures") or []) > 2:
+            res["measures"] = res["measures"][:2]
+        elif cut == "latest":
+            for r in res.get("related") or []:
+                r["latest"] = (r.get("latest") or [])[:2]
+        elif cut == "fields":
+            for f, sm in (res.get("fields") or {}).items():
+                sm["groups"] = (sm.get("groups") or [])[:4]
+        elif cut == "there related":
+            for r in held.get("related") or []:
+                r["latest"] = (r.get("latest") or [])[:1]
+        elif cut == "one record":
+            for r in res.get("related") or []:
+                r["latest"] = (r.get("latest") or [])[:1]
+        elif cut == "one measure" and len(res.get("measures") or []) > 1:
+            res["measures"] = res["measures"][:1]
+        elif cut == "there short" and held.get("what_stands_out"):
+            held["what_stands_out"] = [line[:220] for line in held["what_stands_out"][:2]]
+        elif cut == "reference lines" and res.get("against_reference_days"):
+            lines = res["against_reference_days"]
+            res["against_reference_days"] = lines[:2] + [x for x in lines[2:] if x.startswith("no data on ")]
+        elif cut == "stages" and res.get("stages"):
+            res["stages"] = [line[:260] for line in res["stages"]]
+        elif cut == "notes":                          # (what is said last, in fewer words)
+            for key in ("note", "compared_with"):
+                if res.get(key):
+                    res[key] = str(res[key])[:300]
+    return res
+
+
+@mcp.tool
+def system_links(names: list[str]) -> dict:
+    """What the team's system map says about parts of the system, by their exact names (an application, a
+    server, a pool, a service, a feed, a family...): what each is, what it is part of and consists of, what it
+    depends on, runs on, reads and calls, what depends on it, and where its kind is in the data (fields, metric
+    labels, joins). In an investigation: from the part that looks wrong to what it depends on, and to what
+    depends on it."""
+    try:
+        with _as_user():
+            from supagent.knowledge.brief import links_of
+
+            res = links_of([str(n) for n in (names or [])][:8])
+            if not res.get("parts"):
+                res["note"] = ("none of these names is a value of the team's categories (Data dictionary, "
+                               "Categories): search_knowledge may know them")
+            return res
+    except Exception as ex:  # pylint: disable=broad-except
+        return {"error": f"{type(ex).__name__}: {str(ex)[:500]}"}
 
 
 @mcp.tool

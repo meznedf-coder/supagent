@@ -164,8 +164,8 @@ def test_only_what_needs_an_admin_waits(world, sure_used_at_once):
 
 
 def test_a_code_of_one_letter_is_not_an_application(world):
-    """The values of application-like fields name the applications, but not a code like A or 42; one an older rule
-    seeded is retired with its tags."""
+    """The values of application-like fields name the applications, but not a code like A or 42. One an older rule
+    seeded stays as it is (0.9: no value in use is retired by the learning; its removal is proposed, test_retire)."""
     from superset.extensions import db
 
     from supagent.knowledge import facets as F
@@ -177,12 +177,12 @@ def test_a_code_of_one_letter_is_not_an_application(world):
     db.session.flush()
     db.session.add(Tag(ref="entry:1", facet_id=f.id, confidence=0.9, source="llm", status="approved"))
     db.session.commit()
-    assert F.settle()["values"] >= 1
+    F.settle()
     db.session.refresh(f)
-    assert f.status == "rejected" and not db.session.query(Tag).filter(Tag.facet_id == f.id).count()
+    assert f.status == "approved" and db.session.query(Tag).filter(Tag.facet_id == f.id).count() == 1
 
 
-def test_the_prompt_says_whose_each_piece_is(world):
+def test_the_prompt_says_whose_each_piece_is(world, sure_used_at_once):
     """The knowledge given with a question names each piece's application and subject (approved ones)."""
     from superset.extensions import db
 
@@ -306,10 +306,83 @@ def test_own_categories_read_from_the_fields_and_related_by_the_data(world, monk
     n = F.seed()
     assert n["server"] >= 3 and n["relations"] == 3                       # srv-02 with LEDGER: 2 documents, below 5
     srv1 = db.session.query(Facet).filter(Facet.facet == "server", Facet.value == "srv-01").one()
-    assert srv1.status == "approved" and srv1.origins == [f"field NODE of ops-jobs ({src.database_name})"]
+    # 0.9: what the learning reads in the data waits for an admin, like what the LLM proposes
+    assert srv1.status == "proposed" and srv1.source == "data" and n["proposed"] >= 5
+    assert srv1.origins == [f"field NODE of ops-jobs ({src.database_name})"]
     names = {db.session.get(Facet, i).value for i in srv1.suggested["parents"]}
     assert names == {"LEDGER", "PAYMENTS"} and srv1.parents is None          # proposed, never applied alone
     assert "LEDGER with NODE srv-01 in 40 documents" in " ".join(srv1.suggested["from"].values())
+    again = F.seed()
+    assert again["proposed"] == 0 and db.session.get(Facet, srv1.id).status == "proposed"    # nothing new: nothing said
+    conf["categories.review_all"] = False                                   # as before 0.9: used at once
+    F.seed()
+    assert db.session.get(Facet, srv1.id).status == "approved"
     db.session.query(KObject).filter(KObject.parent == "ops-jobs").delete(synchronize_session=False)
     db.session.delete(idx)
     db.session.commit()
+
+
+def test_a_name_filed_under_another_category_is_that_value_not_a_new_one(world, sure_used_at_once):
+    """0.9: the LLM files parts as "components"; when the team already has that name as a value of another
+    category (a service of theirs), the item is about that value and nothing new waits for an admin. A subject
+    is a topic: it may share its name with a part. What an older rule left waiting says which approved value has
+    its name: nothing is merged without an admin."""
+    from superset.extensions import db
+
+    from supagent import settings
+    from supagent.knowledge import facets as F
+    from supagent.models import Facet, Tag
+
+    settings.set_value("categories.custom", ["service"])
+    try:
+        F.seed()
+        svc = Facet(facet="service", value="ledger db", status="approved", source="admin", synonyms=["LEDGERDB"])
+        old = Facet(facet="component", value="Ledger DB", status="proposed", source="llm")       # from before 0.9
+        db.session.add_all([svc, old])
+        db.session.commit()
+        assert db.session.query(Facet).filter(Facet.facet == "subject", Facet.value == "Payments").one().status == \
+            "approved"                                                   # seeded from the category people wrote
+        ref = f"entry:{world['entry']}"
+        db.session.add(Tag(ref="doc:1", facet_id=old.id, confidence=0.9, source="llm", status="proposed"))
+        db.session.commit()
+        assert F.settle()["values"] == 1                                 # the old duplicate says what it looks like
+        assert db.session.get(Facet, old.id).suggested == {"same_as": svc.id}        # an admin merges it, in one click
+        assert db.session.query(Tag).filter(Tag.ref == "doc:1").one().facet_id == old.id and svc.synonyms == ["LEDGERDB"]
+        assert F.settle()["values"] == 0                                 # said once
+        db.session.delete(db.session.query(Tag).filter(Tag.ref == "doc:1").one())
+        db.session.delete(old)
+        db.session.commit()
+        args = {"items": [{"ref": ref, "aspect": "technical", "confidence": "high", "applications": ["Payments"],
+                           "components": ["ledger db", "LEDGERDB", "scheduler"]}],
+                "new_values": [{"facet": "component", "value": "ledger db", "description": "the ledger"},
+                               {"facet": "application", "value": "Payments"}]}
+        n = F.apply(args, [{"ref": ref, "hash": "h"}], F._table_refs())
+        assert db.session.query(Facet).filter(Facet.facet == "component", Facet.value.ilike("ledger db")).count() == 0
+        tags = {(f.facet, f.value, t.status) for t, f in db.session.query(Tag, Facet).join(
+            Facet, Facet.id == Tag.facet_id).filter(Tag.ref == ref)}
+        assert ("service", "ledger db", "approved") in tags              # by its name and by its other name: once
+        assert ("component", "scheduler", "proposed") in tags            # a name nobody has: proposed as before
+        assert ("application", "Payments", "proposed") in tags           # the subject Payments is another thing
+        assert n["proposed"] == 1                                        # only the application
+    finally:
+        settings.set_value("categories.custom", None)
+
+
+def test_a_proposed_interaction_waits_whatever_its_confidence(world, sure_used_at_once):
+    """0.9: an interaction between two parts read in a text is drawn and followed only once an admin approved
+    it: the rule that uses the confident links at once leaves it waiting."""
+    from superset.extensions import db
+
+    from supagent.knowledge import facets as F
+    from supagent.models import Facet, Link
+
+    a = Facet(facet="application", value="Invoicing", status="approved", source="admin")
+    b = Facet(facet="application", value="Payments", status="approved", source="admin")
+    db.session.add_all([a, b])
+    db.session.flush()
+    db.session.add(Link(a_ref=f"facet:{a.id}", b_ref=f"facet:{b.id}", kind="depends_on", confidence=0.7, source="llm",
+                        status="proposed", note="Invoicing waits for Payments. (a document)"))
+    db.session.add(Link(a_ref="entry:1", b_ref="entry:2", kind="about", confidence=0.9, source="llm", status="proposed"))
+    db.session.commit()
+    assert F.settle()["links"] == 1                                      # the relation between two items: used
+    assert db.session.query(Link).filter(Link.kind == "depends_on").one().status == "proposed"

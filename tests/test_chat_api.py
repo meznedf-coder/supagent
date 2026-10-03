@@ -255,6 +255,12 @@ def test_an_answer_without_the_tools_is_sent_back_once():
     fields = "| field | fill rate |\n|---|---|\n| STATUS_INFO | 100% |\n| ERROR_CATEGORY | 12% |"
     assert unsupported_answer(fields, looked) is None                       # the dictionary's own figures
     assert unsupported_answer("The index batch-jobs holds the job runs.", looked) is None
+    # 0.9: a query written out, not run, and what it "returned" said in words (no figure): sent back too
+    written = ("The SQL query to find the traders of that book:\n```sql\nSELECT DISTINCT \"TRADER\" FROM \"pnl\" WHERE "
+               "\"BOOK\" = 'X'\n```\nThe query returned no rows: no trader worked on that book that day.")
+    assert unsupported_answer(written, looked) == WRITTEN_SQL_NUDGE
+    asked = "Here is the query you asked for:\n```sql\nSELECT DISTINCT \"TRADER\" FROM \"pnl\"\n```\nRun it in SQL Lab."
+    assert unsupported_answer(asked, looked) is None                         # the query itself, asked for
     absent = ("The data does not contain a \"voice\" booking field in the trades index; its fields are TRADE_DATE, "
               "DESK and BOOK. Could you clarify which field you mean?")
     assert unsupported_answer(absent, []) == LOOKUP_NUDGE                     # said absent, nothing looked up
